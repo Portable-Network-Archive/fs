@@ -1,0 +1,26 @@
+name: rust-bench
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["*"]
+
+jobs:
+  rust-bench:
+    name: Run rust-bench
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          channel: nightly
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y fuse3 libfuse3-dev
+      - name: Run rust-bench
+        run: |
+          cargo bench --locked --all-features
