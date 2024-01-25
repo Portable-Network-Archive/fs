@@ -1,8 +1,12 @@
 use crate::file_manager::FileManager;
-use fuser::{Filesystem, ReplyAttr, ReplyDirectory, Request};
+use fuser::{Filesystem, ReplyAttr, ReplyDirectory, ReplyEntry, Request};
+use libc::ENOENT;
 use log::info;
+use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
+
+const TTL: Duration = Duration::from_secs(1);
 
 pub(crate) struct PnaFS {
     manager: FileManager,
@@ -17,6 +21,21 @@ impl PnaFS {
 }
 
 impl Filesystem for PnaFS {
+    fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        info!(
+            "[Implemented] lookup(parent: {:#x?}, name {:?})",
+            parent, name
+        );
+        let name = name.to_string_lossy().to_string();
+        let children = self.manager.get_children(parent).unwrap();
+        let entry = children.iter().find(|it| it.name == name);
+        if let Some(entry) = entry {
+            reply.entry(&TTL, &entry.attr, 0);
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
         info!("[Implemented] getattr(ino: {:#x?})", ino);
         let ttl = Duration::from_secs(1);
@@ -36,7 +55,7 @@ impl Filesystem for PnaFS {
             "[Implemented] readdir(ino: {:#x?}, fh: {}, offset: {})",
             ino, fh, offset
         );
-        let mut children = self.manager.get_children(ino).unwrap();
+        let children = self.manager.get_children(ino).unwrap();
 
         let mut current_offset = offset + 1;
         for entry in children.into_iter().skip(offset as usize) {
