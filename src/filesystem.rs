@@ -1,5 +1,5 @@
 use crate::file_manager::FileManager;
-use fuser::{Filesystem, ReplyAttr, ReplyDirectory, ReplyEntry, Request};
+use fuser::{Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, Request};
 use libc::ENOENT;
 use log::info;
 use std::ffi::OsStr;
@@ -41,6 +41,44 @@ impl Filesystem for PnaFS {
         let ttl = Duration::from_secs(1);
         let file = self.manager.get_file(ino).unwrap();
         reply.attr(&ttl, &file.attr);
+    }
+
+    fn read(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        flags: i32,
+        lock_owner: Option<u64>,
+        reply: ReplyData,
+    ) {
+        info!(
+            "[Implemented] read(ino: {:#x?}, fh: {}, offset: {}, size: {}, \
+            flags: {:#x?}, lock_owner: {:?})",
+            ino, fh, offset, size, flags, lock_owner
+        );
+        if let Some(file) = self.manager.get_file_mut(ino) {
+            let offset = offset as usize;
+            let size = size as usize;
+            let data = file.data.as_slice();
+            reply.data(&data[data.len().min(offset)..data.len().min(offset + size)])
+        } else {
+            reply.error(ENOENT)
+        };
+    }
+
+    fn flush(&mut self, _req: &Request<'_>, ino: u64, fh: u64, lock_owner: u64, reply: ReplyEmpty) {
+        info!(
+            "[Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
+            ino, fh, lock_owner
+        );
+        if let Some(_) = self.manager.get_file(ino) {
+            reply.ok();
+        } else {
+            reply.error(ENOENT);
+        }
     }
 
     fn readdir(

@@ -1,7 +1,9 @@
 use fuser::{FileAttr, FileType};
 use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
-use pna::{Archive, DataKind};
+use pna::{Archive, DataKind, ReadOption};
+use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::io::Read;
 use std::ops::Add;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -9,8 +11,38 @@ use std::{fs, io};
 
 pub type Inode = u64;
 
+pub(crate) struct Entry {
+    cell: OnceCell<Vec<u8>>,
+    data: Option<(pna::RegularEntry, ReadOption)>,
+}
+
+impl Entry {
+    fn empty() -> Self {
+        Self {
+            cell: Default::default(),
+            data: None,
+        }
+    }
+
+    pub(crate) fn as_slice(&mut self) -> &[u8] {
+        self.cell
+            .get_or_init(|| {
+                if let Some((entry, option)) = self.data.take() {
+                    let mut buf = Vec::new();
+                    let mut reader = entry.reader(option).unwrap();
+                    reader.read_to_end(&mut buf).unwrap();
+                    buf
+                } else {
+                    Vec::new()
+                }
+            })
+            .as_slice()
+    }
+}
+
 pub(crate) struct File {
     pub(crate) name: String,
+    pub(crate) data: Entry,
     pub(crate) attr: FileAttr,
 }
 
@@ -19,6 +51,7 @@ impl File {
         let now = SystemTime::now();
         Self {
             name,
+            data: Entry::empty(),
             attr: FileAttr {
                 ino: inode,
                 size: 512,
@@ -42,10 +75,27 @@ impl File {
         Self::dir(inode, ".".into())
     }
 
-    fn from_entry(inode: Inode, entry: pna::RegularEntry) -> Self {
+    fn from_entry<S: Into<String>>(
+        inode: Inode,
+        entry: pna::RegularEntry,
+        password: Option<S>,
+    ) -> Self {
         let now = SystemTime::now();
         let header = entry.header();
         let metadata = entry.metadata();
+        let option = ReadOption::with_password(password);
+        let raw_size = {
+            let mut size = 0;
+            let mut reader = entry.reader(option.clone()).unwrap();
+            let mut buf = [0u8; 1024];
+            while let Ok(s) = reader.read(&mut buf) {
+                if s == 0 {
+                    break;
+                }
+                size += s;
+            }
+            size
+        };
         Self {
             name: header
                 .path()
@@ -58,7 +108,7 @@ impl File {
                 .into(),
             attr: FileAttr {
                 ino: inode,
-                size: metadata.compressed_size() as u64,
+                size: raw_size as u64,
                 blocks: 1,
                 atime: now,
                 mtime: metadata
@@ -87,6 +137,10 @@ impl File {
                 blksize: 512,
                 flags: 0,
             },
+            data: Entry {
+                cell: Default::default(),
+                data: Some((entry, option)),
+            },
         }
     }
 }
@@ -108,8 +162,8 @@ impl FileManager {
             archive_path,
             password: None,
             tree: TreeBuilder::new().build(),
-            files: HashMap::with_capacity(0),
-            node_ids: HashMap::with_capacity(0),
+            files: HashMap::new(),
+            node_ids: HashMap::new(),
             last_inode: ROOT_INODE,
         };
         mamager.populate().unwrap();
@@ -143,7 +197,7 @@ impl FileManager {
                     parent = ino;
                 }
             }
-            let file = File::from_entry(self.next_inode(), entry);
+            let file = File::from_entry(self.next_inode(), entry, password.as_ref());
             self.add_file(file, parent)?;
         }
         Ok(())
@@ -175,6 +229,10 @@ impl FileManager {
 
     pub(crate) fn get_file(&self, ino: Inode) -> Option<&File> {
         self.files.get(&ino)
+    }
+
+    pub(crate) fn get_file_mut(&mut self, ino: Inode) -> Option<&mut File> {
+        self.files.get_mut(&ino)
     }
 
     pub(crate) fn get_children(&self, parent: Inode) -> Option<Vec<&File>> {
