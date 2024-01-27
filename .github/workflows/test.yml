@@ -8,14 +8,20 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
+          - freebsd-latest # self-hosted
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-rust
       - name: Install dependencies
+        if: startsWith(matrix.os, 'ubuntu')
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
+      - name: Install dependencies
+        if: startsWith(matrix.os, 'freebsd')
+        run: |
+          sudo pkg install -y pkgconf fusefs-libs3
       - name: Run test
         run: cargo test --locked --release
         env:
