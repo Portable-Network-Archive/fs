@@ -26,7 +26,6 @@ impl Filesystem for PnaFS {
             "[Implemented] lookup(parent: {:#x?}, name {:?})",
             parent, name
         );
-        let name = name.to_string_lossy().to_string();
         let children = self.manager.get_children(parent).unwrap();
         let entry = children.iter().find(|it| it.name == name);
         if let Some(entry) = entry {
@@ -101,7 +100,7 @@ impl Filesystem for PnaFS {
                 current_offset as u64,
                 current_offset,
                 entry.attr.kind,
-                entry.name.as_str(),
+                &entry.name,
             );
             if is_full {
                 break;
