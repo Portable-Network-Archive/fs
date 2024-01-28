@@ -6,8 +6,6 @@ use std::ffi::OsStr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-const TTL: Duration = Duration::from_secs(1);
-
 pub(crate) struct PnaFS {
     manager: FileManager,
 }
@@ -29,7 +27,8 @@ impl Filesystem for PnaFS {
         let children = self.manager.get_children(parent).unwrap();
         let entry = children.iter().find(|it| it.name == name);
         if let Some(entry) = entry {
-            reply.entry(&TTL, &entry.attr, 0);
+            let ttl = Duration::from_secs(1);
+            reply.entry(&ttl, &entry.attr, 0);
         } else {
             reply.error(ENOENT);
         }
