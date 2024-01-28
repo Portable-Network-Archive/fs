@@ -171,12 +171,12 @@ impl FileManager {
     }
 
     fn populate(&mut self) -> io::Result<()> {
-        self.add_root_file(File::root(ROOT_INODE)).unwrap();
-        let file = fs::File::open(&self.archive_path).unwrap();
-        let mut archive = Archive::read_header(file).unwrap();
+        self.add_root_file(File::root(ROOT_INODE))?;
+        let file = fs::File::open(&self.archive_path)?;
+        let mut archive = Archive::read_header(file)?;
         let password = self.password.clone();
         for entry in archive.entries_with_password(password.as_deref()) {
-            let entry = entry.unwrap();
+            let entry = entry?;
             let mut parents = entry
                 .header()
                 .path()
