@@ -26,3 +26,12 @@ jobs:
         run: cargo test --locked --release
         env:
           RUST_BACKTRACE: 1
+      - name: Install cli
+        run: |
+          cargo install -f portable-network-archive
+          cargo install --locked --path .
+      - name: Run test cli
+        shell: bash
+        run: |
+          chmod +x scripts/tests/run.sh
+          ./scripts/tests/run.sh
