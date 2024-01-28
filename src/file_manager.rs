@@ -3,6 +3,7 @@ use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
 use pna::{Archive, DataKind, ReadOption};
 use std::cell::OnceCell;
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::io::Read;
 use std::ops::Add;
 use std::path::PathBuf;
@@ -41,13 +42,13 @@ impl Entry {
 }
 
 pub(crate) struct File {
-    pub(crate) name: String,
+    pub(crate) name: OsString,
     pub(crate) data: Entry,
     pub(crate) attr: FileAttr,
 }
 
 impl File {
-    fn dir(inode: Inode, name: String) -> Self {
+    fn dir(inode: Inode, name: OsString) -> Self {
         let now = SystemTime::now();
         Self {
             name,
@@ -104,7 +105,6 @@ impl File {
                 .last()
                 .unwrap()
                 .as_os_str()
-                .to_string_lossy()
                 .into(),
             attr: FileAttr {
                 ino: inode,
@@ -186,14 +186,14 @@ impl FileManager {
             parents.pop();
             let mut parent = ROOT_INODE;
             for component in parents {
-                let name = component.as_os_str().to_string_lossy().to_string();
+                let name = component.as_os_str();
                 let children = self.get_children(parent).unwrap();
                 let it = children.iter().find(|it| name == it.name);
                 if let Some(it) = it {
                     parent = it.attr.ino;
                 } else {
                     let ino = self.next_inode();
-                    self.add_file(File::dir(ino, name), parent)?;
+                    self.add_file(File::dir(ino, name.into()), parent)?;
                     parent = ino;
                 }
             }
