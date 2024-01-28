@@ -31,7 +31,7 @@ fn mount_archive<MountPoint: AsRef<Path>, Archive: AsRef<Path>>(
         mount_point,
         &[
             MountOption::FSName("pnafs".to_owned()),
-            MountOption::AllowRoot,
+            // MountOption::AllowRoot,
             MountOption::RO,
         ],
     )?;
