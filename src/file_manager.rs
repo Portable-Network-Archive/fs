@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
 use std::ops::Add;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use std::{fs, io};
 
@@ -177,28 +177,14 @@ impl FileManager {
         let password = self.password.clone();
         for entry in archive.entries_with_password(password.as_deref()) {
             let entry = entry?;
-            let mut parents = entry
-                .header()
-                .path()
-                .as_path()
-                .components()
-                .collect::<Vec<_>>();
-            parents.pop();
-            let mut parent = ROOT_INODE;
-            for component in parents {
-                let name = component.as_os_str();
-                let children = self.get_children(parent).unwrap();
-                let it = children.iter().find(|it| name == it.name);
-                if let Some(it) = it {
-                    parent = it.attr.ino;
-                } else {
-                    let ino = self.next_inode();
-                    self.add_file(File::dir(ino, name.into()), parent)?;
-                    parent = ino;
-                }
-            }
+            let mut parents = entry.header().path().as_path().parent();
+            let parent = if let Some(parents) = parents {
+                self.make_dir_all(parents, ROOT_INODE)?
+            } else {
+                ROOT_INODE
+            };
             let file = File::from_entry(self.next_inode(), entry, password.as_ref());
-            self.add_file(file, parent)?;
+            self.add_or_update_file(file, parent)?;
         }
         Ok(())
     }
@@ -225,6 +211,38 @@ impl FileManager {
         self.node_ids.insert(file.attr.ino, node_id);
         self.files.insert(file.attr.ino, file);
         Ok(())
+    }
+
+    fn update_file(&mut self, ino: Inode, mut file: File) -> io::Result<()> {
+        file.attr.ino = ino;
+        self.files.insert(file.attr.ino, file);
+        Ok(())
+    }
+
+    fn add_or_update_file(&mut self, mut file: File, parent: Inode) -> io::Result<()> {
+        let children = self.get_children(parent).unwrap();
+        if let Some(it) = children.iter().find(|it| it.name == file.name) {
+            self.update_file(it.attr.ino, file)
+        } else {
+            self.add_file(file, parent)
+        }
+    }
+
+    /// Create directories and return most deep directory Inode.
+    fn make_dir_all(&mut self, path: &Path, mut parent: Inode) -> io::Result<Inode> {
+        for component in path.components() {
+            let name = component.as_os_str();
+            let children = self.get_children(parent).unwrap();
+            let it = children.iter().find(|it| name == it.name);
+            if let Some(it) = it {
+                parent = it.attr.ino;
+            } else {
+                let ino = self.next_inode();
+                self.add_file(File::dir(ino, name.into()), parent)?;
+                parent = ino;
+            }
+        }
+        Ok(parent)
     }
 
     pub(crate) fn get_file(&self, ino: Inode) -> Option<&File> {
