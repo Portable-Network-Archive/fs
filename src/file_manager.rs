@@ -177,7 +177,7 @@ impl FileManager {
         let password = self.password.clone();
         for entry in archive.entries_with_password(password.as_deref()) {
             let entry = entry?;
-            let mut parents = entry.header().path().as_path().parent();
+            let parents = entry.header().path().as_path().parent();
             let parent = if let Some(parents) = parents {
                 self.make_dir_all(parents, ROOT_INODE)?
             } else {
@@ -207,7 +207,7 @@ impl FileManager {
         let node_id = self
             .tree
             .insert(Node::new(file.attr.ino), insert_behavior)
-            .map_err(|err| io::Error::other(err))?;
+            .map_err(io::Error::other)?;
         self.node_ids.insert(file.attr.ino, node_id);
         self.files.insert(file.attr.ino, file);
         Ok(())
@@ -219,7 +219,7 @@ impl FileManager {
         Ok(())
     }
 
-    fn add_or_update_file(&mut self, mut file: File, parent: Inode) -> io::Result<()> {
+    fn add_or_update_file(&mut self, file: File, parent: Inode) -> io::Result<()> {
         let children = self.get_children(parent).unwrap();
         if let Some(it) = children.iter().find(|it| it.name == file.name) {
             self.update_file(it.attr.ino, file)

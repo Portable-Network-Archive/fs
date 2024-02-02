@@ -72,7 +72,7 @@ impl Filesystem for PnaFS {
             "[Implemented] flush(ino: {:#x?}, fh: {}, lock_owner: {:?})",
             ino, fh, lock_owner
         );
-        if let Some(_) = self.manager.get_file(ino) {
+        if self.manager.get_file(ino).is_some() {
             reply.ok();
         } else {
             reply.error(ENOENT);
