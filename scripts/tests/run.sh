@@ -3,7 +3,7 @@ set -eu
 
 main() {
   pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --overwrite
-  pna-fs mount src.pna ./mnt/pna/src/ &
+  pnafs mount src.pna ./mnt/pna/src/ &
   PID=$(echo $!)
   while [ ! -e ./mnt/pna/src/src ]; do
     echo "Wait while mount ..."
