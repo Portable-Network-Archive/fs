@@ -2,7 +2,7 @@ use crate::command::mount::MountArgs;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-pub(crate) struct CLI {
+pub(crate) struct Cli {
     #[clap(subcommand)]
     pub(crate) subcommand: SubCommand,
 }

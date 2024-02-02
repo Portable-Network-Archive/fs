@@ -15,7 +15,7 @@ fn main() -> io::Result<()> {
 }
 
 fn entry() -> io::Result<()> {
-    let cli = cli::CLI::parse();
+    let cli = cli::Cli::parse();
     match cli.subcommand {
         SubCommand::Mount(args) => args.execute(),
     }
