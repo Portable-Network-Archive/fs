@@ -129,7 +129,7 @@ impl File {
                     DataKind::SymbolicLink => FileType::Symlink,
                     DataKind::HardLink => FileType::RegularFile,
                 },
-                perm: 0o775,
+                perm: metadata.permission().map_or(0o775, |it| it.permissions()),
                 nlink: 1,
                 uid: 0,
                 gid: 0,
