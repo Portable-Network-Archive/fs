@@ -1,9 +1,12 @@
 
 set -eu
 
-main() {
-  pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --overwrite
-  pnafs mount src.pna ./mnt/pna/src/ &
+PASSWORD="password"
+
+run_with() {
+  EXTRA_OPTIONS=$*
+  pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --overwrite $EXTRA_OPTIONS
+  pnafs mount src.pna ./mnt/pna/src/ $EXTRA_OPTIONS &
   PID=$(echo $!)
   while [ ! -e ./mnt/pna/src/src ]; do
     echo "Wait while mount ..."
@@ -21,6 +24,11 @@ main() {
   diff -r ./src ./mnt/pna/src/src
   umount ./mnt/pna/src/
   echo "Done."
+}
+
+main() {
+  run_with
+  run_with --password "$PASSWORD"
 }
 
 main "$@"
