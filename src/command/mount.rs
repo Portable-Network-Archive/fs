@@ -3,7 +3,7 @@ use crate::{
     command::{ask_password, Command},
     filesystem::PnaFS,
 };
-use clap::Args;
+use clap::{Args, ValueHint};
 use fuser::{mount2, MountOption};
 use std::fs::create_dir_all;
 use std::io;
@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 pub(crate) struct MountArgs {
     #[command(flatten)]
     password: PasswordArgs,
-    #[arg()]
+    #[arg(value_hint = ValueHint::FilePath)]
     archive: PathBuf,
-    #[arg()]
+    #[arg(value_hint = ValueHint::DirPath)]
     mount_point: PathBuf,
 }
 
