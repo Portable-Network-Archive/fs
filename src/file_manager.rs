@@ -1,11 +1,12 @@
 use fuser::{FileAttr, FileType};
 use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
-use pna::{Archive, DataKind, ReadOption};
+#[cfg(unix)]
+use nix::unistd::{Gid, Group, Uid, User};
+use pna::{Archive, DataKind, Permission, ReadOption};
 use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
-use std::ops::Add;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use std::{fs, io};
@@ -64,14 +65,15 @@ impl File {
                 kind: FileType::Directory,
                 perm: 0o775,
                 nlink: 2,
-                uid: 0,
-                gid: 0,
+                uid: get_owner_id(None),
+                gid: get_group_id(None),
                 rdev: 0,
                 blksize: 0,
                 flags: 0,
             },
         }
     }
+
     fn root(inode: Inode) -> Self {
         Self::dir(inode, ".".into())
     }
@@ -113,15 +115,15 @@ impl File {
                 atime: now,
                 mtime: metadata
                     .modified()
-                    .map(|it| SystemTime::UNIX_EPOCH.add(it))
+                    .map(|it| SystemTime::UNIX_EPOCH + it)
                     .unwrap_or(now),
                 ctime: metadata
                     .modified()
-                    .map(|it| SystemTime::UNIX_EPOCH.add(it))
+                    .map(|it| SystemTime::UNIX_EPOCH + it)
                     .unwrap_or(now),
                 crtime: metadata
                     .created()
-                    .map(|it| SystemTime::UNIX_EPOCH.add(it))
+                    .map(|it| SystemTime::UNIX_EPOCH + it)
                     .unwrap_or(now),
                 kind: match header.data_kind() {
                     DataKind::File => FileType::RegularFile,
@@ -131,8 +133,8 @@ impl File {
                 },
                 perm: metadata.permission().map_or(0o775, |it| it.permissions()),
                 nlink: 1,
-                uid: 0,
-                gid: 0,
+                uid: get_owner_id(metadata.permission()),
+                gid: get_group_id(metadata.permission()),
                 rdev: 0,
                 blksize: 512,
                 flags: 0,
@@ -260,4 +262,48 @@ impl FileManager {
             .map(|ino| self.files.get(ino.data()))
             .collect::<Option<Vec<_>>>()
     }
+}
+
+#[cfg(unix)]
+fn search_owner(name: &str, id: u64) -> Option<User> {
+    let user = User::from_name(name).ok().flatten();
+    if user.is_some() {
+        return user;
+    }
+    User::from_uid((id as u32).into()).ok().flatten()
+}
+
+#[cfg(unix)]
+fn search_group(name: &str, id: u64) -> Option<Group> {
+    let group = Group::from_name(name).ok().flatten();
+    if group.is_some() {
+        return group;
+    }
+    Group::from_gid((id as u32).into()).ok().flatten()
+}
+
+#[cfg(unix)]
+fn get_owner_id(permission: Option<&Permission>) -> u32 {
+    permission
+        .and_then(|it| search_owner(it.uname(), it.uid()))
+        .map_or_else(Uid::current, |it| it.uid)
+        .as_raw()
+}
+
+#[cfg(unix)]
+fn get_group_id(permission: Option<&Permission>) -> u32 {
+    permission
+        .and_then(|it| search_group(it.gname(), it.gid()))
+        .map_or_else(Gid::current, |it| it.gid)
+        .as_raw()
+}
+
+#[cfg(not(unix))]
+fn get_owner_id(_permission: Option<&Permission>) -> u32 {
+    0
+}
+
+#[cfg(not(unix))]
+fn get_group_id(_permission: Option<&Permission>) -> u32 {
+    0
 }
