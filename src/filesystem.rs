@@ -11,9 +11,9 @@ pub(crate) struct PnaFS {
 }
 
 impl PnaFS {
-    pub(crate) fn new(archive: PathBuf) -> Self {
+    pub(crate) fn new(archive: PathBuf, password: Option<String>) -> Self {
         Self {
-            manager: FileManager::new(archive),
+            manager: FileManager::new(archive, password),
         }
     }
 }
