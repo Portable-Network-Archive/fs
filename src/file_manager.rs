@@ -159,10 +159,10 @@ pub(crate) struct FileManager {
 }
 
 impl FileManager {
-    pub(crate) fn new(archive_path: PathBuf) -> Self {
+    pub(crate) fn new(archive_path: PathBuf, password: Option<String>) -> Self {
         let mut mamager = Self {
             archive_path,
-            password: None,
+            password,
             tree: TreeBuilder::new().build(),
             files: HashMap::new(),
             node_ids: HashMap::new(),

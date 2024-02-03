@@ -11,3 +11,12 @@ pub(crate) struct Cli {
 pub(crate) enum SubCommand {
     Mount(MountArgs),
 }
+
+#[derive(Parser, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
+pub(crate) struct PasswordArgs {
+    #[arg(
+        long,
+        help = "Password of archive. If password is not given it's asked from the tty"
+    )]
+    pub(crate) password: Option<Option<String>>,
+}
