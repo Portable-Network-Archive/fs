@@ -1,7 +1,5 @@
 use crate::command::mount::MountArgs;
 use clap::{Parser, Subcommand};
-#[cfg(feature = "unstable-generate")]
-use clap_complete::Shell;
 
 #[derive(Parser)]
 #[command(
@@ -13,15 +11,16 @@ use clap_complete::Shell;
 )]
 pub(crate) struct Cli {
     #[clap(subcommand)]
-    pub(crate) subcommand: Option<SubCommand>,
-    #[cfg(feature = "unstable-generate")]
-    #[arg(long, help = "Generate shell auto complete")]
-    pub(crate) generate: Option<Shell>,
+    pub(crate) subcommand: SubCommand,
 }
 
 #[derive(Subcommand)]
 pub(crate) enum SubCommand {
+    #[command(about = "Mount archive")]
     Mount(MountArgs),
+    #[cfg(feature = "unstable-generate")]
+    #[command(about = "Generate shell auto complete")]
+    Generate(crate::command::generate::GenerateArgs),
 }
 
 #[derive(Parser, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
