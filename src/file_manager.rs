@@ -86,64 +86,51 @@ impl File {
         let now = SystemTime::now();
         let header = entry.header();
         let metadata = entry.metadata();
-        let option = ReadOption::with_password(password);
-        let raw_size = {
-            let mut size = 0;
-            let mut reader = entry.reader(option.clone()).unwrap();
-            let mut buf = [0u8; 1024];
-            while let Ok(s) = reader.read(&mut buf) {
-                if s == 0 {
-                    break;
-                }
-                size += s;
-            }
-            size
+        let name = header
+            .path()
+            .as_path()
+            .components()
+            .last()
+            .unwrap()
+            .as_os_str()
+            .into();
+
+        let mut attr = FileAttr {
+            ino: inode,
+            size: 0,
+            blocks: 1,
+            atime: now,
+            mtime: metadata
+                .modified()
+                .map_or(now, |it| SystemTime::UNIX_EPOCH + it),
+            ctime: metadata
+                .modified()
+                .map_or(now, |it| SystemTime::UNIX_EPOCH + it),
+            crtime: metadata
+                .created()
+                .map_or(now, |it| SystemTime::UNIX_EPOCH + it),
+            kind: match header.data_kind() {
+                DataKind::File => FileType::RegularFile,
+                DataKind::Directory => FileType::Directory,
+                DataKind::SymbolicLink => FileType::Symlink,
+                DataKind::HardLink => FileType::RegularFile,
+            },
+            perm: metadata.permission().map_or(0o775, |it| it.permissions()),
+            nlink: 1,
+            uid: get_owner_id(metadata.permission()),
+            gid: get_group_id(metadata.permission()),
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
         };
-        Self {
-            name: header
-                .path()
-                .as_path()
-                .components()
-                .last()
-                .unwrap()
-                .as_os_str()
-                .into(),
-            attr: FileAttr {
-                ino: inode,
-                size: raw_size as u64,
-                blocks: 1,
-                atime: now,
-                mtime: metadata
-                    .modified()
-                    .map(|it| SystemTime::UNIX_EPOCH + it)
-                    .unwrap_or(now),
-                ctime: metadata
-                    .modified()
-                    .map(|it| SystemTime::UNIX_EPOCH + it)
-                    .unwrap_or(now),
-                crtime: metadata
-                    .created()
-                    .map(|it| SystemTime::UNIX_EPOCH + it)
-                    .unwrap_or(now),
-                kind: match header.data_kind() {
-                    DataKind::File => FileType::RegularFile,
-                    DataKind::Directory => FileType::Directory,
-                    DataKind::SymbolicLink => FileType::Symlink,
-                    DataKind::HardLink => FileType::RegularFile,
-                },
-                perm: metadata.permission().map_or(0o775, |it| it.permissions()),
-                nlink: 1,
-                uid: get_owner_id(metadata.permission()),
-                gid: get_group_id(metadata.permission()),
-                rdev: 0,
-                blksize: 512,
-                flags: 0,
-            },
-            data: Entry {
-                cell: Default::default(),
-                data: Some((entry, option)),
-            },
-        }
+        let option = ReadOption::with_password(password);
+        let mut data = Entry {
+            cell: Default::default(),
+            data: Some((entry, option)),
+        };
+        let raw_size = data.as_slice().len();
+        attr.size = raw_size as u64;
+        Self { name, attr, data }
     }
 }
 
