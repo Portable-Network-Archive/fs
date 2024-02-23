@@ -99,7 +99,9 @@ impl File {
             ino: inode,
             size: 0,
             blocks: 1,
-            atime: now,
+            atime: metadata
+                .modified()
+                .map_or(now, |it| SystemTime::UNIX_EPOCH + it),
             mtime: metadata
                 .modified()
                 .map_or(now, |it| SystemTime::UNIX_EPOCH + it),
