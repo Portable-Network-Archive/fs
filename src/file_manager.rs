@@ -124,11 +124,20 @@ impl File {
             flags: 0,
         };
         let option = ReadOption::with_password(password);
-        let mut data = Entry {
-            cell: Default::default(),
-            data: Some((entry, option)),
+        let (data, raw_size) = if let Some(raw_size) = metadata.raw_file_size() {
+            let data = Entry {
+                cell: Default::default(),
+                data: Some((entry, option)),
+            };
+            (data, raw_size as usize)
+        } else {
+            let mut data = Entry {
+                cell: Default::default(),
+                data: Some((entry, option)),
+            };
+            let raw_size = data.as_slice().len();
+            (data, raw_size)
         };
-        let raw_size = data.as_slice().len();
         attr.size = raw_size as u64;
         Self { name, attr, data }
     }
