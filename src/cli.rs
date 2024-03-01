@@ -20,7 +20,7 @@ pub(crate) enum SubCommand {
     Mount(MountArgs),
     #[cfg(feature = "unstable-generate")]
     #[command(about = "Generate shell auto complete")]
-    Generate(crate::command::generate::GenerateArgs),
+    Complete(crate::command::complete::CompleteArgs),
 }
 
 #[derive(Parser, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]

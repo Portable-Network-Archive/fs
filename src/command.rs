@@ -1,5 +1,5 @@
 #[cfg(feature = "unstable-generate")]
-pub(crate) mod generate;
+pub(crate) mod complete;
 pub(crate) mod mount;
 
 use crate::cli::{Cli, PasswordArgs, SubCommand};
@@ -9,7 +9,7 @@ pub(crate) fn entry(args: Cli) -> io::Result<()> {
     match args.subcommand {
         SubCommand::Mount(args) => args.execute(),
         #[cfg(feature = "unstable-generate")]
-        SubCommand::Generate(args) => args.execute(),
+        SubCommand::Complete(args) => args.execute(),
     }
 }
 

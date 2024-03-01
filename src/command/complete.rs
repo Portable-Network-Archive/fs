@@ -4,12 +4,12 @@ use clap_complete::{generate, Generator, Shell};
 use std::{env, io, path::PathBuf};
 
 #[derive(Args)]
-pub(crate) struct GenerateArgs {
+pub(crate) struct CompleteArgs {
     #[arg(help = "shell")]
     pub(crate) shell: Shell,
 }
 
-impl Command for GenerateArgs {
+impl Command for CompleteArgs {
     fn execute(self) -> io::Result<()> {
         print_completions(self.shell, &mut Cli::command());
         Ok(())
