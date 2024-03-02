@@ -1,4 +1,3 @@
-#[cfg(feature = "unstable-generate")]
 pub(crate) mod complete;
 pub(crate) mod mount;
 
@@ -8,7 +7,6 @@ use std::io;
 pub(crate) fn entry(args: Cli) -> io::Result<()> {
     match args.subcommand {
         SubCommand::Mount(args) => args.execute(),
-        #[cfg(feature = "unstable-generate")]
         SubCommand::Complete(args) => args.execute(),
     }
 }

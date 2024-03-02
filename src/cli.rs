@@ -18,7 +18,6 @@ pub(crate) struct Cli {
 pub(crate) enum SubCommand {
     #[command(about = "Mount archive")]
     Mount(MountArgs),
-    #[cfg(feature = "unstable-generate")]
     #[command(about = "Generate shell auto complete")]
     Complete(crate::command::complete::CompleteArgs),
 }
