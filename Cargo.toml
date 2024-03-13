@@ -45,7 +45,7 @@ targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-unknown-linux-
 pr-run-mode = "upload"
 
 [workspace.metadata.dist.dependencies.homebrew]
-osxfuse = { stage = ["build", "run"] }
+"homebrew/cask/osxfuse" = { stage = ["build", "run"] }
 
 [workspace.metadata.dist.dependencies.apt]
 libfuse3-dev = { stage = ["build", "run"] }
