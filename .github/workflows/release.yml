@@ -121,11 +121,6 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      - if: startsWith(matrix.runner, 'macos')
-        name: "Install fuse"
-        run: |
-          git clone https://github.com/osxfuse/fuse.git
-          cd fuse && ./makeconf.sh && ./configure && make -j8 && make install
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
