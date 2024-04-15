@@ -141,6 +141,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "camino"
+version = "1.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c59e92b5a388f549b863a7bea62612c09f24c8393560709a54558a9abdfb3b9c"
+
+[[package]]
 name = "cbc"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -454,18 +460,18 @@ checksum = "9c198f91728a82281a64e1f4f9eeb25d82cb32a5de251c6bd1b5154d63a8e7bd"
 
 [[package]]
 name = "liblzma"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4a85763908276cd4526fe29677e85cf4945bb15f59d91312db61bfe88294e18"
+checksum = "717c314a016664dec8c5b42f72dce3b23bc42b0399b712604c816d4f528ec99a"
 dependencies = [
  "liblzma-sys",
 ]
 
 [[package]]
 name = "liblzma-sys"
-version = "0.3.0"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac1124ae12ab2748227b1302133d48a752c5f92340d85a28a53cee3d71b2c86b"
+checksum = "2897528b23db157f02481ed7dd11d05421885fd5b5b4020c5ddb95bef6d47b4a"
 dependencies = [
  "cc",
  "libc",
@@ -474,13 +480,14 @@ dependencies = [
 
 [[package]]
 name = "libpna"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8aa2acd7beaf47a93b05648ed077f8cf1de6bb448720ed9b9ba6e0965f1d5a0c"
+checksum = "fd052fb99223849e63dc198782f004fe7f9a8705580bbb8fcf3ab5aacebc4bcd"
 dependencies = [
  "aes",
  "argon2",
  "camellia",
+ "camino",
  "cbc",
  "cipher",
  "crc32fast",
@@ -585,9 +592,9 @@ checksum = "2900ede94e305130c13ddd391e0ab7cbaeb783945ae07a279c268cb05109c6cb"
 
 [[package]]
 name = "pna"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "324e71e214a6da3b3c32b7495a1f4d6953c4967a839708767787c47e5353c976"
+checksum = "e6e83ba1ab90d7cf2c8038afd310e835dc8bf88a7d2ab924aec6a5883d3882ec"
 dependencies = [
  "libpna",
 ]
