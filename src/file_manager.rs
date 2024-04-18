@@ -14,6 +14,7 @@ pub type Inode = u64;
 
 pub(crate) struct LoadedEntry {
     data: Vec<u8>,
+    xattrs: HashMap<OsString, Vec<u8>>,
 }
 
 pub(crate) struct UnprocessedEntry {
@@ -30,15 +31,22 @@ pub(crate) struct Entry(State);
 
 impl Entry {
     fn empty() -> Self {
-        Self(State::Loaded(LoadedEntry { data: Vec::new() }))
+        Self(State::Loaded(LoadedEntry {
+            data: Vec::new(),
+            xattrs: HashMap::new(),
+        }))
     }
 
     fn load(&mut self) {
         if let State::Unprocessed(e) = &self.0 {
+            let mut xattrs = HashMap::with_capacity(e.entry.xattrs().len());
+            for xattr in e.entry.xattrs() {
+                xattrs.insert(xattr.name().into(), xattr.value().into());
+            }
             let mut buf = Vec::new();
             let mut reader = e.entry.reader(e.option.clone()).unwrap();
             reader.read_to_end(&mut buf).unwrap();
-            self.0 = State::Loaded(LoadedEntry { data: buf });
+            self.0 = State::Loaded(LoadedEntry { data: buf, xattrs });
         }
     }
 
@@ -46,6 +54,14 @@ impl Entry {
         self.load();
         match &self.0 {
             State::Loaded(e) => e.data.as_slice(),
+            State::Unprocessed(_) => unreachable!(),
+        }
+    }
+
+    pub(crate) fn xattrs(&mut self) -> &HashMap<OsString, Vec<u8>> {
+        self.load();
+        match &self.0 {
+            State::Loaded(e) => &e.xattrs,
             State::Unprocessed(_) => unreachable!(),
         }
     }
