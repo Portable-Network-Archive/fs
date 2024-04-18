@@ -3,7 +3,6 @@ use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
 use pna::{Archive, DataKind, Permission, ReadOption};
-use std::cell::OnceCell;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
@@ -13,32 +12,42 @@ use std::{fs, io};
 
 pub type Inode = u64;
 
-pub(crate) struct Entry {
-    cell: OnceCell<Vec<u8>>,
-    data: Option<(pna::RegularEntry, ReadOption)>,
+pub(crate) struct LoadedEntry {
+    data: Vec<u8>,
 }
+
+pub(crate) struct UnprocessedEntry {
+    entry: pna::RegularEntry,
+    option: ReadOption,
+}
+
+pub(crate) enum State {
+    Loaded(LoadedEntry),
+    Unprocessed(UnprocessedEntry),
+}
+
+pub(crate) struct Entry(State);
 
 impl Entry {
     fn empty() -> Self {
-        Self {
-            cell: Default::default(),
-            data: None,
+        Self(State::Loaded(LoadedEntry { data: Vec::new() }))
+    }
+
+    fn load(&mut self) {
+        if let State::Unprocessed(e) = &self.0 {
+            let mut buf = Vec::new();
+            let mut reader = e.entry.reader(e.option.clone()).unwrap();
+            reader.read_to_end(&mut buf).unwrap();
+            self.0 = State::Loaded(LoadedEntry { data: buf });
         }
     }
 
     pub(crate) fn as_slice(&mut self) -> &[u8] {
-        self.cell
-            .get_or_init(|| {
-                if let Some((entry, option)) = self.data.take() {
-                    let mut buf = Vec::new();
-                    let mut reader = entry.reader(option).unwrap();
-                    reader.read_to_end(&mut buf).unwrap();
-                    buf
-                } else {
-                    Vec::new()
-                }
-            })
-            .as_slice()
+        self.load();
+        match &self.0 {
+            State::Loaded(e) => e.data.as_slice(),
+            State::Unprocessed(_) => unreachable!(),
+        }
     }
 }
 
@@ -127,16 +136,10 @@ impl File {
         };
         let option = ReadOption::with_password(password);
         let (data, raw_size) = if let Some(raw_size) = metadata.raw_file_size() {
-            let data = Entry {
-                cell: Default::default(),
-                data: Some((entry, option)),
-            };
+            let data = Entry(State::Unprocessed(UnprocessedEntry { entry, option }));
             (data, raw_size as usize)
         } else {
-            let mut data = Entry {
-                cell: Default::default(),
-                data: Some((entry, option)),
-            };
+            let mut data = Entry(State::Unprocessed(UnprocessedEntry { entry, option }));
             let raw_size = data.as_slice().len();
             (data, raw_size)
         };
