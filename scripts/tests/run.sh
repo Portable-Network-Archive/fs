@@ -5,7 +5,7 @@ PASSWORD="password"
 
 run_with() {
   EXTRA_OPTIONS=$*
-  pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --overwrite $EXTRA_OPTIONS
+  pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --keep-xattr --overwrite $EXTRA_OPTIONS
   pnafs mount src.pna ./mnt/pna/src/ $EXTRA_OPTIONS &
   PID=$(echo $!)
   while [ ! -e ./mnt/pna/src/src ]; do
