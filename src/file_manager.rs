@@ -43,12 +43,10 @@ impl Entry {
     }
 
     pub(crate) fn as_slice(&mut self) -> &[u8] {
+        self.load();
         match &self.0 {
             State::Loaded(e) => e.data.as_slice(),
-            State::Unprocessed(_) => {
-                self.load();
-                self.as_slice()
-            }
+            State::Unprocessed(_) => unreachable!(),
         }
     }
 }
