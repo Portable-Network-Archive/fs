@@ -1,8 +1,11 @@
 use crate::file_manager::FileManager;
-use fuser::{Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, Request};
+use fuser::{
+    Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyXattr, Request,
+};
 use libc::ENOENT;
 use log::info;
-use std::ffi::OsStr;
+use std::ffi::{CString, OsStr};
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -108,5 +111,56 @@ impl Filesystem for PnaFS {
             }
         }
         reply.ok();
+    }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        info!(
+            "[Implemented] getxattr(ino: {:#x?}, name: {:?}, size: {})",
+            ino, name, size
+        );
+        if let Some(file) = self.manager.get_file_mut(ino) {
+            if let Some(value) = file.data.xattrs().get(name) {
+                if size == 0 {
+                    reply.size(value.len() as u32);
+                } else {
+                    reply.data(value);
+                }
+            } else {
+                reply.error(ENOENT);
+            }
+        } else {
+            reply.error(ENOENT);
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        info!("[Implemented] listxattr(ino: {:#x?}, size: {})", ino, size);
+        if let Some(file) = self.manager.get_file_mut(ino) {
+            let keys = file
+                .data
+                .xattrs()
+                .keys()
+                .flat_map(|key| {
+                    CString::new(key.as_bytes())
+                        .unwrap_or_default()
+                        .as_bytes_with_nul()
+                        .to_vec()
+                })
+                .collect::<Vec<_>>();
+            if size == 0 {
+                reply.size(keys.len() as u32);
+            } else {
+                reply.data(&keys);
+            }
+        } else {
+            reply.error(ENOENT);
+        }
     }
 }
