@@ -14,7 +14,7 @@ clap = { version = "4.5.4", features = ["derive"] }
 clap_complete = "4.5.2"
 fuser = "0.14.0"
 id_tree = "1.8.0"
-libc = "0.2.154"
+libc = "0.2.155"
 log = "0.4.21"
 pna = "0.11.0"
 rpassword = "7.3.1"
