@@ -11,7 +11,7 @@ readme = "README.md"
 
 [dependencies]
 clap = { version = "4.5.6", features = ["derive"] }
-clap_complete = "4.5.4"
+clap_complete = "4.5.5"
 fuser = "0.14.0"
 id_tree = "1.8.0"
 libc = "0.2.155"
