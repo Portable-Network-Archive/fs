@@ -142,9 +142,9 @@ dependencies = [
 
 [[package]]
 name = "camino"
-version = "1.1.6"
+version = "1.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c59e92b5a388f549b863a7bea62612c09f24c8393560709a54558a9abdfb3b9c"
+checksum = "e0ec6b951b160caa93cc0c7b209e5a3bff7aae9062213451ac99493cd844c239"
 
 [[package]]
 name = "cbc"
@@ -263,9 +263,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.4.0"
+version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3855a8a784b474f333699ef2bbca9db2c4a1f6d9088a90a2d25b1eb53111eaa"
+checksum = "a97769d94ddab943e4510d138150169a2758b5ef3eb191a9ee688de3e23ef7b3"
 dependencies = [
  "cfg-if",
 ]
@@ -460,18 +460,18 @@ checksum = "97b3888a4aecf77e811145cadf6eef5901f4782c53886191b2f693f24761847c"
 
 [[package]]
 name = "liblzma"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "717c314a016664dec8c5b42f72dce3b23bc42b0399b712604c816d4f528ec99a"
+checksum = "243510a5543c358949902b9e76daec3a32d7b03a43abce823e7c62a1a8360172"
 dependencies = [
  "liblzma-sys",
 ]
 
 [[package]]
 name = "liblzma-sys"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2897528b23db157f02481ed7dd11d05421885fd5b5b4020c5ddb95bef6d47b4a"
+checksum = "83cf78d20a45b5c0f3c7da2dcac255b230efe7d8684282bd35873164c1491187"
 dependencies = [
  "cc",
  "libc",
@@ -480,9 +480,9 @@ dependencies = [
 
 [[package]]
 name = "libpna"
-version = "0.11.1"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2cc553189a1e361fb6c9786268eae2359852451be3068c5b8af11d7a3672631"
+checksum = "e3b438de9fab1bacd80e77c7efb8cb67fc30a31874317d3c748aeea76dcd5898"
 dependencies = [
  "aes",
  "argon2",
@@ -598,9 +598,9 @@ checksum = "2900ede94e305130c13ddd391e0ab7cbaeb783945ae07a279c268cb05109c6cb"
 
 [[package]]
 name = "pna"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "760686d27c2270ada533df0c69fd4d22f451e50b8f0fd5cb4f8408a5a94f161c"
+checksum = "61a0614a22c8e954be875bb3e4ab799d23953bb07d17210ab51e1d9abf12ddef"
 dependencies = [
  "libpna",
 ]
