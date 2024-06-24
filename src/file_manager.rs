@@ -2,7 +2,7 @@ use fuser::{FileAttr, FileType};
 use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
-use pna::{Archive, DataKind, Permission, ReadOption};
+use pna::{Archive, DataKind, Permission, ReadOptions};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
@@ -19,7 +19,7 @@ pub(crate) struct LoadedEntry {
 
 pub(crate) struct UnprocessedEntry {
     entry: pna::RegularEntry,
-    option: ReadOption,
+    option: ReadOptions,
 }
 
 pub(crate) enum State {
@@ -150,7 +150,7 @@ impl File {
             blksize: 512,
             flags: 0,
         };
-        let option = ReadOption::with_password(password);
+        let option = ReadOptions::with_password(password);
         let (data, raw_size) = if let Some(raw_size) = metadata.raw_file_size() {
             let data = Entry(State::Unprocessed(UnprocessedEntry { entry, option }));
             (data, raw_size as usize)
