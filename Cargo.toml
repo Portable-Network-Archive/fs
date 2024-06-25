@@ -4,6 +4,7 @@ version = "0.0.0"
 edition = "2021"
 authors = ["Portable-Network-Archive Developers"]
 repository = "https://github.com/Portable-Network-Archive/fs"
+description = "PNA(Portable-Network-Archive) file system"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 
