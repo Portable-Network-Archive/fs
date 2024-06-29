@@ -9,11 +9,17 @@ jobs:
         os:
           - ubuntu-latest
           - freebsd-latest # self-hosted
+        rust:
+          - stable
+          - beta
+          - nightly
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - id: install_rust
         uses: ./.github/actions/setup-rust
+        with:
+          channel: ${{ matrix.rust }}
       - name: Install dependencies
         if: startsWith(matrix.os, 'ubuntu')
         run: |
