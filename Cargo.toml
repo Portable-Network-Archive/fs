@@ -1,6 +1,6 @@
 [package]
 name = "pnafs"
-version = "0.0.0"
+version = "0.0.1"
 edition = "2021"
 authors = ["Portable-Network-Archive Developers"]
 repository = "https://github.com/Portable-Network-Archive/fs"
