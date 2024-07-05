@@ -8,6 +8,6 @@ mod filesystem;
 
 fn main() -> io::Result<()> {
     #[cfg(feature = "logging")]
-    simple_logger::init_with_level(log::Level::Trace).unwrap();
+    simple_logger::init_with_level(log::Level::Trace).map_err(io::Error::other)?;
     command::entry(cli::Cli::parse())
 }
