@@ -37,9 +37,13 @@ jobs:
         run: cargo test --locked --release
         env:
           RUST_BACKTRACE: 1
+      - name: Install portable-network-archive from crates.io
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: portable-network-archive
+          cache-key: ${{ matrix.os }}
       - name: Install cli
         run: |
-          cargo install -f portable-network-archive
           cargo install --locked --path .
       - name: Run test cli
         shell: bash
