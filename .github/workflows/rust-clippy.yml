@@ -30,8 +30,14 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
-      - name: Install required cargo
-        run: cargo install clippy-sarif sarif-fmt
+      - name: Install sarif-fmt from crates.io
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: sarif-fmt
+      - name: Install clippy-sarif from crates.io
+        uses: baptiste0928/cargo-install@v3
+        with:
+          crate: clippy-sarif
       - name: Run rust-clippy
         run: |
           cargo clippy --locked --all-features --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
