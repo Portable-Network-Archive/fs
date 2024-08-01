@@ -33,6 +33,8 @@ jobs:
         with:
           path: target
           key: ${{ matrix.os }}-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ matrix.os }}-rust-${{ steps.install_rust.outputs.version }}
       - name: Run test
         run: cargo test --locked --release
         env:
