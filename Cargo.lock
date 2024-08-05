@@ -460,9 +460,9 @@ checksum = "97b3888a4aecf77e811145cadf6eef5901f4782c53886191b2f693f24761847c"
 
 [[package]]
 name = "liblzma"
-version = "0.3.2"
+version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "243510a5543c358949902b9e76daec3a32d7b03a43abce823e7c62a1a8360172"
+checksum = "b3139da5a723df5ecc87bea4f09c5622b0f6e40a1448c839aefa56727834491d"
 dependencies = [
  "liblzma-sys",
 ]
@@ -480,9 +480,9 @@ dependencies = [
 
 [[package]]
 name = "libpna"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd5bebc1ca7f2a74871654aa1553008c6f34212b1ed1687982755a21c50020d1"
+checksum = "6205e2cfd0196291f285a13f8250107cf49a6fe817216257f268aa4491bed24a"
 dependencies = [
  "aes",
  "argon2",
@@ -598,9 +598,9 @@ checksum = "2900ede94e305130c13ddd391e0ab7cbaeb783945ae07a279c268cb05109c6cb"
 
 [[package]]
 name = "pna"
-version = "0.15.0"
+version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b5aa6b02730f28f73c8eabdf67d3c9cb6b8df05f8f409e3e38e97e3be4dc2159"
+checksum = "3feab267e872fc4c1790548086150a243bf352f6295a69614b7747119f7a3bfc"
 dependencies = [
  "libpna",
 ]
