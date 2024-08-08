@@ -37,7 +37,7 @@ impl Entry {
         }))
     }
 
-    fn load(&mut self) {
+    fn load(&mut self) -> &LoadedEntry {
         if let State::Unprocessed(e) = &self.0 {
             let mut xattrs = HashMap::with_capacity(e.entry.xattrs().len());
             for xattr in e.entry.xattrs() {
@@ -48,22 +48,20 @@ impl Entry {
             reader.read_to_end(&mut buf).unwrap();
             self.0 = State::Loaded(LoadedEntry { data: buf, xattrs });
         }
+        match &self.0 {
+            State::Loaded(l) => l,
+            State::Unprocessed(_) => unreachable!(),
+        }
     }
 
+    #[inline]
     pub(crate) fn as_slice(&mut self) -> &[u8] {
-        self.load();
-        match &self.0 {
-            State::Loaded(e) => e.data.as_slice(),
-            State::Unprocessed(_) => unreachable!(),
-        }
+        self.load().data.as_slice()
     }
 
+    #[inline]
     pub(crate) fn xattrs(&mut self) -> &HashMap<OsString, Vec<u8>> {
-        self.load();
-        match &self.0 {
-            State::Loaded(e) => &e.xattrs,
-            State::Unprocessed(_) => unreachable!(),
-        }
+        &self.load().xattrs
     }
 }
 
