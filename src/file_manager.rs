@@ -166,7 +166,6 @@ const ROOT_INODE: Inode = 1;
 
 pub(crate) struct FileManager {
     archive_path: PathBuf,
-    password: Option<String>,
     tree: Tree<Inode>,
     files: HashMap<Inode, File>,
     node_ids: HashMap<Inode, NodeId>,
@@ -177,22 +176,20 @@ impl FileManager {
     pub(crate) fn new(archive_path: PathBuf, password: Option<String>) -> Self {
         let mut mamager = Self {
             archive_path,
-            password,
             tree: TreeBuilder::new().build(),
             files: HashMap::new(),
             node_ids: HashMap::new(),
             last_inode: ROOT_INODE,
         };
-        mamager.populate().unwrap();
+        mamager.populate(password.as_deref()).unwrap();
         mamager
     }
 
-    fn populate(&mut self) -> io::Result<()> {
+    fn populate(&mut self, password: Option<&str>) -> io::Result<()> {
         self.add_root_file(File::root(ROOT_INODE))?;
         let file = fs::File::open(&self.archive_path)?;
         let mut archive = Archive::read_header(file)?;
-        let password = self.password.clone();
-        for entry in archive.entries_with_password(password.as_deref()) {
+        for entry in archive.entries_with_password(password) {
             let entry = entry?;
             let parents = entry.header().path().as_path().parent();
             let parent = if let Some(parents) = parents {
@@ -200,7 +197,7 @@ impl FileManager {
             } else {
                 ROOT_INODE
             };
-            let file = File::from_entry(self.next_inode(), entry, password.as_ref());
+            let file = File::from_entry(self.next_inode(), entry, password);
             self.add_or_update_file(file, parent)?;
         }
         Ok(())
