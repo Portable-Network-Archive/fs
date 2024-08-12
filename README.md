@@ -48,9 +48,7 @@ After all requirements are met, PNA-FS can be installed using `cargo`:
 
 
 ```bash
-$ git clone https://github.com/Portable-Network-Archive/fs.git
-$ cd fs
-$ cargo install --path .
+$ cargo install --git https://github.com/Portable-Network-Archive/fs.git
 ```
 
 This will generate the `pnafs` binary in `$HOME/.cargo/bin`. Make sure that this directory is in your `PATH` variable: `export PATH=$PATH:$HOME/.cargo/bin`
