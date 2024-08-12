@@ -20,6 +20,7 @@ pub(crate) struct MountArgs {
 }
 
 impl Command for MountArgs {
+    #[inline]
     fn execute(self) -> io::Result<()> {
         let password = ask_password(self.password)?;
         mount_archive(&self.mount_point, &self.archive, password)
