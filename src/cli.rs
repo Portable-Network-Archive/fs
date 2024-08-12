@@ -1,4 +1,4 @@
-use crate::command::mount::MountArgs;
+use crate::command::{complete::CompleteArgs, mount::MountArgs};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -19,7 +19,7 @@ pub(crate) enum SubCommand {
     #[command(about = "Mount archive")]
     Mount(MountArgs),
     #[command(about = "Generate shell auto complete")]
-    Complete(crate::command::complete::CompleteArgs),
+    Complete(CompleteArgs),
 }
 
 #[derive(Parser, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
