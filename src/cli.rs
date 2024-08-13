@@ -12,6 +12,8 @@ use clap::{Parser, Subcommand};
 pub(crate) struct Cli {
     #[clap(subcommand)]
     pub(crate) subcommand: SubCommand,
+    #[command(flatten)]
+    pub(crate) verbose: clap_verbosity_flag::Verbosity,
 }
 
 #[derive(Subcommand)]
