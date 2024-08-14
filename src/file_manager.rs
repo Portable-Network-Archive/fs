@@ -174,15 +174,15 @@ pub(crate) struct FileManager {
 
 impl FileManager {
     pub(crate) fn new(archive_path: PathBuf, password: Option<String>) -> Self {
-        let mut mamager = Self {
+        let mut manager = Self {
             archive_path,
             tree: TreeBuilder::new().build(),
             files: HashMap::new(),
             node_ids: HashMap::new(),
             last_inode: ROOT_INODE,
         };
-        mamager.populate(password.as_deref()).unwrap();
-        mamager
+        manager.populate(password.as_deref()).unwrap();
+        manager
     }
 
     fn populate(&mut self, password: Option<&str>) -> io::Result<()> {
