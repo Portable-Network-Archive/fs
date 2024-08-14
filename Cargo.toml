@@ -21,6 +21,7 @@ fuser = "0.14.0"
 id_tree = "1.8.0"
 libc = "0.2.158"
 log = "0.4.22"
+memmap2 = "0.9.4"
 pna = "0.18.0"
 rpassword = "7.3.1"
 simple_logger = { version = "5.0.0" , optional = true }
