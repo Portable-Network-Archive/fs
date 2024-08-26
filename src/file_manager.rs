@@ -22,23 +22,21 @@ pub(crate) struct UnprocessedEntry {
     option: ReadOptions,
 }
 
-pub(crate) enum State {
+pub(crate) enum Entry {
     Loaded(LoadedEntry),
     Unprocessed(UnprocessedEntry),
 }
 
-pub(crate) struct Entry(State);
-
 impl Entry {
     fn empty() -> Self {
-        Self(State::Loaded(LoadedEntry {
+        Self::Loaded(LoadedEntry {
             data: Vec::new(),
             xattrs: HashMap::new(),
-        }))
+        })
     }
 
     fn load(&mut self) -> &LoadedEntry {
-        if let State::Unprocessed(e) = &self.0 {
+        if let Self::Unprocessed(e) = &self {
             let mut xattrs = HashMap::with_capacity(e.entry.xattrs().len());
             for xattr in e.entry.xattrs() {
                 xattrs.insert(xattr.name().into(), xattr.value().into());
@@ -46,11 +44,11 @@ impl Entry {
             let mut buf = Vec::new();
             let mut reader = e.entry.reader(e.option.clone()).unwrap();
             reader.read_to_end(&mut buf).unwrap();
-            self.0 = State::Loaded(LoadedEntry { data: buf, xattrs });
+            *self = Self::Loaded(LoadedEntry { data: buf, xattrs });
         }
-        match &self.0 {
-            State::Loaded(l) => l,
-            State::Unprocessed(_) => unreachable!(),
+        match self {
+            Self::Loaded(l) => l,
+            Self::Unprocessed(_) => unreachable!(),
         }
     }
 
@@ -150,10 +148,10 @@ impl File {
         };
         let option = ReadOptions::with_password(password);
         let (data, raw_size) = if let Some(raw_size) = metadata.raw_file_size() {
-            let data = Entry(State::Unprocessed(UnprocessedEntry { entry, option }));
+            let data = Entry::Unprocessed(UnprocessedEntry { entry, option });
             (data, raw_size as usize)
         } else {
-            let mut data = Entry(State::Unprocessed(UnprocessedEntry { entry, option }));
+            let mut data = Entry::Unprocessed(UnprocessedEntry { entry, option });
             let raw_size = data.as_slice().len();
             (data, raw_size)
         };
