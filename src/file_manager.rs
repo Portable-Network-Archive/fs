@@ -2,7 +2,7 @@ use fuser::{FileAttr, FileType};
 use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
-use pna::{Archive, DataKind, Permission, ReadOptions};
+use pna::{Archive, DataKind, Permission, ReadEntry, ReadOptions};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::Read;
@@ -186,17 +186,35 @@ impl FileManager {
     fn populate(&mut self, password: Option<&str>) -> io::Result<()> {
         self.add_root_file(File::root(ROOT_INODE))?;
         let file = fs::File::open(&self.archive_path)?;
-        let mut archive = Archive::read_header(file)?;
-        for entry in archive.entries_with_password(password) {
+        let memmap = unsafe { memmap2::Mmap::map(&file) }?;
+        let mut archive = Archive::read_header_from_slice(&memmap[..])?;
+        for entry in archive.entries_slice() {
             let entry = entry?;
-            let parents = entry.header().path().as_path().parent();
-            let parent = if let Some(parents) = parents {
-                self.make_dir_all(parents, ROOT_INODE)?
-            } else {
-                ROOT_INODE
-            };
-            let file = File::from_entry(self.next_inode(), entry, password);
-            self.add_or_update_file(file, parent)?;
+            match entry {
+                ReadEntry::Solid(s) => {
+                    for entry in s.entries(password)? {
+                        let entry = entry?;
+                        let parents = entry.header().path().as_path().parent();
+                        let parent = if let Some(parents) = parents {
+                            self.make_dir_all(parents, ROOT_INODE)?
+                        } else {
+                            ROOT_INODE
+                        };
+                        let file = File::from_entry(self.next_inode(), entry, password);
+                        self.add_or_update_file(file, parent)?;
+                    }
+                }
+                ReadEntry::Regular(entry) => {
+                    let parents = entry.header().path().as_path().parent();
+                    let parent = if let Some(parents) = parents {
+                        self.make_dir_all(parents, ROOT_INODE)?
+                    } else {
+                        ROOT_INODE
+                    };
+                    let file = File::from_entry(self.next_inode(), entry.into(), password);
+                    self.add_or_update_file(file, parent)?;
+                }
+            }
         }
         Ok(())
     }
