@@ -4,7 +4,7 @@ set -eu
 PASSWORD="password"
 
 run() {
-  pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --keep-xattr --overwrite $PNA_OPTIONS
+  pna create src.pna -r ./src --overwrite $PNA_OPTIONS
   pnafs mount src.pna ./mnt/pna/src/ $PNA_FS_OPTIONS &
   PID=$(echo $!)
   while [ ! -e ./mnt/pna/src/src ]; do
@@ -26,7 +26,8 @@ run() {
 }
 
 main() {
-  PNA_OPTIONS="" PNA_FS_OPTIONS="" run
+  PNA_OPTIONS="--keep-permission --keep-timestamp --keep-xattr" PNA_FS_OPTIONS="" run
+  PNA_OPTIONS="--keep-dir --keep-permission --keep-timestamp --keep-xattr" PNA_FS_OPTIONS="" run
   PNA_OPTIONS="--password $PASSWORD" PNA_FS_OPTIONS="--password $PASSWORD" run
 }
 
