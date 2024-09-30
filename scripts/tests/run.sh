@@ -3,10 +3,9 @@ set -eu
 
 PASSWORD="password"
 
-run_with() {
-  EXTRA_OPTIONS=$*
-  pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --keep-xattr --overwrite $EXTRA_OPTIONS
-  pnafs mount src.pna ./mnt/pna/src/ $EXTRA_OPTIONS &
+run() {
+  pna create src.pna -r ./src --keep-dir --keep-permission --keep-timestamp --keep-xattr --overwrite $PNA_OPTIONS
+  pnafs mount src.pna ./mnt/pna/src/ $PNA_FS_OPTIONS &
   PID=$(echo $!)
   while [ ! -e ./mnt/pna/src/src ]; do
     echo "Wait while mount ..."
@@ -27,8 +26,8 @@ run_with() {
 }
 
 main() {
-  run_with
-  run_with --password "$PASSWORD"
+  PNA_OPTIONS="" PNA_FS_OPTIONS="" run
+  PNA_OPTIONS="--password $PASSWORD" PNA_FS_OPTIONS="--password $PASSWORD" run
 }
 
 main "$@"
