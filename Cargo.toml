@@ -36,29 +36,3 @@ logging = ["dep:simple_logger"]
 [profile.dist]
 inherits = "release"
 lto = "thin"
-
-# Config for 'cargo dist'
-[workspace.metadata.dist]
-# The preferred cargo-dist version to use in CI (Cargo.toml SemVer syntax)
-cargo-dist-version = "0.22.1"
-# CI backends to support
-ci = "github"
-# The installers to generate for each app
-installers = ["shell"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["x86_64-unknown-linux-gnu"]
-# Which actions to run on pull requests
-pr-run-mode = "upload"
-# Whether to consider the binaries in a package for distribution (defaults true)
-dist = true
-# Where to host releases
-hosting = "github"
-# Whether to install an updater program
-install-updater = false
-# Path that installers should place binaries in
-install-path = "CARGO_HOME"
-
-
-[workspace.metadata.dist.dependencies.apt]
-libfuse3-dev = { stage = ["build", "run"], targets = ["x86_64-unknown-linux-gnu"] }
-fuse3 = { stage = ["build", "run"], targets = ["x86_64-unknown-linux-gnu"] }
