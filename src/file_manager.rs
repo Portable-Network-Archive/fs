@@ -18,7 +18,7 @@ pub(crate) struct LoadedEntry {
 }
 
 pub(crate) struct UnprocessedEntry {
-    entry: pna::RegularEntry,
+    entry: pna::NormalEntry,
     option: ReadOptions,
 }
 
@@ -102,7 +102,7 @@ impl File {
 
     fn from_entry<S: Into<String>>(
         inode: Inode,
-        entry: pna::RegularEntry,
+        entry: pna::NormalEntry,
         password: Option<S>,
     ) -> Self {
         let now = SystemTime::now();
@@ -205,7 +205,7 @@ impl FileManager {
                         self.add_or_update_file(file, parent)?;
                     }
                 }
-                ReadEntry::Regular(entry) => {
+                ReadEntry::Normal(entry) => {
                     let parents = entry.header().path().as_path().parent();
                     let parent = if let Some(parents) = parents {
                         self.make_dir_all(parents, ROOT_INODE)?
