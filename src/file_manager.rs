@@ -95,6 +95,7 @@ impl File {
         }
     }
 
+    #[inline]
     fn root(inode: Inode) -> Self {
         Self::dir(inode, ".".into())
     }
