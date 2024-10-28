@@ -37,8 +37,8 @@ impl Filesystem for PnaFS {
         }
     }
 
-    fn getattr(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyAttr) {
-        info!("[Implemented] getattr(ino: {:#x?})", ino);
+    fn getattr(&mut self, _req: &Request<'_>, ino: u64, fh: Option<u64>, reply: ReplyAttr) {
+        info!("[Implemented] getattr(ino: {:#x?}, fh: {:#x?})", ino, fh);
         let ttl = Duration::from_secs(1);
         let file = self.manager.get_file(ino).unwrap();
         reply.attr(&ttl, &file.attr);
