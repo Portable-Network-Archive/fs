@@ -1,5 +1,6 @@
 name: test
 on:
+  merge_group:
   pull_request:
   push:
 jobs:
