@@ -2,6 +2,7 @@
 name = "pnafs"
 version = "0.0.4"
 edition = "2021"
+rust-version = "1.77"
 authors = ["Portable-Network-Archive Developers"]
 repository = "https://github.com/Portable-Network-Archive/fs"
 homepage = "https://portable-network-archive.github.io/fs/"
