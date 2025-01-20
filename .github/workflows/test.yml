@@ -9,6 +9,7 @@ jobs:
       matrix:
         os:
           - ubuntu-latest
+          - ubuntu-22.04-arm
           - freebsd-latest # self-hosted
         rust:
           - stable
