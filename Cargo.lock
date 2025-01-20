@@ -636,7 +636,7 @@ dependencies = [
 
 [[package]]
 name = "pnafs"
-version = "0.0.4"
+version = "0.0.5"
 dependencies = [
  "clap",
  "clap-verbosity-flag",
