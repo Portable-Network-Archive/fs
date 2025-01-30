@@ -81,6 +81,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "arrayvec"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
+
+[[package]]
 name = "base64ct"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -499,12 +505,13 @@ dependencies = [
 
 [[package]]
 name = "libpna"
-version = "0.21.2"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8d4d6759db4e140f3e8fb30981876f903b2a0f773f0682f75b9347d3a0be08b0"
+checksum = "ace0e7e8cff7fbd81cc4cf935b2b0c79ef1740fbd935b783f57641542558b565"
 dependencies = [
  "aes",
  "argon2",
+ "arrayvec",
  "camellia",
  "camino",
  "cbc",
@@ -627,9 +634,9 @@ checksum = "d231b230927b5e4ad203db57bbcbee2802f6bce620b1e4a9024a07d94e2907ec"
 
 [[package]]
 name = "pna"
-version = "0.21.1"
+version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "404fe6d93d236fae793a025d097f4a54ce01ad16f5d4fd6449da522662082c23"
+checksum = "8600e3183ed376327876dec13a8561f35f6909f1057347f6312b6090e20579e8"
 dependencies = [
  "libpna",
 ]
