@@ -3,6 +3,10 @@ on:
   merge_group:
   pull_request:
   push:
+
+# env:
+#   RUST_BACKTRACE: 1
+
 jobs:
   rust_doc_test:
     strategy:
@@ -39,8 +43,6 @@ jobs:
             ${{ matrix.os }}-rust-${{ steps.install_rust.outputs.version }}
       - name: Run test
         run: cargo test --locked --release
-        env:
-          RUST_BACKTRACE: 1
       - name: Install portable-network-archive from crates.io
         uses: baptiste0928/cargo-install@v3
         with:
