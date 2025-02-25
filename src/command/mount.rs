@@ -23,16 +23,16 @@ impl Command for MountArgs {
     #[inline]
     fn execute(self) -> io::Result<()> {
         let password = ask_password(self.password)?;
-        mount_archive(&self.mount_point, &self.archive, password)
+        mount_archive(self.mount_point, self.archive, password)
     }
 }
 
-fn mount_archive<MountPoint: AsRef<Path>, Archive: AsRef<Path>>(
-    mount_point: MountPoint,
-    archive: Archive,
+fn mount_archive(
+    mount_point: impl AsRef<Path>,
+    archive: impl Into<PathBuf>,
     password: Option<String>,
 ) -> io::Result<()> {
-    let fs = PnaFS::new(archive.as_ref().into(), password);
+    let fs = PnaFS::new(archive.into(), password);
     create_dir_all(&mount_point)?;
     mount2(
         fs,
