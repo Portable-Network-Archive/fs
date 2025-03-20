@@ -17,7 +17,7 @@ keywords = ["pna", "archive", "cli"]
 [dependencies]
 clap = { version = "4.5.32", features = ["derive"] }
 clap-verbosity-flag = "3.0.2"
-clap_complete = "4.5.46"
+clap_complete = "4.5.47"
 fuser = "0.15.1"
 id_tree = "1.8.0"
 libc = "0.2.171"
