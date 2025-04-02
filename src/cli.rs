@@ -1,4 +1,4 @@
-use crate::command::{complete::CompleteArgs, mount::MountArgs};
+use crate::command::{bugreport::BugReportCommand, complete::CompleteArgs, mount::MountArgs};
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -22,6 +22,8 @@ pub(crate) enum SubCommand {
     Mount(MountArgs),
     #[command(about = "Generate shell auto complete")]
     Complete(CompleteArgs),
+    #[command(about = "Generate bug report template")]
+    BugReport(BugReportCommand),
 }
 
 #[derive(Parser, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug)]
