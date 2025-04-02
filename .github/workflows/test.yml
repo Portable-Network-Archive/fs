@@ -27,6 +27,7 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           channel: ${{ matrix.rust }}
+          default: false
       - name: Install dependencies
         if: startsWith(matrix.os, 'ubuntu')
         run: |
@@ -43,7 +44,7 @@ jobs:
           restore-keys: |
             ${{ matrix.os }}-rust-${{ steps.install_rust.outputs.version }}
       - name: Run test
-        run: cargo test --locked --release
+        run: cargo +${{ matrix.rust }} test --locked --release
       - name: Install portable-network-archive from crates.io
         uses: baptiste0928/cargo-install@v3
         with:
