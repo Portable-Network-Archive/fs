@@ -10,11 +10,18 @@ inputs:
     description: 'Rust build target'
     default: ''
     required: false
+  default:
+    description: 'Run `rustup default`'
+    default: 'true'
+    required: false
 
 outputs:
   version:
     description: "`rustc --version` result"
     value: ${{ steps.set_output.outputs.version }}
+  channel:
+    description: "input channel"
+    value: ${{ inputs.channel }}
 
 runs:
   using: 'composite'
@@ -23,6 +30,10 @@ runs:
       shell: bash
       run: |
         rustup update --no-self-update ${{ inputs.channel }}
+    - name: Set default channel
+      if: ${{ inputs.default == 'true' }}
+      shell: bash
+      run: |
         rustup default ${{ inputs.channel }}
     - name: Echo rust version
       shell: bash
