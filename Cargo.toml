@@ -15,6 +15,7 @@ keywords = ["pna", "archive", "cli"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bugreport = "0.5.1"
 clap = { version = "4.5.35", features = ["derive"] }
 clap-verbosity-flag = "3.0.2"
 clap_complete = "4.5.47"
