@@ -1,3 +1,4 @@
+pub(crate) mod bugreport;
 pub(crate) mod complete;
 pub(crate) mod mount;
 
@@ -8,6 +9,7 @@ pub(crate) fn entry(args: Cli) -> io::Result<()> {
     match args.subcommand {
         SubCommand::Mount(args) => args.execute(),
         SubCommand::Complete(args) => args.execute(),
+        SubCommand::BugReport(cmd) => cmd.execute(),
     }
 }
 
