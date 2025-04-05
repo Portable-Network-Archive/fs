@@ -112,7 +112,7 @@ impl File {
             .path()
             .as_path()
             .components()
-            .last()
+            .next_back()
             .unwrap()
             .as_os_str()
             .into();
