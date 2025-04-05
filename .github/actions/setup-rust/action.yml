@@ -17,7 +17,7 @@ inputs:
 
 outputs:
   version:
-    description: "`rustc --version` result"
+    description: "Installed `rustc --version` result"
     value: ${{ steps.set_output.outputs.version }}
   channel:
     description: "input channel"
@@ -38,7 +38,7 @@ runs:
     - name: Echo rust version
       shell: bash
       run: |
-        rustc --version
+        rustc +${{ inputs.channel }} -V
     - if: ${{ inputs.target != '' }}
       name: Install Rust target
       shell: bash
@@ -48,5 +48,5 @@ runs:
       name: Set output
       shell: bash
       run: |
-        RUST_VERSION=$(rustc -V)
+        RUST_VERSION=$(rustc +${{ inputs.channel }} -V)
         echo "version=${RUST_VERSION}" >> $GITHUB_OUTPUT
