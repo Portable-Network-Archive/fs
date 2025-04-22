@@ -24,6 +24,7 @@ install-path = "CARGO_HOME"
 
 [dist.github-custom-runners]
 aarch64-unknown-linux-gnu = "ubuntu-22.04-arm"
+x86_64-unknown-linux-gnu = "ubuntu-22.04"
 
 [dist.dependencies.apt]
 libfuse3-dev = { stage = ["build", "run"], targets = ["aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"] }
