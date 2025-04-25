@@ -56,5 +56,5 @@ jobs:
       - name: Run test cli
         shell: bash
         run: |
-          chmod +x scripts/tests/run.sh
-          ./scripts/tests/run.sh
+          chmod +x -R scripts/tests
+          ./scripts/tests/test_mount.sh
