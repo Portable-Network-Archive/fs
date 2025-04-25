@@ -57,4 +57,4 @@ jobs:
         shell: bash
         run: |
           chmod +x -R scripts/tests
-          ./scripts/tests/test_mount.sh
+          ./scripts/tests/run.sh
