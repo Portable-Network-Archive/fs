@@ -6,7 +6,7 @@ PASSWORD="password"
 run() {
   pna create src.pna -r ./src --overwrite $PNA_OPTIONS
   pnafs mount src.pna ./mnt/pna/src/ $PNA_FS_OPTIONS &
-  PID=$(echo $!)
+  PID="$!"
   while [ ! -e ./mnt/pna/src/src ]; do
     echo "Wait while mount ..."
     sleep 1
