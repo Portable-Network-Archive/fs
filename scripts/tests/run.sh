@@ -1,11 +1,22 @@
 
 set -eu
 
+PNA_BIN="${PNA_BIN:-pna}"
+PNAFS_BIN="${PNAFS_BIN:-pnafs}"
 PASSWORD="password"
 
+cleanup() {
+  echo "Cleaning up..."
+  if mount | grep -q ./mnt/pna/src/; then
+    fusermount -u ./mnt/pna/src/ || umount ./mnt/pna/src/
+  fi
+  rm -rf ./mnt/pna/src ./src.pna
+  echo "Done."
+}
+
 run() {
-  pna create src.pna -r ./src --overwrite $PNA_OPTIONS
-  pnafs mount src.pna ./mnt/pna/src/ $PNA_FS_OPTIONS &
+  $PNA_BIN create src.pna -r ./src --overwrite $PNA_OPTIONS
+  $PNAFS_BIN mount src.pna ./mnt/pna/src/ $PNA_FS_OPTIONS &
   PID="$!"
   while [ ! -e ./mnt/pna/src/src ]; do
     echo "Wait while mount ..."
@@ -26,6 +37,7 @@ run() {
 }
 
 main() {
+  trap cleanup EXIT
   PNA_OPTIONS="--keep-permission --keep-timestamp --keep-xattr" PNA_FS_OPTIONS="" run
   PNA_OPTIONS="--keep-dir --keep-permission --keep-timestamp --keep-xattr" PNA_FS_OPTIONS="" run
   PNA_OPTIONS="--password $PASSWORD" PNA_FS_OPTIONS="--password $PASSWORD" run
