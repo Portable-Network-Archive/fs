@@ -1,11 +1,13 @@
 use fuser::{FileAttr, FileType};
-use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
+use id_tree::{InsertBehavior, Node, NodeId, RemoveBehavior, Tree, TreeBuilder};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
-use pna::{Archive, DataKind, Permission, ReadEntry, ReadOptions};
+use pna::{
+    Archive, DataKind, EntryName, Metadata, Permission, ReadEntry, ReadOptions, WriteOptions,
+};
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::io::Read;
+use std::io::{BufWriter, prelude::*};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use std::{fs, io};
@@ -61,6 +63,15 @@ impl Entry {
     pub(crate) fn xattrs(&mut self) -> &HashMap<OsString, Vec<u8>> {
         &self.load().xattrs
     }
+
+    #[inline]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut Vec<u8> {
+        self.load();
+        match self {
+            Entry::Loaded(l) => &mut l.data,
+            Entry::Unprocessed(_) => unreachable!(),
+        }
+    }
 }
 
 pub(crate) struct File {
@@ -70,7 +81,7 @@ pub(crate) struct File {
 }
 
 impl File {
-    fn dir(inode: Inode, name: OsString) -> Self {
+    pub(crate) fn dir(inode: Inode, name: OsString) -> Self {
         let now = SystemTime::now();
         Self {
             name,
@@ -225,32 +236,80 @@ impl FileManager {
         self.last_inode
     }
 
-    fn add_root_file(&mut self, file: File) -> io::Result<()> {
+    fn add_root_file(&mut self, file: File) -> io::Result<FileAttr> {
         self._add_file(file, InsertBehavior::AsRoot)
     }
 
-    fn add_file(&mut self, file: File, parent: Inode) -> io::Result<()> {
+    fn add_file(&mut self, file: File, parent: Inode) -> io::Result<FileAttr> {
         let node_id = self.node_ids.get(&parent).unwrap().clone();
         self._add_file(file, InsertBehavior::UnderNode(&node_id))
     }
 
-    fn _add_file(&mut self, file: File, insert_behavior: InsertBehavior) -> io::Result<()> {
+    fn _add_file(&mut self, file: File, insert_behavior: InsertBehavior) -> io::Result<FileAttr> {
+        let attr = file.attr;
         let node_id = self
             .tree
             .insert(Node::new(file.attr.ino), insert_behavior)
             .map_err(io::Error::other)?;
         self.node_ids.insert(file.attr.ino, node_id);
         self.files.insert(file.attr.ino, file);
-        Ok(())
+        Ok(attr)
     }
 
-    fn update_file(&mut self, ino: Inode, mut file: File) -> io::Result<()> {
+    pub(crate) fn make_dir(&mut self, parent: Inode, name: OsString) -> io::Result<FileAttr> {
+        let ino = self.next_inode();
+
+        let file = File::dir(ino, name);
+        let attr = file.attr;
+        self.add_file(file, parent)?;
+        Ok(attr)
+    }
+
+    pub(crate) fn create_file(&mut self, parent: Inode, name: OsString) -> io::Result<FileAttr> {
+        let now = SystemTime::now();
+
+        let ino = self.next_inode();
+
+        // 新しいファイル属性を生成
+        let attr = FileAttr {
+            ino,
+            size: 0,
+            blocks: 1,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::RegularFile,
+            perm: 0o644,
+            nlink: 1,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            blksize: 512,
+            flags: 0,
+        };
+
+        // ファイル構造体を作成
+        let file = File {
+            name,
+            attr,
+            data: Entry::Loaded(LoadedEntry {
+                data: Vec::new(),
+                xattrs: HashMap::new(),
+            }),
+        };
+        self.add_file(file, parent)?;
+        Ok(attr)
+    }
+
+    fn update_file(&mut self, ino: Inode, mut file: File) -> io::Result<FileAttr> {
         file.attr.ino = ino;
+        let attr = file.attr;
         self.files.insert(file.attr.ino, file);
-        Ok(())
+        Ok(attr)
     }
 
-    fn add_or_update_file(&mut self, file: File, parent: Inode) -> io::Result<()> {
+    fn add_or_update_file(&mut self, file: File, parent: Inode) -> io::Result<FileAttr> {
         let children = self.get_children(parent).unwrap();
         if let Some(it) = children.iter().find(|it| it.name == file.name) {
             self.update_file(it.attr.ino, file)
@@ -290,6 +349,220 @@ impl FileManager {
         children
             .map(|ino| self.files.get(ino.data()))
             .collect::<Option<Vec<_>>>()
+    }
+
+    pub(crate) fn remove_file(&mut self, ino: Inode) -> bool {
+        if let Some(node_id) = self.node_ids.remove(&ino) {
+            // Treeからノード削除
+            let _ = self.tree.remove_node(node_id, RemoveBehavior::DropChildren);
+            self.files.remove(&ino).is_some()
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn save_to_archive(&self) -> io::Result<()> {
+        let file = fs::File::create(&self.archive_path)?;
+        let writer = BufWriter::new(file);
+        let mut archive = Archive::write_header(writer)?;
+
+        for file in self.files.values() {
+            if !matches!(file.attr.kind, FileType::RegularFile) {
+                // TODO: Support other file types
+                continue;
+            }
+
+            // パス構築
+            let mut full_path = vec![];
+            if let Some(node_id) = self.node_ids.get(&file.attr.ino) {
+                if let Ok(ancestors) = self.tree.ancestors(node_id) {
+                    for ancestor in ancestors {
+                        if let Some(ancestor_file) = self.files.get(ancestor.data()) {
+                            full_path.push(ancestor_file.name.clone());
+                        }
+                    }
+                }
+            }
+            full_path.push(file.name.clone());
+            let path_str = PathBuf::from_iter(&full_path);
+            let name = EntryName::from_lossy(path_str);
+
+            // メタデータ構築
+            let metadata = Metadata::default(); // 必要に応じて file.attr から変換して拡張可
+            let options = WriteOptions::builder().build();
+
+            // 書き込み処理
+            if let Entry::Loaded(loaded) = &file.data {
+                archive.write_file(name, metadata, options, |w| {
+                    w.write_all(&loaded.data)?;
+                    Ok(())
+                })?;
+            }
+        }
+
+        archive.finalize()?;
+        Ok(())
+    }
+
+    pub(crate) fn move_file(
+        &mut self,
+        ino: Inode,
+        new_parent: Inode,
+        new_name: OsString,
+    ) -> io::Result<()> {
+        use libc::ENOENT;
+        // 移動元ファイルが存在するか確認
+        if !self.files.contains_key(&ino) {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        }
+
+        // 移動先の親ディレクトリが存在するか確認
+        if !self.files.contains_key(&new_parent) {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        }
+
+        // 移動先の親ディレクトリが実際にディレクトリかどうか確認
+        if let Some(parent_file) = self.files.get(&new_parent) {
+            if parent_file.attr.kind != FileType::Directory {
+                return Err(io::Error::from_raw_os_error(libc::ENOTDIR));
+            }
+        }
+
+        // 新しい親ディレクトリの下に同名のファイルが既に存在するかチェック
+        if let Some(children) = self.get_children(new_parent) {
+            if children.iter().any(|f| f.name == new_name) {
+                return Err(io::Error::from_raw_os_error(libc::EEXIST));
+            }
+        }
+
+        // ノードIDを取得
+        let node_id = if let Some(id) = self.node_ids.get(&ino).cloned() {
+            id
+        } else {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        };
+
+        // 新しい親ノードIDを取得
+        let new_parent_id = if let Some(id) = self.node_ids.get(&new_parent).cloned() {
+            id
+        } else {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        };
+
+        // // 自分自身の下に移動しようとしている場合はエラー（循環参照防止）
+        // if let Ok(is_ancestor) = self.tree.is_ancestor_of(&node_id, &new_parent_id) {
+        //     if is_ancestor {
+        //         return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        //     }
+        // }
+
+        // 現在の親ノードIDを取得
+        let current_parent_id = match self.tree.ancestor_ids(&node_id).map(|mut it| it.next()) {
+            Ok(Some(parent_id)) => parent_id.clone(),
+            Ok(None) => return Err(io::Error::from_raw_os_error(libc::EINVAL)), // ルートノードは移動できない
+            Err(_) => return Err(io::Error::from_raw_os_error(libc::EIO)),
+        };
+
+        // ファイル名を更新
+        if let Some(file) = self.files.get_mut(&ino) {
+            file.name = new_name;
+        } else {
+            return Err(io::Error::from_raw_os_error(ENOENT));
+        }
+
+        // 移動するノードとそのすべての子孫のマッピング情報を保存
+        let mut node_map = HashMap::new();
+        self.collect_node_subtree_mapping(&node_id, &mut node_map)?;
+
+        // 元のノードを削除（子ノードも含めて）
+        let removed_node = self
+            .tree
+            .remove_node(node_id, RemoveBehavior::DropChildren)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // 新しい親の下に移動するノードを挿入
+        let new_node_id = self
+            .tree
+            .insert(removed_node, InsertBehavior::UnderNode(&new_parent_id))
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+        // ノードIDのマッピングを更新
+        self.node_ids.insert(ino, new_node_id.clone());
+
+        // 子孫ノードを新しい構造で再構築
+        self.rebuild_subtree(new_node_id, node_map)?;
+
+        Ok(())
+    }
+
+    // 指定されたノード以下のサブツリーのマッピング情報を収集
+    fn collect_node_subtree_mapping(
+        &self,
+        root_id: &NodeId,
+        node_map: &mut HashMap<Inode, (Inode, Vec<Inode>)>,
+    ) -> io::Result<()> {
+        // ルートノードのInodeを取得
+        let root_inode = *self
+            .tree
+            .get(root_id)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .data();
+
+        // 子ノード情報を収集
+        let mut children = Vec::new();
+
+        if let Ok(child_ids) = self.tree.children_ids(root_id) {
+            for child_id in child_ids {
+                let child_inode = *self
+                    .tree
+                    .get(child_id)
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+                    .data();
+
+                children.push(child_inode);
+
+                // 再帰的に子ノードのサブツリーも収集
+                self.collect_node_subtree_mapping(child_id, node_map)?;
+            }
+        }
+
+        // 親子関係の情報を保存
+        node_map.insert(root_inode, (root_inode, children));
+
+        Ok(())
+    }
+
+    // 保存したマッピング情報を使ってサブツリーを再構築
+    fn rebuild_subtree(
+        &mut self,
+        parent_id: NodeId,
+        node_map: HashMap<Inode, (Inode, Vec<Inode>)>,
+    ) -> io::Result<()> {
+        let parent_inode = *self
+            .tree
+            .get(&parent_id)
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
+            .data();
+
+        // 親ノードの直接の子ノードを処理
+        if let Some((_, children)) = node_map.get(&parent_inode) {
+            for &child_inode in children {
+                // 子ノードを親の下に再挿入
+                let child_node = Node::new(child_inode);
+                let new_child_id = self
+                    .tree
+                    .insert(child_node, InsertBehavior::UnderNode(&parent_id))
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+                // ノードIDのマッピングを更新
+                self.node_ids.insert(child_inode, new_child_id.clone());
+
+                // 再帰的に子ノードのサブツリーも再構築
+                self.rebuild_subtree(new_child_id, node_map.clone())?;
+            }
+        }
+
+        Ok(())
     }
 }
 

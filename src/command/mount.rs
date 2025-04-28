@@ -3,7 +3,7 @@ use crate::{
     command::{Command, ask_password},
     filesystem::PnaFS,
 };
-use clap::{Args, ValueHint};
+use clap::{ArgGroup, Args, ValueHint};
 use fuser::{MountOption, mount2};
 use std::fs::create_dir_all;
 use std::io;
@@ -22,6 +22,9 @@ pub(crate) struct MountArgs {
 }
 
 #[derive(Args)]
+#[command(
+    group(ArgGroup::new("mount_mode").args(["read_only", "read_write"])),
+)]
 struct MountOptions {
     #[arg(
         long,
@@ -33,6 +36,10 @@ struct MountOptions {
         help = "Allow all users to access files on this filesystem. By default access is restricted to the user who mounted it"
     )]
     allow_other: bool,
+    #[arg(long, help = "Mount the filesystem in read-only mode (default)")]
+    read_only: bool,
+    #[arg(long, help = "Mount the filesystem in read-write mode")]
+    read_write: bool,
 }
 
 impl Command for MountArgs {
@@ -58,7 +65,11 @@ fn mount_archive(
             Some(MountOption::FSName("pnafs".to_owned())),
             mount_options.allow_root.then_some(MountOption::AllowRoot),
             mount_options.allow_other.then_some(MountOption::AllowOther),
-            Some(MountOption::RO),
+            Some(if mount_options.read_write {
+                MountOption::RW
+            } else {
+                MountOption::RO
+            }),
         ]
         .into_iter()
         .flatten()
