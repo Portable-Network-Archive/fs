@@ -2,16 +2,8 @@ pub(crate) mod bugreport;
 pub(crate) mod complete;
 pub(crate) mod mount;
 
-use crate::cli::{Cli, PasswordArgs, SubCommand};
+use crate::cli::PasswordArgs;
 use std::io;
-
-pub(crate) fn entry(args: Cli) -> io::Result<()> {
-    match args.subcommand {
-        SubCommand::Mount(args) => args.execute(),
-        SubCommand::Complete(args) => args.execute(),
-        SubCommand::BugReport(cmd) => cmd.execute(),
-    }
-}
 
 pub(crate) trait Command {
     fn execute(self) -> io::Result<()>;

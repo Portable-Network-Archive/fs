@@ -1,3 +1,4 @@
+use crate::command::Command;
 use clap::Parser;
 use std::io;
 
@@ -11,5 +12,5 @@ fn main() -> io::Result<()> {
     #[cfg(feature = "logging")]
     simple_logger::init_with_level(args.verbose.log_level().unwrap_or(log::Level::Trace))
         .map_err(io::Error::other)?;
-    command::entry(args)
+    args.execute()
 }
