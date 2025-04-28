@@ -1,5 +1,8 @@
-use crate::command::{bugreport::BugReportCommand, complete::CompleteArgs, mount::MountArgs};
+use crate::command::{
+    bugreport::BugReportCommand, complete::CompleteArgs, mount::MountArgs, Command,
+};
 use clap::{Parser, Subcommand};
+use std::io;
 
 #[derive(Parser)]
 #[command(
@@ -14,6 +17,17 @@ pub(crate) struct Cli {
     pub(crate) subcommand: SubCommand,
     #[command(flatten)]
     pub(crate) verbose: clap_verbosity_flag::Verbosity,
+}
+
+impl Command for Cli {
+    #[inline]
+    fn execute(self) -> io::Result<()> {
+        match self.subcommand {
+            SubCommand::Mount(args) => args.execute(),
+            SubCommand::Complete(args) => args.execute(),
+            SubCommand::BugReport(cmd) => cmd.execute(),
+        }
+    }
 }
 
 #[derive(Subcommand)]
