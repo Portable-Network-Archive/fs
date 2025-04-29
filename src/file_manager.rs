@@ -259,7 +259,7 @@ impl FileManager {
         }
     }
 
-    /// Create directories and return most deep directory Inode.
+    /// Create directories and return deepest directory Inode.
     fn make_dir_all(&mut self, path: &Path, mut parent: Inode) -> io::Result<Inode> {
         for component in path.components() {
             let name = component.as_os_str();
