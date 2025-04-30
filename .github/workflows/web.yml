@@ -54,11 +54,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # Setup
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
 
       # If you use any mdbook plugins, here's the place to install them!
 
@@ -78,7 +78,7 @@ jobs:
       # go into repo's settings > pages and set "deploy from branch: gh-pages".
       # The other defaults work fine.
       - name: Deploy to Github Pages
-        uses: JamesIves/github-pages-deploy-action@v4.7.3
+        uses: JamesIves/github-pages-deploy-action@6c2d9db40f9296374acc17b90404b6e8864128c8 # v4.7.3
         # ONLY if we're on main (so no PRs or feature branches allowed!)
         if: ${{ github.ref == 'refs/heads/main' }}
         with:
