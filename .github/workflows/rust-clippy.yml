@@ -24,18 +24,18 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: ./.github/actions/setup-rust
       - name: Install dependencies
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
       - name: Install sarif-fmt from crates.io
-        uses: baptiste0928/cargo-install@v3
+        uses: baptiste0928/cargo-install@91c5da15570085bcde6f4d7aed98cb82d6769fd3 # v3.3.0
         with:
           crate: sarif-fmt
       - name: Install clippy-sarif from crates.io
-        uses: baptiste0928/cargo-install@v3
+        uses: baptiste0928/cargo-install@91c5da15570085bcde6f4d7aed98cb82d6769fd3 # v3.3.0
         with:
           crate: clippy-sarif
       - name: Run rust-clippy
@@ -43,7 +43,7 @@ jobs:
           cargo clippy --locked --all-features --message-format=json | clippy-sarif | tee rust-clippy-results.sarif | sarif-fmt
         continue-on-error: true
       - name: Upload analysis results to GitHub
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@28deaeda66b76a05916b6923827895f2b14ab387 # v3.28.16
         with:
           sarif_file: rust-clippy-results.sarif
           wait-for-processing: true
