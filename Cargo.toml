@@ -1,8 +1,8 @@
 [package]
 name = "pnafs"
 version = "0.0.7"
-edition = "2021"
-rust-version = "1.80"
+edition = "2024"
+rust-version = "1.85"
 authors = ["Portable-Network-Archive Developers"]
 repository = "https://github.com/Portable-Network-Archive/fs"
 homepage = "https://portable-network-archive.github.io/fs/"
