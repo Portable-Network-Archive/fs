@@ -1,5 +1,5 @@
 use crate::command::{
-    bugreport::BugReportCommand, complete::CompleteArgs, mount::MountArgs, Command,
+    Command, bugreport::BugReportCommand, complete::CompleteArgs, mount::MountArgs,
 };
 use clap::{Parser, Subcommand};
 use std::io;

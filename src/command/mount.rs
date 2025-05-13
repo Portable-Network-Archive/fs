@@ -1,10 +1,10 @@
 use crate::{
     cli::PasswordArgs,
-    command::{ask_password, Command},
+    command::{Command, ask_password},
     filesystem::PnaFS,
 };
 use clap::{Args, ValueHint};
-use fuser::{mount2, MountOption};
+use fuser::{MountOption, mount2};
 use std::fs::create_dir_all;
 use std::io;
 use std::path::{Path, PathBuf};
