@@ -4,19 +4,29 @@ use fuser::{
 };
 use libc::ENOENT;
 use log::info;
+use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+#[derive(Default)]
+pub(crate) struct PendingChanges {
+    pub created: HashMap<u64, crate::file_manager::File>,
+    pub written: HashMap<u64, Vec<u8>>, // ino -> 新しいデータ
+    pub deleted: Vec<u64>,
+}
+
 pub(crate) struct PnaFS {
     manager: FileManager,
+    pending: PendingChanges, // 差分管理用フィールドを追加
 }
 
 impl PnaFS {
     pub(crate) fn new(archive: PathBuf, password: Option<String>) -> Self {
         Self {
             manager: FileManager::new(archive, password),
+            pending: PendingChanges::default(),
         }
     }
 }
@@ -162,5 +172,101 @@ impl Filesystem for PnaFS {
         } else {
             reply.error(ENOENT);
         }
+    }
+
+    // --- ここから書き込み系メソッドのダミー実装 ---
+    fn create(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        flags: u32,
+        _umask: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        log::info!(
+            "[Experimental] create(parent: {:#x?}, name: {:?}, mode: {:#o}, flags: {:#x?})",
+            parent,
+            name,
+            mode,
+            flags
+        );
+        let ino = self
+            .manager
+            .get_file(parent)
+            .map(|_| self.manager.get_file(parent).unwrap().attr.ino + 10000)
+            .unwrap_or(99999);
+        let now = std::time::SystemTime::now();
+        let file = crate::file_manager::File {
+            name: name.to_os_string(),
+            data: crate::file_manager::Entry::Loaded(crate::file_manager::LoadedEntry::empty()),
+            attr: fuser::FileAttr {
+                ino,
+                size: 0,
+                blocks: 1,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                kind: fuser::FileType::RegularFile,
+                perm: mode as u16,
+                nlink: 1,
+                uid: 0,
+                gid: 0,
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            },
+        };
+        self.pending.created.insert(ino, file);
+        let ttl = Duration::from_secs(1);
+        reply.created(&ttl, &self.pending.created[&ino].attr, 0, 0, 0);
+    }
+
+    fn write(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        log::info!(
+            "[Experimental] write(ino: {:#x?}, offset: {}, size: {})",
+            ino,
+            offset,
+            data.len()
+        );
+        let entry = self.pending.written.entry(ino).or_default();
+        if offset as usize > entry.len() {
+            entry.resize(offset as usize, 0);
+        }
+        if offset as usize + data.len() > entry.len() {
+            entry.resize(offset as usize + data.len(), 0);
+        }
+        entry[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+        reply.written(data.len() as u32);
+    }
+
+    fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        log::info!(
+            "[Experimental] unlink(parent: {:#x?}, name: {:?})",
+            parent,
+            name
+        );
+        // 仮実装: 親ディレクトリの子から名前一致のinodeを探して削除リストに追加
+        if let Some(children) = self.manager.get_children(parent) {
+            if let Some(file) = children.iter().find(|f| f.name == name) {
+                self.pending.deleted.push(file.attr.ino);
+                reply.ok();
+                return;
+            }
+        }
+        reply.error(ENOENT);
     }
 }
