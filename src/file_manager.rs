@@ -339,10 +339,14 @@ impl FileManager {
         self.files.get(&ino)
     }
 
+    /// 指定したinodeのファイルへの可変参照を返す。
+    /// inodeが存在しない場合はNone。
     pub(crate) fn get_file_mut(&mut self, ino: Inode) -> Option<&mut File> {
         self.files.get_mut(&ino)
     }
 
+    /// 指定した親inode直下の子ファイル一覧を返す。
+    /// 親inodeが存在しない場合やツリー不整合時はNone。
     pub(crate) fn get_children(&self, parent: Inode) -> Option<Vec<&File>> {
         let node_id = self.node_ids.get(&parent)?;
         let children = self.tree.children(node_id).ok()?;
@@ -351,9 +355,11 @@ impl FileManager {
             .collect::<Option<Vec<_>>>()
     }
 
+    /// Remove the file or directory with the specified inode.
+    /// Returns false if the inode does not exist. All descendants are safely removed from the tree.
     pub(crate) fn remove_file(&mut self, ino: Inode) -> bool {
         if let Some(node_id) = self.node_ids.remove(&ino) {
-            // Treeからノード削除
+            // Remove the node and all descendants from the tree
             let _ = self.tree.remove_node(node_id, RemoveBehavior::DropChildren);
             self.files.remove(&ino).is_some()
         } else {
@@ -361,18 +367,15 @@ impl FileManager {
         }
     }
 
+    /// Persist all files, directories, and symlinks to the archive as much as the current API allows.
+    /// Attributes and xattrs are also persisted if supported by the API.
     pub(crate) fn save_to_archive(&self) -> io::Result<()> {
         let file = fs::File::create(&self.archive_path)?;
         let writer = BufWriter::new(file);
         let mut archive = Archive::write_header(writer)?;
 
         for file in self.files.values() {
-            if !matches!(file.attr.kind, FileType::RegularFile) {
-                // TODO: Support other file types
-                continue;
-            }
-
-            // パス構築
+            // Build the full path for the entry
             let mut full_path = vec![];
             if let Some(node_id) = self.node_ids.get(&file.attr.ino) {
                 if let Ok(ancestors) = self.tree.ancestors(node_id) {
@@ -387,16 +390,38 @@ impl FileManager {
             let path_str = PathBuf::from_iter(&full_path);
             let name = EntryName::from_lossy(path_str);
 
-            // メタデータ構築
-            let metadata = Metadata::default(); // 必要に応じて file.attr から変換して拡張可
+            // Build metadata (only default is supported by current API)
+            let metadata = Metadata::default();
+            // NOTE: Permission, timestamps, uid/gid, xattr are not supported by current API
+            //       When the API is extended, add them here.
             let options = WriteOptions::builder().build();
 
-            // 書き込み処理
-            if let Entry::Loaded(loaded) = &file.data {
-                archive.write_file(name, metadata, options, |w| {
-                    w.write_all(&loaded.data)?;
-                    Ok(())
-                })?;
+            match file.attr.kind {
+                FileType::RegularFile => {
+                    if let Entry::Loaded(loaded) = &file.data {
+                        archive.write_file(name, metadata, options, |w| {
+                            w.write_all(&loaded.data)?;
+                            Ok(())
+                        })?;
+                    }
+                }
+                FileType::Directory => {
+                    // Directory persistence is not supported by the current archive API
+                    log::warn!(
+                        "Directory persistence is not supported by the current archive API. Skipped: {:?}",
+                        file.name
+                    );
+                }
+                FileType::Symlink => {
+                    // Symlink persistence is not supported by the current archive API
+                    log::warn!(
+                        "Symlink persistence is not supported by the current archive API. Skipped: {:?}",
+                        file.name
+                    );
+                }
+                _ => {
+                    log::warn!("Unsupported file type for persistence: {:?}", file.name);
+                }
             }
         }
 
@@ -449,19 +474,20 @@ impl FileManager {
             return Err(io::Error::from_raw_os_error(ENOENT));
         };
 
-        // // 自分自身の下に移動しようとしている場合はエラー（循環参照防止）
-        // if let Ok(is_ancestor) = self.tree.is_ancestor_of(&node_id, &new_parent_id) {
-        //     if is_ancestor {
-        //         return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        //     }
-        // }
-
-        // 現在の親ノードIDを取得
-        let current_parent_id = match self.tree.ancestor_ids(&node_id).map(|mut it| it.next()) {
-            Ok(Some(parent_id)) => parent_id.clone(),
-            Ok(None) => return Err(io::Error::from_raw_os_error(libc::EINVAL)), // ルートノードは移動できない
-            Err(_) => return Err(io::Error::from_raw_os_error(libc::EIO)),
-        };
+        // Prevent moving a node under itself or its descendants (cycle check)
+        // id_tree does not provide is_ancestor_of, so we check manually
+        // by traversing all descendants of the node to be moved.
+        let mut stack = vec![node_id.clone()];
+        while let Some(current) = stack.pop() {
+            if current == new_parent_id {
+                return Err(io::Error::from_raw_os_error(libc::EINVAL));
+            }
+            if let Ok(children) = self.tree.children_ids(&current) {
+                for child in children {
+                    stack.push(child.clone());
+                }
+            }
+        }
 
         // ファイル名を更新
         if let Some(file) = self.files.get_mut(&ino) {
