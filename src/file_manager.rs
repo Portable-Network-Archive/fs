@@ -17,6 +17,15 @@ pub(crate) struct LoadedEntry {
     xattrs: HashMap<OsString, Vec<u8>>,
 }
 
+impl LoadedEntry {
+    pub(crate) fn empty() -> Self {
+        Self {
+            data: Vec::new(),
+            xattrs: HashMap::new(),
+        }
+    }
+}
+
 pub(crate) struct UnprocessedEntry {
     entry: pna::NormalEntry,
     option: ReadOptions,
