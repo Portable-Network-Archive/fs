@@ -18,7 +18,7 @@ keywords = ["pna", "archive", "cli"]
 bugreport = "0.5.1"
 clap = { version = "4.5.53", features = ["derive"] }
 clap-verbosity-flag = "3.0.4"
-clap_complete = "4.5.60"
+clap_complete = "4.5.61"
 fuser = "0.16.0"
 id_tree = "1.8.0"
 libc = "0.2.177"
