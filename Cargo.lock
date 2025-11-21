@@ -686,9 +686,9 @@ checksum = "d231b230927b5e4ad203db57bbcbee2802f6bce620b1e4a9024a07d94e2907ec"
 
 [[package]]
 name = "pna"
-version = "0.28.0"
+version = "0.28.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fe70c3dbfbe29059a275288b06664ea34d3e23387ef31fafb4e872a6c1e79fed"
+checksum = "4209134d6440cfc9afa2b2ebcd53e7291f42f4ce3ee18b7c5fc73a8a523c0a38"
 dependencies = [
  "libpna",
 ]
