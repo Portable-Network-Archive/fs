@@ -1,0 +1,96 @@
+name: release-prep
+
+on:
+  workflow_dispatch:
+    inputs:
+      level:
+        description: "Version level"
+        required: true
+        type: choice
+        options:
+          - major
+          - minor
+          - patch
+        default: patch
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: "release-prep"
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/setup-rust
+        with:
+          channel: stable
+
+      - name: Install cargo-release
+        run: cargo install --locked cargo-release --version 0.25.22
+
+      - name: Get current version
+        id: before_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BEFORE_VERSION="$(grep '^version = "' Cargo.toml | head -n 1 | cut -d '"' -f 2)"
+          if [ -z "$BEFORE_VERSION" ]; then
+            echo "Failed to read version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "value=$BEFORE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Bump version with cargo-release
+        env:
+          CARGO_TERM_COLOR: always
+        run: cargo release version "${{ inputs.level }}" --execute --no-confirm --allow-branch main
+
+      - name: Get updated version
+        id: after_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          AFTER_VERSION="$(grep '^version = "' Cargo.toml | head -n 1 | cut -d '"' -f 2)"
+          if [ -z "$AFTER_VERSION" ]; then
+            echo "Failed to read updated version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "$AFTER_VERSION" = "${{ steps.before_version.outputs.value }}" ]; then
+            echo "Version did not change after cargo-release execution" >&2
+            exit 1
+          fi
+          echo "value=$AFTER_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Set PR branch name
+        id: branch
+        run: echo "name=release/pnafs/${{ inputs.level }}-${{ steps.after_version.outputs.value }}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft PR
+        uses: peter-evans/create-pull-request@c0f553fe549906ede9cf27b5156039d195d2ece0 # v8.1.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ steps.branch.outputs.name }}
+          title: ":bookmark: prepare release pnafs ${{ steps.after_version.outputs.value }}"
+          body: |
+            Draft: release prep for `pnafs` (${{ inputs.level }}).
+            - Version updated to `${{ steps.after_version.outputs.value }}`
+            - This PR only updates release version files (`Cargo.toml` / `Cargo.lock`)
+            - Tag creation and publishing are not performed in this workflow
+
+            Manual next steps:
+            1. Review and merge this PR.
+            2. Create and push a SemVer tag without `v` prefix (example: `${{ steps.after_version.outputs.value }}`).
+            3. Confirm existing `Release` and `Publish Rust crate` workflows complete successfully.
+          draft: true
+          commit-message: ":bookmark: Bump pnafs version to ${{ steps.after_version.outputs.value }}"
+          add-paths: |
+            Cargo.toml
+            Cargo.lock
