@@ -100,11 +100,7 @@ impl File {
         Self::dir(inode, ".".into())
     }
 
-    fn from_entry<S: Into<String>>(
-        inode: Inode,
-        entry: pna::NormalEntry,
-        password: Option<S>,
-    ) -> Self {
+    fn from_entry(inode: Inode, entry: pna::NormalEntry, password: Option<&[u8]>) -> Self {
         let now = SystemTime::now();
         let header = entry.header();
         let metadata = entry.metadata();
@@ -188,6 +184,7 @@ impl FileManager {
         self.add_root_file(File::root(ROOT_INODE))?;
         let file = fs::File::open(&self.archive_path)?;
         let memmap = unsafe { memmap2::Mmap::map(&file) }?;
+        let password = password.map(str::as_bytes);
         let mut archive = Archive::read_header_from_slice(&memmap[..])?;
         for entry in archive.entries_slice() {
             let entry = entry?;
