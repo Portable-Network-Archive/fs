@@ -31,11 +31,11 @@ jobs:
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
       - name: Install sarif-fmt from crates.io
-        uses: baptiste0928/cargo-install@b687c656bda5733207e629b50a22bf68974a0305 # v3.3.2
+        uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
         with:
           crate: sarif-fmt
       - name: Install clippy-sarif from crates.io
-        uses: baptiste0928/cargo-install@b687c656bda5733207e629b50a22bf68974a0305 # v3.3.2
+        uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
         with:
           crate: clippy-sarif
       - name: Run rust-clippy
