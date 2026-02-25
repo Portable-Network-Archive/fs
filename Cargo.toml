@@ -19,7 +19,7 @@ bugreport = "0.5.1"
 clap = { version = "4.5.60", features = ["derive"] }
 clap-verbosity-flag = "3.0.4"
 clap_complete = "4.5.66"
-fuser = "0.16.0"
+fuser = "0.17.0"
 id_tree = "1.8.0"
 libc = "0.2.180"
 log = "0.4.29"
