@@ -1,4 +1,4 @@
-use fuser::{FileAttr, FileType};
+use fuser::{FileAttr, FileType, INodeNo};
 use id_tree::{InsertBehavior, Node, NodeId, Tree, TreeBuilder};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
@@ -76,7 +76,7 @@ impl File {
             name,
             data: Entry::empty(),
             attr: FileAttr {
-                ino: inode,
+                ino: INodeNo(inode),
                 size: 512,
                 blocks: 1,
                 atime: now,
@@ -114,7 +114,7 @@ impl File {
             .into();
 
         let mut attr = FileAttr {
-            ino: inode,
+            ino: INodeNo(inode),
             size: 0,
             blocks: 1,
             atime: metadata
@@ -232,25 +232,26 @@ impl FileManager {
     }
 
     fn _add_file(&mut self, file: File, insert_behavior: InsertBehavior) -> io::Result<()> {
+        let ino = file.attr.ino.0;
         let node_id = self
             .tree
-            .insert(Node::new(file.attr.ino), insert_behavior)
+            .insert(Node::new(ino), insert_behavior)
             .map_err(io::Error::other)?;
-        self.node_ids.insert(file.attr.ino, node_id);
-        self.files.insert(file.attr.ino, file);
+        self.node_ids.insert(ino, node_id);
+        self.files.insert(ino, file);
         Ok(())
     }
 
     fn update_file(&mut self, ino: Inode, mut file: File) -> io::Result<()> {
-        file.attr.ino = ino;
-        self.files.insert(file.attr.ino, file);
+        file.attr.ino = INodeNo(ino);
+        self.files.insert(ino, file);
         Ok(())
     }
 
     fn add_or_update_file(&mut self, file: File, parent: Inode) -> io::Result<()> {
         let children = self.get_children(parent).unwrap();
         if let Some(it) = children.iter().find(|it| it.name == file.name) {
-            self.update_file(it.attr.ino, file)
+            self.update_file(it.attr.ino.0, file)
         } else {
             self.add_file(file, parent)
         }
@@ -263,7 +264,7 @@ impl FileManager {
             let children = self.get_children(parent).unwrap();
             let it = children.iter().find(|it| name == it.name);
             if let Some(it) = it {
-                parent = it.attr.ino;
+                parent = it.attr.ino.0;
             } else {
                 let ino = self.next_inode();
                 self.add_file(File::dir(ino, name.into()), parent)?;
