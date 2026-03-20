@@ -16,7 +16,7 @@ jobs:
           - ubuntu-22.04-arm
           # - freebsd-latest # self-hosted
         rust:
-          - '1.85' # msrv
+          - '1.88' # msrv
           - stable
           - beta
           - nightly
