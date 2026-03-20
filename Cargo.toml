@@ -33,6 +33,7 @@ nix = { version = "0.31.2", features = ["user"] }
 
 [features]
 logging = ["dep:simple_logger"]
+macos-no-mount = ["fuser/macos-no-mount"]
 
 # The profile that 'cargo dist' will build with
 [profile.dist]

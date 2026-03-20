@@ -4,7 +4,7 @@ use crate::{
     filesystem::PnaFS,
 };
 use clap::{Args, ValueHint};
-use fuser::{MountOption, mount2};
+use fuser::{Config, MountOption, SessionACL, mount2};
 use std::fs::create_dir_all;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -51,18 +51,19 @@ fn mount_archive(
 ) -> io::Result<()> {
     let fs = PnaFS::new(archive.into(), password);
     create_dir_all(&mount_point)?;
-    mount2(
-        fs,
-        mount_point,
-        &[
-            Some(MountOption::FSName("pnafs".to_owned())),
-            mount_options.allow_root.then_some(MountOption::AllowRoot),
-            mount_options.allow_other.then_some(MountOption::AllowOther),
-            Some(MountOption::RO),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>(),
-    )?;
+
+    let acl = if mount_options.allow_other {
+        SessionACL::All
+    } else if mount_options.allow_root {
+        SessionACL::RootAndOwner
+    } else {
+        SessionACL::Owner
+    };
+
+    let mut config = Config::default();
+    config.mount_options = vec![MountOption::FSName("pnafs".to_owned()), MountOption::RO];
+    config.acl = acl;
+
+    mount2(fs, mount_point, &config)?;
     Ok(())
 }
