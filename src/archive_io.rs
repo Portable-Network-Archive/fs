@@ -1,5 +1,5 @@
 use crate::file_tree::{
-    CipherConfig, FileData, FileTree, FsContent, FsNode, ROOT_INODE, get_gid, get_uid,
+    CipherConfig, DirContent, FileData, FileTree, FsContent, FsNode, ROOT_INODE, get_gid, get_uid,
     make_dir_node,
 };
 use fuser::{FileAttr, FileType, INodeNo};
@@ -183,14 +183,31 @@ fn add_normal_entry(
 
     if let Some(existing) = existing_ino {
         if let Some(existing_node) = tree.get_mut(existing) {
+            // When replacing an existing directory with another directory entry,
+            // preserve the children map — it may already contain nodes inserted
+            // by earlier file entries (e.g., "dir/file.txt" before "dir").
+            let preserve_children = matches!(existing_node.content, FsContent::Directory(_))
+                && matches!(node.content, FsContent::Directory(_));
+            let preserved = if preserve_children {
+                match std::mem::replace(
+                    &mut existing_node.content,
+                    FsContent::Directory(DirContent::new()),
+                ) {
+                    old @ FsContent::Directory(_) => Some(old),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let parent = existing_node.parent;
             *existing_node = FsNode {
                 name: node.name,
-                parent: existing_node.parent,
+                parent,
                 attr: FileAttr {
                     ino: INodeNo(existing),
                     ..node.attr
                 },
-                content: node.content,
+                content: preserved.unwrap_or(node.content),
                 xattrs: node.xattrs,
             };
         }
@@ -891,5 +908,51 @@ mod tests {
         let children: Vec<_> = tree2.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, std::ffi::OsStr::new("b.txt"));
+    }
+
+    /// Regression test: when a PNA archive has file entries before their parent
+    /// directory entry (e.g., "dir/file.txt" then "dir"), the directory
+    /// replacement must preserve the children already inserted.
+    #[test]
+    fn load_dir_entry_after_child_preserves_children() {
+        use std::io::Write as IoWrite;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("ordered.pna");
+        let mut archive = Archive::write_header(std::fs::File::create(&path).unwrap()).unwrap();
+        // Write file BEFORE its parent directory entry
+        archive
+            .write_file(
+                pna::EntryName::from_lossy("mydir/child.txt"),
+                Metadata::new(),
+                WriteOptions::builder().build(),
+                |w| {
+                    w.write_all(b"hello")?;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        // Now write explicit directory entry for "mydir"
+        let dir_entry = EntryBuilder::new_dir(pna::EntryName::from_lossy("mydir"))
+            .build()
+            .unwrap();
+        archive.add_entry(dir_entry).unwrap();
+        archive.finalize().unwrap();
+
+        let tree = load(&path, None).unwrap();
+        // "mydir" should exist as a directory under root
+        let mydir = tree
+            .lookup_child(ROOT_INODE, std::ffi::OsStr::new("mydir"))
+            .expect("mydir not found");
+        let mydir_ino = mydir.attr.ino.0;
+        // "child.txt" should still be a child of "mydir" (not orphaned)
+        let child = tree
+            .lookup_child(mydir_ino, std::ffi::OsStr::new("child.txt"))
+            .expect("child.txt was orphaned by directory replacement");
+        let data = match &child.content {
+            FsContent::File(fd) => fd.data(),
+            _ => panic!("expected file"),
+        };
+        assert_eq!(data, b"hello");
     }
 }
