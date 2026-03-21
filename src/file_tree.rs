@@ -150,12 +150,12 @@ impl std::fmt::Debug for FsNode {
 pub(crate) struct FileTree {
     inodes: HashMap<Inode, FsNode>,
     next_inode: Inode,
-    pub(crate) password: Option<String>,
+    password: Option<String>,
     archive_path: PathBuf,
     dirty: bool,
 }
 
-// Static assertion: FileTree must be Send so it can live in Mutex<FileTree>.
+// Static assertion: FileTree must be Send so it can live in RwLock<FileTree>.
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<FileTree>();
@@ -180,6 +180,11 @@ impl FileTree {
 
     pub(crate) fn password(&self) -> Option<&str> {
         self.password.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clear_password(&mut self) {
+        self.password = None;
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
@@ -1693,5 +1698,111 @@ mod tests {
             tree.lookup_child(children[0].attr.ino.0, OsStr::new("new"))
                 .is_some()
         );
+    }
+
+    // ── BTreeMap sorted children order ────────────────────────────
+
+    #[test]
+    fn children_returns_sorted_order() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("z.txt"), 0o644)
+            .unwrap();
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644)
+            .unwrap();
+        tree.create_file(ROOT_INODE, OsStr::new("m.txt"), 0o644)
+            .unwrap();
+        let names: Vec<_> = tree
+            .children(ROOT_INODE)
+            .unwrap()
+            .map(|n| n.name.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["a.txt", "m.txt", "z.txt"]);
+    }
+
+    // ── Parent back-pointer correctness ───────────────────────────
+
+    #[test]
+    fn parent_pointer_set_on_create_file() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644)
+            .unwrap();
+        let child = tree.lookup_child(ROOT_INODE, OsStr::new("f.txt")).unwrap();
+        assert_eq!(child.parent, Some(ROOT_INODE));
+    }
+
+    #[test]
+    fn parent_pointer_for_nested_file() {
+        let mut tree = make_tree();
+        let dir = tree
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0)
+            .unwrap();
+        let dir_ino = dir.attr.ino.0;
+        tree.create_file(dir_ino, OsStr::new("f.txt"), 0o644)
+            .unwrap();
+        let child = tree.lookup_child(dir_ino, OsStr::new("f.txt")).unwrap();
+        assert_eq!(child.parent, Some(dir_ino));
+    }
+
+    #[test]
+    fn parent_pointer_for_make_dir() {
+        let mut tree = make_tree();
+        let dir = tree
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0)
+            .unwrap();
+        assert_eq!(dir.parent, Some(ROOT_INODE));
+    }
+
+    // ── is_dirty on non-file mutations ────────────────────────────
+
+    #[test]
+    fn is_dirty_after_make_dir() {
+        let mut tree = make_tree();
+        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0)
+            .unwrap();
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn is_dirty_after_unlink() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644)
+            .unwrap();
+        tree.mark_clean();
+        tree.unlink(ROOT_INODE, OsStr::new("f.txt")).unwrap();
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn is_dirty_after_set_times_with_value() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644)
+            .unwrap();
+        tree.mark_clean();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let ino = tree
+            .lookup_child(ROOT_INODE, OsStr::new("f.txt"))
+            .unwrap()
+            .attr
+            .ino
+            .0;
+        tree.set_times(ino, Some(TimeOrNow::SpecificTime(t)), None)
+            .unwrap();
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn not_dirty_after_set_times_none_none() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644)
+            .unwrap();
+        tree.mark_clean();
+        let ino = tree
+            .lookup_child(ROOT_INODE, OsStr::new("f.txt"))
+            .unwrap()
+            .attr
+            .ino
+            .0;
+        tree.set_times(ino, None, None).unwrap();
+        assert!(!tree.is_dirty());
     }
 }

@@ -717,7 +717,7 @@ mod tests {
             .0;
         tree.write_file(child_ino, 0, b"data").unwrap();
         // Now clear the password — the node is now Dirty with cipher config.
-        tree.password = None;
+        tree.clear_password();
 
         let result = save(&tree);
         assert!(result.is_err());
