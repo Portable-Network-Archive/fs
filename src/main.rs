@@ -6,6 +6,7 @@ mod archive_io;
 mod archive_store;
 mod cli;
 mod command;
+mod file_tree;
 mod filesystem;
 
 fn main() -> io::Result<()> {
