@@ -515,6 +515,64 @@ impl FileTree {
         Err(Errno::ENOSYS)
     }
 
+    // ── Traversal / bulk helpers ───────────────────────────────────
+
+    /// Return every node except root in depth-first order together with its
+    /// full archive path (e.g. `"dir/subdir/file.txt"`).
+    pub(crate) fn collect_dfs(&self) -> Vec<(Inode, &FsNode, String)> {
+        let mut result = Vec::new();
+        if let Some(root) = self.inodes.get(&ROOT_INODE) {
+            if let FsContent::Directory(ref dir) = root.content {
+                self.collect_dfs_recurse(dir, &mut result, &mut String::new());
+            }
+        }
+        result
+    }
+
+    fn collect_dfs_recurse<'a>(
+        &'a self,
+        dir: &DirContent,
+        result: &mut Vec<(Inode, &'a FsNode, String)>,
+        prefix: &mut String,
+    ) {
+        for (name, &ino) in &dir.children {
+            let node = match self.inodes.get(&ino) {
+                Some(n) => n,
+                None => continue,
+            };
+            let path = if prefix.is_empty() {
+                name.to_string_lossy().into_owned()
+            } else {
+                format!("{}/{}", prefix, name.to_string_lossy())
+            };
+            result.push((ino, node, path.clone()));
+            if let FsContent::Directory(ref child_dir) = node.content {
+                let mut child_prefix = path;
+                self.collect_dfs_recurse(child_dir, result, &mut child_prefix);
+            }
+        }
+    }
+
+    /// Create all intermediate directories along `path`, starting from
+    /// `parent`. Returns the inode of the deepest directory.
+    ///
+    /// Does **not** set `self.dirty` — this is used during archive load,
+    /// which should leave the tree in a clean state.
+    pub(crate) fn make_dir_all(&mut self, path: &Path, mut parent: Inode) -> io::Result<Inode> {
+        for component in path.components() {
+            let name = component.as_os_str();
+            if let Some(child) = self.lookup_child(parent, name) {
+                parent = child.attr.ino.0;
+            } else {
+                let ino = self.next_inode();
+                let dir_node = make_dir_node(ino, name.to_owned());
+                self.insert_node(dir_node, Some(parent))?;
+                parent = ino;
+            }
+        }
+        Ok(parent)
+    }
+
     /// Constructs an empty tree with just the root directory node, intended
     /// for use in unit tests.
     #[cfg(test)]
@@ -1559,5 +1617,81 @@ mod tests {
         assert_eq!(fd.data(), &[1, 2, 3]);
         fd.data_mut().push(4);
         assert_eq!(fd.data(), &[1, 2, 3, 4]);
+    }
+
+    // ── collect_dfs ─────────────────────────────────────────────────
+
+    #[test]
+    fn collect_dfs_empty_tree() {
+        let tree = make_tree();
+        let result = tree.collect_dfs();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn collect_dfs_single_file() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644)
+            .unwrap();
+        let result = tree.collect_dfs();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].2, "a.txt");
+    }
+
+    #[test]
+    fn collect_dfs_nested_dirs() {
+        let mut tree = make_tree();
+        let dir = tree
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0)
+            .unwrap();
+        let dir_ino = dir.attr.ino.0;
+        tree.create_file(dir_ino, OsStr::new("file.txt"), 0o644)
+            .unwrap();
+        let result = tree.collect_dfs();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].2, "sub");
+        assert_eq!(result[1].2, "sub/file.txt");
+    }
+
+    #[test]
+    fn collect_dfs_sorted_order() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("z.txt"), 0o644)
+            .unwrap();
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644)
+            .unwrap();
+        let result = tree.collect_dfs();
+        assert_eq!(result[0].2, "a.txt");
+        assert_eq!(result[1].2, "z.txt");
+    }
+
+    // ── make_dir_all ────────────────────────────────────────────────
+
+    #[test]
+    fn make_dir_all_creates_nested() {
+        let mut tree = make_tree();
+        let ino = tree.make_dir_all(Path::new("a/b/c"), ROOT_INODE).unwrap();
+        assert!(tree.get(ino).is_some());
+        let a = tree.lookup_child(ROOT_INODE, OsStr::new("a")).unwrap();
+        let b = tree.lookup_child(a.attr.ino.0, OsStr::new("b")).unwrap();
+        let c = tree.lookup_child(b.attr.ino.0, OsStr::new("c")).unwrap();
+        assert_eq!(c.attr.ino.0, ino);
+    }
+
+    #[test]
+    fn make_dir_all_reuses_existing() {
+        let mut tree = make_tree();
+        tree.make_dir(ROOT_INODE, OsStr::new("existing"), 0o755, 0)
+            .unwrap();
+        let ino = tree
+            .make_dir_all(Path::new("existing/new"), ROOT_INODE)
+            .unwrap();
+        // "existing" was reused (not duplicated), "new" was created
+        let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
+        assert_eq!(children.len(), 1); // only "existing", not a duplicate
+        assert!(
+            tree.lookup_child(children[0].attr.ino.0, OsStr::new("new"))
+                .is_some()
+        );
     }
 }
