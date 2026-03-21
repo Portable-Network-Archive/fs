@@ -251,20 +251,8 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
                 FsContent::Directory(_) => {
                     // Write explicit directory entry with metadata (mtime, crtime).
                     let mut builder = EntryBuilder::new_dir(entry_name);
-                    let mtime = node
-                        .attr
-                        .mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| pna::Duration::seconds(d.as_secs() as i64));
-                    let crtime = node
-                        .attr
-                        .crtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| pna::Duration::seconds(d.as_secs() as i64));
-                    builder.modified(mtime);
-                    builder.created(crtime);
+                    builder.modified(system_time_to_pna(node.attr.mtime));
+                    builder.created(system_time_to_pna(node.attr.crtime));
                     let dir_entry = builder.build()?;
                     archive.add_entry(dir_entry)?;
                 }
@@ -275,15 +263,9 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
                     );
                 }
                 FsContent::File(fc) => {
-                    let (data, cipher_ref): (&[u8], Option<&CipherConfig>) = match fc {
-                        FileData::Clean { data, cipher } | FileData::Dirty { data, cipher } => {
-                            (data.as_slice(), cipher.as_ref())
-                        }
-                        FileData::New(data) => (data.as_slice(), None),
-                    };
-                    let write_opts = build_write_options(cipher_ref, tree.password())?;
+                    let write_opts = build_write_options(fc.cipher(), tree.password())?;
                     archive.write_file(entry_name, metadata, write_opts, |w| {
-                        w.write_all(data)?;
+                        w.write_all(fc.data())?;
                         Ok(())
                     })?;
                 }
@@ -316,7 +298,10 @@ fn build_write_options(
     cipher: Option<&CipherConfig>,
     password: Option<&str>,
 ) -> io::Result<WriteOptions> {
-    match cipher {
+    let effective = cipher
+        .copied()
+        .or_else(|| password.map(|_| CipherConfig::default_for_password()));
+    match effective {
         Some(cfg) => {
             let pwd = password.ok_or_else(|| {
                 io::Error::new(
@@ -331,37 +316,20 @@ fn build_write_options(
                 .password(Some(pwd.as_bytes()))
                 .build())
         }
-        None => {
-            if let Some(pwd) = password {
-                let defaults = CipherConfig::default_for_password();
-                Ok(WriteOptions::builder()
-                    .encryption(defaults.encryption)
-                    .cipher_mode(defaults.cipher_mode)
-                    .hash_algorithm(HashAlgorithm::argon2id())
-                    .password(Some(pwd.as_bytes()))
-                    .build())
-            } else {
-                Ok(WriteOptions::builder().build())
-            }
-        }
+        None => Ok(WriteOptions::builder().build()),
     }
+}
+
+fn system_time_to_pna(t: SystemTime) -> Option<pna::Duration> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| pna::Duration::seconds(d.as_secs() as i64))
 }
 
 /// Build pna `Metadata` from node attributes.
 fn build_metadata(node: &FsNode) -> Metadata {
-    use std::time::UNIX_EPOCH;
-    let mtime = node
-        .attr
-        .mtime
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| pna::Duration::seconds(d.as_secs() as i64));
-    let crtime = node
-        .attr
-        .crtime
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|d| pna::Duration::seconds(d.as_secs() as i64));
+    let mtime = system_time_to_pna(node.attr.mtime);
+    let crtime = system_time_to_pna(node.attr.crtime);
     Metadata::new().with_modified(mtime).with_created(crtime)
 }
 
@@ -528,9 +496,7 @@ mod tests {
     fn read_node_data(tree: &FileTree, ino: u64) -> Vec<u8> {
         let node = tree.get(ino).expect("node not found");
         match &node.content {
-            FsContent::File(FileData::Clean { data, .. })
-            | FsContent::File(FileData::Dirty { data, .. })
-            | FsContent::File(FileData::New(data)) => data.clone(),
+            FsContent::File(fd) => fd.data().to_vec(),
             _ => panic!("not a file"),
         }
     }

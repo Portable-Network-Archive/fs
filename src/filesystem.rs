@@ -40,6 +40,14 @@ impl PnaFS {
         })
     }
 
+    fn require_writable(&self) -> Result<(), Errno> {
+        if self.write_strategy.is_none() {
+            Err(Errno::EROFS)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Save the archive and mark the tree clean. Returns `Ok(())` even when
     /// there is nothing to save.
     fn save_if_dirty(tree: &mut FileTree) -> io::Result<()> {
@@ -151,8 +159,8 @@ impl Filesystem for PnaFS {
             "[Implemented] write(ino: {ino:#x?}, offset: {offset}, data.len(): {})",
             data.len()
         );
-        if self.write_strategy.is_none() {
-            reply.error(Errno::EROFS);
+        if let Err(e) = self.require_writable() {
+            reply.error(e);
             return;
         }
         let mut tree = self.tree.write().unwrap();
@@ -240,8 +248,8 @@ impl Filesystem for PnaFS {
         reply: ReplyAttr,
     ) {
         info!("[Implemented] setattr(ino: {ino:#x?}, mode: {mode:?}, size: {size:?})");
-        if self.write_strategy.is_none() {
-            reply.error(Errno::EROFS);
+        if let Err(e) = self.require_writable() {
+            reply.error(e);
             return;
         }
         let mut tree = self.tree.write().unwrap();
@@ -286,23 +294,11 @@ impl Filesystem for PnaFS {
         reply: ReplyCreate,
     ) {
         info!("[Implemented] create(parent: {parent:#x?}, name: {name:?}, mode: {mode})");
-        if self.write_strategy.is_none() {
-            reply.error(Errno::EROFS);
+        if let Err(e) = self.require_writable() {
+            reply.error(e);
             return;
         }
         let mut tree = self.tree.write().unwrap();
-        // Check parent
-        match tree.get(parent.0) {
-            None => {
-                reply.error(Errno::ENOENT);
-                return;
-            }
-            Some(n) if !matches!(n.content, FsContent::Directory(_)) => {
-                reply.error(Errno::ENOTDIR);
-                return;
-            }
-            _ => {}
-        }
         let existing = tree.lookup_child(parent.0, name).map(|n| n.attr.ino.0);
         if let Some(ino) = existing {
             if (flags & libc::O_EXCL) != 0 {
@@ -350,8 +346,8 @@ impl Filesystem for PnaFS {
         reply: ReplyEntry,
     ) {
         info!("[Implemented] mkdir(parent: {parent:#x?}, name: {name:?}, mode: {mode})");
-        if self.write_strategy.is_none() {
-            reply.error(Errno::EROFS);
+        if let Err(e) = self.require_writable() {
+            reply.error(e);
             return;
         }
         let mut tree = self.tree.write().unwrap();
@@ -366,8 +362,8 @@ impl Filesystem for PnaFS {
 
     fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
         info!("[Implemented] unlink(parent: {parent:#x?}, name: {name:?})");
-        if self.write_strategy.is_none() {
-            reply.error(Errno::EROFS);
+        if let Err(e) = self.require_writable() {
+            reply.error(e);
             return;
         }
         let mut tree = self.tree.write().unwrap();
@@ -390,8 +386,8 @@ impl Filesystem for PnaFS {
         info!(
             "[Implemented] rename(parent: {parent:#x?}, name: {name:?}, newparent: {newparent:#x?}, newname: {newname:?})"
         );
-        if self.write_strategy.is_none() {
-            reply.error(Errno::EROFS);
+        if let Err(e) = self.require_writable() {
+            reply.error(e);
             return;
         }
         let mut tree = self.tree.write().unwrap();
@@ -422,10 +418,8 @@ impl Filesystem for PnaFS {
             reply.error(Errno::ENOTDIR);
             return;
         }
-        let children: Vec<_> = tree.children(ino.0).unwrap().collect();
-
         let mut current_offset = offset + 1;
-        for entry in children.into_iter().skip(offset as usize) {
+        for entry in tree.children(ino.0).unwrap().skip(offset as usize) {
             let is_full = reply.add(entry.attr.ino, current_offset, entry.attr.kind, &entry.name);
             if is_full {
                 break;

@@ -102,6 +102,13 @@ impl FileData {
             }
         }
     }
+
+    pub(crate) fn cipher(&self) -> Option<&CipherConfig> {
+        match self {
+            FileData::Clean { cipher, .. } | FileData::Dirty { cipher, .. } => cipher.as_ref(),
+            FileData::New(_) => None,
+        }
+    }
 }
 
 pub(crate) struct DirContent {
@@ -339,7 +346,7 @@ impl FileTree {
         if offset > buf.len() {
             buf.resize(offset, 0);
         }
-        let end = offset + data.len();
+        let end = offset.checked_add(data.len()).ok_or(Errno::EFBIG)?;
         if end > buf.len() {
             buf.resize(end, 0);
         }
@@ -351,6 +358,9 @@ impl FileTree {
 
     pub(crate) fn set_size(&mut self, ino: Inode, size: u64) -> Result<(), Errno> {
         let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
+        if size == node.attr.size {
+            return Ok(());
+        }
         let file_data = match &mut node.content {
             FsContent::Directory(_) => return Err(Errno::EISDIR),
             FsContent::Symlink(_) => return Err(Errno::EIO),
