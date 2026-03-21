@@ -132,7 +132,7 @@ impl Filesystem for PnaFS {
         };
         let offset = offset as usize;
         let size = size as usize;
-        reply.data(&data[data.len().min(offset)..data.len().min(offset + size)]);
+        reply.data(&data[data.len().min(offset)..data.len().min(offset.saturating_add(size))]);
     }
 
     fn write(
@@ -262,8 +262,10 @@ impl Filesystem for PnaFS {
         // Handle mode/uid/gid.
         if mode.is_some() || uid.is_some() || gid.is_some() {
             if let Err(e) = tree.set_attr_full(ino.0, mode, uid, gid) {
-                reply.error(e);
-                return;
+                if e.code() != libc::ENOSYS {
+                    reply.error(e);
+                    return;
+                }
             }
         }
         let ttl = Duration::from_secs(1);
@@ -409,10 +411,18 @@ impl Filesystem for PnaFS {
     ) {
         info!("[Implemented] readdir(ino: {ino:#x?}, fh: {fh:?}, offset: {offset})");
         let tree = self.tree.read().unwrap();
-        let children: Vec<_> = match tree.children(ino.0) {
-            Some(iter) => iter.collect(),
-            None => Vec::new(),
+        let node = match tree.get(ino.0) {
+            Some(n) => n,
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
         };
+        if !matches!(node.content, FsContent::Directory(_)) {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+        let children: Vec<_> = tree.children(ino.0).unwrap().collect();
 
         let mut current_offset = offset + 1;
         for entry in children.into_iter().skip(offset as usize) {

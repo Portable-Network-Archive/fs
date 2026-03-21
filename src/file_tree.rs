@@ -23,6 +23,13 @@ pub(crate) struct CipherConfig {
 }
 
 impl CipherConfig {
+    pub(crate) fn default_for_password() -> Self {
+        Self {
+            encryption: pna::Encryption::Aes,
+            cipher_mode: pna::CipherMode::CTR,
+        }
+    }
+
     pub(crate) fn from_entry_header(header: &pna::EntryHeader) -> Option<Self> {
         if header.encryption() != pna::Encryption::No {
             Some(Self {
@@ -70,10 +77,7 @@ impl FileData {
             FileData::New(data) => {
                 let data = std::mem::take(data);
                 let cipher = if has_password {
-                    Some(CipherConfig {
-                        encryption: pna::Encryption::Aes,
-                        cipher_mode: pna::CipherMode::CTR,
-                    })
+                    Some(CipherConfig::default_for_password())
                 } else {
                     None
                 };
@@ -117,6 +121,10 @@ impl DirContent {
 
     pub(crate) fn insert(&mut self, name: OsString, ino: Inode) {
         self.children.insert(name, ino);
+    }
+
+    pub(crate) fn remove(&mut self, name: &OsStr) -> Option<Inode> {
+        self.children.remove(name)
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&OsString, &Inode)> {
@@ -294,7 +302,7 @@ impl FileTree {
                 ctime: now,
                 crtime: now,
                 kind: FileType::RegularFile,
-                perm: mode as u16,
+                perm: (mode & 0o7777) as u16,
                 nlink: 1,
                 uid: current_uid(),
                 gid: current_gid(),
@@ -408,7 +416,7 @@ impl FileTree {
             return Err(Errno::EEXIST);
         }
         let ino = self.next_inode();
-        let effective_mode = (mode & !umask) as u16;
+        let effective_mode = (mode & !umask & 0o7777) as u16;
         let mut node = make_dir_node(ino, name.to_owned());
         node.attr.perm = effective_mode;
         self.insert_node(node, Some(parent))
@@ -437,7 +445,7 @@ impl FileTree {
         // Remove from parent's children
         let parent_node = self.inodes.get_mut(&parent).unwrap();
         if let FsContent::Directory(dir) = &mut parent_node.content {
-            dir.children.remove(name);
+            dir.remove(name);
         }
         // Remove from inodes
         self.inodes.remove(&target_ino);
@@ -522,8 +530,9 @@ impl FileTree {
 
     // ── Traversal / bulk helpers ───────────────────────────────────
 
-    /// Return every node except root in depth-first order together with its
-    /// full archive path (e.g. `"dir/subdir/file.txt"`).
+    /// Return every node except root in pre-order traversal (children sorted
+    /// lexicographically by name) together with its full archive path
+    /// (e.g. `"dir/subdir/file.txt"`).
     pub(crate) fn collect_dfs(&self) -> Vec<(Inode, &FsNode, String)> {
         let mut result = Vec::new();
         if let Some(root) = self.inodes.get(&ROOT_INODE) {
@@ -1556,6 +1565,26 @@ mod tests {
         let mut fd = FileData::New(vec![6, 7]);
         fd.promote_to_dirty();
         assert!(matches!(fd, FileData::New(_)));
+    }
+
+    #[test]
+    fn promote_to_dirty_preserves_cipher() {
+        let mut fd = FileData::Clean {
+            data: vec![1, 2, 3],
+            cipher: Some(CipherConfig {
+                encryption: pna::Encryption::Aes,
+                cipher_mode: pna::CipherMode::CTR,
+            }),
+        };
+        fd.promote_to_dirty();
+        if let FileData::Dirty {
+            cipher: Some(c), ..
+        } = &fd
+        {
+            assert!(matches!(c.encryption, pna::Encryption::Aes));
+        } else {
+            panic!("expected Dirty with cipher");
+        }
     }
 
     #[test]

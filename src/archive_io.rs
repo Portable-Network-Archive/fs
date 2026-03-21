@@ -30,11 +30,18 @@ pub(crate) fn cleanup_stale_tmp(archive_path: &Path) {
             if let Some(pid_str) = name_str.strip_prefix(&prefix) {
                 if let Ok(pid) = pid_str.parse::<u32>() {
                     #[cfg(unix)]
-                    if unsafe { libc::kill(pid as i32, 0) } == 0 {
-                        continue;
+                    {
+                        let ret = unsafe { libc::kill(pid as i32, 0) };
+                        if ret == 0 {
+                            continue;
+                        }
+                        let err = std::io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EPERM) {
+                            continue;
+                        }
                     }
+                    let _ = fs::remove_file(entry.path());
                 }
-                let _ = fs::remove_file(entry.path());
             }
         }
     }
@@ -289,6 +296,11 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
         drop(inner);
 
         fs::rename(&tmp_path, archive_path)?;
+        if let Some(parent_dir) = archive_path.parent() {
+            if let Ok(dir_file) = fs::File::open(parent_dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
         Ok(())
     })();
 
@@ -321,10 +333,10 @@ fn build_write_options(
         }
         None => {
             if let Some(pwd) = password {
-                // Store has password; encrypt new/plain entries with AES-CTR.
+                let defaults = CipherConfig::default_for_password();
                 Ok(WriteOptions::builder()
-                    .encryption(pna::Encryption::Aes)
-                    .cipher_mode(pna::CipherMode::CTR)
+                    .encryption(defaults.encryption)
+                    .cipher_mode(defaults.cipher_mode)
                     .hash_algorithm(HashAlgorithm::argon2id())
                     .password(Some(pwd.as_bytes()))
                     .build())
