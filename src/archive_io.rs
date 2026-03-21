@@ -1,9 +1,8 @@
-use crate::archive_store::{
-    ArchiveStore, CipherConfig, FileContent, Node, NodeContent, ROOT_INODE, get_gid, get_uid,
+use crate::file_tree::{
+    CipherConfig, FileData, FileTree, FsContent, FsNode, ROOT_INODE, get_gid, get_uid,
     make_dir_node,
 };
 use fuser::{FileAttr, FileType, INodeNo};
-use id_tree::NodeId;
 use pna::{
     Archive, DataKind, EntryBuilder, EntryName, HashAlgorithm, Metadata, NormalEntry, ReadEntry,
     ReadOptions, WriteOptions,
@@ -42,22 +41,21 @@ pub(crate) fn cleanup_stale_tmp(archive_path: &Path) {
 }
 
 /// Load a PNA archive from `archive_path`, optionally decrypting with `password`.
-pub(crate) fn load(archive_path: &Path, password: Option<String>) -> io::Result<ArchiveStore> {
+pub(crate) fn load(archive_path: &Path, password: Option<String>) -> io::Result<FileTree> {
     cleanup_stale_tmp(archive_path);
 
-    let file = fs::File::open(archive_path)?;
-    let memmap = unsafe { memmap2::Mmap::map(&file) }?;
+    let data = fs::read(archive_path)?;
 
-    // Derive password bytes before moving `password` into the store.
+    // Derive password bytes before moving `password` into the tree.
     let password_bytes: Option<Vec<u8>> = password.as_deref().map(|s| s.as_bytes().to_vec());
 
-    let mut archive = Archive::read_header_from_slice(&memmap[..])?;
+    let mut archive = Archive::read_header_from_slice(&data)?;
 
-    let mut store = ArchiveStore::new(archive_path.to_path_buf(), password);
+    let mut tree = FileTree::new(archive_path.to_path_buf(), password);
 
     // Insert root directory node (no parent).
     let root = make_dir_node(ROOT_INODE, ".".into());
-    store.insert_node(root, None)?;
+    tree.insert_node(root, None)?;
 
     let pw = password_bytes.as_deref();
 
@@ -66,25 +64,25 @@ pub(crate) fn load(archive_path: &Path, password: Option<String>) -> io::Result<
         match entry {
             ReadEntry::Normal(e) => {
                 let owned: NormalEntry<Vec<u8>> = e.into();
-                add_normal_entry(&mut store, owned, pw)?;
+                add_normal_entry(&mut tree, owned, pw)?;
             }
             ReadEntry::Solid(solid) => {
                 for e in solid.entries(pw)? {
                     let e = e?;
-                    add_normal_entry(&mut store, e, pw)?;
+                    add_normal_entry(&mut tree, e, pw)?;
                 }
             }
         }
     }
 
-    // Loading from disk — store is clean.
-    store.dirty = false;
+    // No need to reset dirty — FileTree::new() starts with dirty=false
+    // and insert_node() does not set dirty.
 
-    Ok(store)
+    Ok(tree)
 }
 
 fn add_normal_entry(
-    store: &mut ArchiveStore,
+    tree: &mut FileTree,
     entry: NormalEntry<Vec<u8>>,
     password: Option<&[u8]>,
 ) -> io::Result<()> {
@@ -95,7 +93,7 @@ fn add_normal_entry(
 
     // Determine parent inode.
     let parent_ino = match entry_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => store.make_dir_all(p, ROOT_INODE)?,
+        Some(p) if !p.as_os_str().is_empty() => tree.make_dir_all(p, ROOT_INODE)?,
         _ => ROOT_INODE,
     };
 
@@ -105,7 +103,7 @@ fn add_normal_entry(
         None => return Ok(()),
     };
 
-    let ino = store.next_inode();
+    let ino = tree.next_inode();
 
     let mut attr = FileAttr {
         ino: INodeNo(ino),
@@ -142,11 +140,11 @@ fn add_normal_entry(
     let opts = ReadOptions::with_password(password);
 
     let content = match header.data_kind() {
-        DataKind::Directory => NodeContent::Directory,
+        DataKind::Directory => FsContent::Directory(crate::file_tree::DirContent::new()),
         DataKind::SymbolicLink => {
             let mut buf = Vec::new();
             entry.reader(&opts)?.read_to_end(&mut buf)?;
-            NodeContent::Symlink(std::ffi::OsString::from(
+            FsContent::Symlink(std::ffi::OsString::from(
                 String::from_utf8_lossy(&buf).into_owned(),
             ))
         }
@@ -158,12 +156,13 @@ fn add_normal_entry(
             let mut buf = Vec::new();
             entry.reader(&opts)?.read_to_end(&mut buf)?;
             attr.size = buf.len() as u64;
-            NodeContent::File(FileContent::Loaded { data: buf, cipher })
+            FsContent::File(FileData::Clean { data: buf, cipher })
         }
     };
 
-    let node = Node {
+    let node = FsNode {
         name,
+        parent: None,
         attr,
         content,
         xattrs: HashMap::new(),
@@ -171,17 +170,15 @@ fn add_normal_entry(
 
     // If a node with this name already exists under parent (e.g. incremental
     // archives), update it in-place reusing the existing inode.
-    let existing_ino = store.get_children(parent_ino).and_then(|children| {
-        children
-            .iter()
-            .find(|n| n.name == node.name)
-            .map(|n| n.attr.ino.0)
-    });
+    let existing_ino = tree
+        .lookup_child(parent_ino, &node.name)
+        .map(|n| n.attr.ino.0);
 
     if let Some(existing) = existing_ino {
-        if let Some(existing_node) = store.get_node_mut(existing) {
-            *existing_node = Node {
+        if let Some(existing_node) = tree.get_mut(existing) {
+            *existing_node = FsNode {
                 name: node.name,
+                parent: existing_node.parent,
                 attr: FileAttr {
                     ino: INodeNo(existing),
                     ..node.attr
@@ -191,36 +188,37 @@ fn add_normal_entry(
             };
         }
     } else {
-        store.insert_node(node, Some(parent_ino))?;
+        tree.insert_node(node, Some(parent_ino))?;
     }
 
     Ok(())
 }
 
-/// Save the in-memory `ArchiveStore` back to disk atomically.
+/// Save the in-memory `FileTree` back to disk atomically.
 ///
 /// Writes to a temporary file `.{stem}.tmp.{pid}`, finalizes, calls `sync_all()`,
 /// then renames the temporary file over the original archive path.
-pub(crate) fn save(store: &ArchiveStore) -> io::Result<()> {
-    let archive_path = store.archive_path();
+pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
+    let archive_path = tree.archive_path();
 
-    // Password guard: any node that carries a cipher config requires a password.
-    for node in store.nodes.values() {
-        let needs_password = matches!(
-            &node.content,
-            NodeContent::File(FileContent::Loaded {
-                cipher: Some(_),
-                ..
-            }) | NodeContent::File(FileContent::Modified {
-                cipher: Some(_),
-                ..
-            })
-        );
-        if needs_password && store.password().is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "cannot re-encrypt: archive requires password but none was provided",
-            ));
+    // Password guard via collect_dfs
+    let nodes = tree.collect_dfs();
+    for (_, node, _) in &nodes {
+        if let FsContent::File(
+            FileData::Clean {
+                cipher: Some(_), ..
+            }
+            | FileData::Dirty {
+                cipher: Some(_), ..
+            },
+        ) = &node.content
+        {
+            if tree.password().is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot re-encrypt: archive requires password but none was provided",
+                ));
+            }
         }
     }
 
@@ -238,9 +236,51 @@ pub(crate) fn save(store: &ArchiveStore) -> io::Result<()> {
     let result = (|| -> io::Result<()> {
         let mut archive = Archive::write_header(tmp_file)?;
 
-        // Traverse tree in DFS order and write every non-root node.
-        if let Some(root_tree_id) = store.tree.root_node_id() {
-            write_subtree(store, root_tree_id, &mut archive, &mut Vec::new())?;
+        for (_, node, archive_path_str) in &nodes {
+            let entry_name = EntryName::from_lossy(archive_path_str);
+            let metadata = build_metadata(node);
+
+            match &node.content {
+                FsContent::Directory(_) => {
+                    // Write explicit directory entry with metadata (mtime, crtime).
+                    let mut builder = EntryBuilder::new_dir(entry_name);
+                    let mtime = node
+                        .attr
+                        .mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| pna::Duration::seconds(d.as_secs() as i64));
+                    let crtime = node
+                        .attr
+                        .crtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| pna::Duration::seconds(d.as_secs() as i64));
+                    builder.modified(mtime);
+                    builder.created(crtime);
+                    let dir_entry = builder.build()?;
+                    archive.add_entry(dir_entry)?;
+                }
+                FsContent::Symlink(_target) => {
+                    log::warn!(
+                        "save: skipping symlink entry '{}' (not yet supported)",
+                        archive_path_str
+                    );
+                }
+                FsContent::File(fc) => {
+                    let (data, cipher_ref): (&[u8], Option<&CipherConfig>) = match fc {
+                        FileData::Clean { data, cipher } | FileData::Dirty { data, cipher } => {
+                            (data.as_slice(), cipher.as_ref())
+                        }
+                        FileData::New(data) => (data.as_slice(), None),
+                    };
+                    let write_opts = build_write_options(cipher_ref, tree.password())?;
+                    archive.write_file(entry_name, metadata, write_opts, |w| {
+                        w.write_all(data)?;
+                        Ok(())
+                    })?;
+                }
+            }
         }
 
         // Finalize returns the inner writer so we can sync before rename.
@@ -257,102 +297,6 @@ pub(crate) fn save(store: &ArchiveStore) -> io::Result<()> {
     }
 
     result
-}
-
-/// Recursively write `node_id` and all its descendants into `archive`.
-/// `path_components` accumulates the path segments from root down to the current node.
-fn write_subtree(
-    store: &ArchiveStore,
-    node_id: &NodeId,
-    archive: &mut Archive<fs::File>,
-    path_components: &mut Vec<String>,
-) -> io::Result<()> {
-    let tree_node = store.tree.get(node_id).map_err(io::Error::other)?;
-    let ino = *tree_node.data();
-
-    // The root inode is synthetic — skip writing it but recurse into its children.
-    if ino == ROOT_INODE {
-        for child_id in store.tree.children_ids(node_id).map_err(io::Error::other)? {
-            write_subtree(store, child_id, archive, path_components)?;
-        }
-        return Ok(());
-    }
-
-    let node = store
-        .nodes
-        .get(&ino)
-        .ok_or_else(|| io::Error::other(format!("missing node for inode {ino}")))?;
-
-    // Build the archive path for this node.
-    let node_name = node.name.to_string_lossy().into_owned();
-    path_components.push(node_name);
-    let archive_path_str = path_components.join("/");
-    let entry_name = EntryName::from_lossy(&archive_path_str);
-
-    // Build metadata (mtime and crtime where available).
-    let metadata = build_metadata(node);
-
-    // Write this node.
-    match &node.content {
-        NodeContent::Directory => {
-            // Write explicit directory entry with metadata (mtime, crtime).
-            let mut builder = EntryBuilder::new_dir(entry_name);
-            let mtime = node
-                .attr
-                .mtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|d| pna::Duration::seconds(d.as_secs() as i64));
-            let crtime = node
-                .attr
-                .crtime
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .map(|d| pna::Duration::seconds(d.as_secs() as i64));
-            builder.modified(mtime);
-            builder.created(crtime);
-            let dir_entry = builder.build()?;
-            archive.add_entry(dir_entry)?;
-        }
-        NodeContent::Symlink(_target) => {
-            log::warn!(
-                "save: skipping symlink entry '{}' (not yet supported)",
-                archive_path_str
-            );
-        }
-        NodeContent::File(fc) => {
-            match fc {
-                FileContent::Unloaded(entry, _opts) => {
-                    // Re-add the original NormalEntry verbatim (clone is cheap — Vec<u8>).
-                    archive.add_entry(entry.clone())?;
-                }
-                _ => {
-                    let (data, cipher_ref): (&[u8], Option<&CipherConfig>) = match fc {
-                        FileContent::Loaded { data, cipher }
-                        | FileContent::Modified { data, cipher } => {
-                            (data.as_slice(), cipher.as_ref())
-                        }
-                        FileContent::Created(data) => (data.as_slice(), None),
-                        FileContent::Unloaded(..) => unreachable!(),
-                    };
-                    let write_opts = build_write_options(cipher_ref, store.password())?;
-                    archive.write_file(entry_name, metadata, write_opts, |w| {
-                        w.write_all(data)?;
-                        Ok(())
-                    })?;
-                }
-            }
-        }
-    }
-
-    // Recurse into children.
-    for child_id in store.tree.children_ids(node_id).map_err(io::Error::other)? {
-        write_subtree(store, child_id, archive, path_components)?;
-    }
-
-    path_components.pop();
-
-    Ok(())
 }
 
 /// Build `WriteOptions` for a given optional cipher config and password.
@@ -392,7 +336,7 @@ fn build_write_options(
 }
 
 /// Build pna `Metadata` from node attributes.
-fn build_metadata(node: &Node) -> Metadata {
+fn build_metadata(node: &FsNode) -> Metadata {
     use std::time::UNIX_EPOCH;
     let mtime = node
         .attr
@@ -412,7 +356,7 @@ fn build_metadata(node: &Node) -> Metadata {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::archive_store::ROOT_INODE;
+    use crate::file_tree::ROOT_INODE;
     use pna::{Archive, Metadata, WriteOptions};
     use std::io::Write as IoWrite;
     use std::path::PathBuf;
@@ -444,25 +388,23 @@ mod tests {
     fn load_empty_archive() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "empty.pna", &[]);
-        let store = load(&path, None).unwrap();
-        assert!(store.get_node(ROOT_INODE).is_some());
-        assert!(store.get_children(ROOT_INODE).unwrap().is_empty());
-        assert!(!store.is_dirty());
+        let tree = load(&path, None).unwrap();
+        assert!(tree.get(ROOT_INODE).is_some());
+        assert_eq!(tree.children(ROOT_INODE).unwrap().count(), 0);
+        assert!(!tree.is_dirty());
     }
 
     #[test]
     fn load_single_file() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "single.pna", &[("hello.txt", b"world")]);
-        let store = load(&path, None).unwrap();
-        let children = store.get_children(ROOT_INODE).unwrap();
+        let tree = load(&path, None).unwrap();
+        let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, std::ffi::OsStr::new("hello.txt"));
-        // create_plain_archive uses write_file() which doesn't write fSIZ,
-        // so the entry is force-loaded.
         assert!(matches!(
             children[0].content,
-            NodeContent::File(FileContent::Loaded { .. })
+            FsContent::File(FileData::Clean { .. })
         ));
         assert_eq!(children[0].attr.size, 5); // b"world"
     }
@@ -474,7 +416,7 @@ mod tests {
         // create a stale tmp file
         let stale = dir.path().join(".test.pna.tmp.99999");
         std::fs::write(&stale, b"stale").unwrap();
-        let _store = load(&path, None).unwrap();
+        let _tree = load(&path, None).unwrap();
         assert!(!stale.exists(), "stale tmp should be deleted");
     }
 
@@ -482,22 +424,22 @@ mod tests {
     fn load_nested_dirs() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "nested.pna", &[("a/b/c.txt", b"x")]);
-        let store = load(&path, None).unwrap();
+        let tree = load(&path, None).unwrap();
 
         // Root should have exactly one child: "a" (a directory).
-        let root_children = store.get_children(ROOT_INODE).unwrap();
+        let root_children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
         assert_eq!(root_children.len(), 1);
         assert_eq!(root_children[0].name.to_str().unwrap(), "a");
 
         // "a" should have exactly one child: "b" (a directory).
         let a_ino = root_children[0].attr.ino.0;
-        let a_children = store.get_children(a_ino).unwrap();
+        let a_children: Vec<_> = tree.children(a_ino).unwrap().collect();
         assert_eq!(a_children.len(), 1);
         assert_eq!(a_children[0].name.to_str().unwrap(), "b");
 
         // "b" should have exactly one child: "c.txt".
         let b_ino = a_children[0].attr.ino.0;
-        let b_children = store.get_children(b_ino).unwrap();
+        let b_children: Vec<_> = tree.children(b_ino).unwrap().collect();
         assert_eq!(b_children.len(), 1);
         assert_eq!(b_children[0].name.to_str().unwrap(), "c.txt");
     }
@@ -521,13 +463,13 @@ mod tests {
             .unwrap();
         solid.finalize().unwrap();
 
-        let store = load(&path, None).unwrap();
-        let children = store.get_children(ROOT_INODE).unwrap();
+        let tree = load(&path, None).unwrap();
+        let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, std::ffi::OsStr::new("solid_file.txt"));
         assert!(matches!(
             children[0].content,
-            NodeContent::File(FileContent::Loaded { .. })
+            FsContent::File(FileData::Clean { .. })
         ));
     }
 
@@ -556,13 +498,13 @@ mod tests {
             .unwrap();
         archive.finalize().unwrap();
 
-        let store = load(&path, Some("testpass".to_string())).unwrap();
-        let children = store.get_children(ROOT_INODE).unwrap();
+        let tree = load(&path, Some("testpass".to_string())).unwrap();
+        let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, std::ffi::OsStr::new("secret.txt"));
         assert!(matches!(
             children[0].content,
-            NodeContent::File(FileContent::Loaded { .. })
+            FsContent::File(FileData::Clean { .. })
         ));
     }
 
@@ -570,91 +512,85 @@ mod tests {
     // save() tests
     // -----------------------------------------------------------------------
 
-    /// Helper: read all data for a node by inode (handles Unloaded, Loaded, Modified, Created).
-    fn read_node_data(store: &ArchiveStore, ino: u64) -> Vec<u8> {
-        let node = store.get_node(ino).expect("node not found");
+    /// Helper: read all data for a node by inode.
+    fn read_node_data(tree: &FileTree, ino: u64) -> Vec<u8> {
+        let node = tree.get(ino).expect("node not found");
         match &node.content {
-            NodeContent::File(FileContent::Loaded { data, .. })
-            | NodeContent::File(FileContent::Modified { data, .. })
-            | NodeContent::File(FileContent::Created(data)) => data.clone(),
-            NodeContent::File(FileContent::Unloaded(entry, opts)) => {
-                let mut buf = Vec::new();
-                entry.reader(opts).unwrap().read_to_end(&mut buf).unwrap();
-                buf
-            }
+            FsContent::File(FileData::Clean { data, .. })
+            | FsContent::File(FileData::Dirty { data, .. })
+            | FsContent::File(FileData::New(data)) => data.clone(),
             _ => panic!("not a file"),
         }
     }
 
-    /// Helper: read all data for the first child of `parent_ino` in a store.
-    fn read_first_child_data(store: &ArchiveStore, parent_ino: u64) -> Vec<u8> {
-        let child_ino = store
-            .get_children(parent_ino)
+    /// Helper: read all data for the first child of `parent_ino` in a tree.
+    fn read_first_child_data(tree: &FileTree, parent_ino: u64) -> Vec<u8> {
+        let child_ino = tree
+            .children(parent_ino)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        read_node_data(store, child_ino)
+        read_node_data(tree, child_ino)
     }
 
-    /// Test 1: Loaded entries are re-written with the same content.
+    /// Test 1: Clean entries are re-written with the same content.
     #[test]
     fn save_loaded_entries_rewritten() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "t1.pna", &[("hello.txt", b"world")]);
-        let store = load(&path, None).unwrap();
-        save(&store).unwrap();
+        let tree = load(&path, None).unwrap();
+        save(&tree).unwrap();
 
-        let store2 = load(&path, None).unwrap();
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let tree2 = load(&path, None).unwrap();
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"world");
     }
 
-    /// Test 2: Loaded{modified data} - new content appears in the archive.
+    /// Test 2: Dirty data - new content appears in the archive.
     #[test]
     fn save_loaded_modified_data() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "t2.pna", &[("file.txt", b"original")]);
-        let mut store = load(&path, None).unwrap();
-        // Force-load and modify the file.
-        let child_ino = store
-            .get_children(ROOT_INODE)
+        let mut tree = load(&path, None).unwrap();
+        let child_ino = tree
+            .children(ROOT_INODE)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        // Write new content (this transitions Unloaded → Modified via write_file).
-        store.write_file(child_ino, 0, b"modified").unwrap();
-        save(&store).unwrap();
+        // Write new content (this transitions Clean -> Dirty via write_file).
+        tree.write_file(child_ino, 0, b"modified").unwrap();
+        save(&tree).unwrap();
 
-        let store2 = load(&path, None).unwrap();
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let tree2 = load(&path, None).unwrap();
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"modified");
     }
 
-    /// Test 3: Modified entries persist the modified data.
+    /// Test 3: Dirty entries persist the modified data.
     #[test]
     fn save_modified_entries_persisted() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "t3.pna", &[("a.txt", b"aaa")]);
-        let mut store = load(&path, None).unwrap();
-        let child_ino = store
-            .get_children(ROOT_INODE)
+        let mut tree = load(&path, None).unwrap();
+        let child_ino = tree
+            .children(ROOT_INODE)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        store.write_file(child_ino, 0, b"bbb").unwrap();
-        save(&store).unwrap();
+        tree.write_file(child_ino, 0, b"bbb").unwrap();
+        save(&tree).unwrap();
 
-        let store2 = load(&path, None).unwrap();
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let tree2 = load(&path, None).unwrap();
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"bbb");
     }
 
@@ -663,26 +599,25 @@ mod tests {
     fn save_created_entries_appear() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "t4.pna", &[]);
-        let mut store = load(&path, None).unwrap();
-        store
-            .create_file(ROOT_INODE, std::ffi::OsStr::new("new.txt"), 0o644)
+        let mut tree = load(&path, None).unwrap();
+        tree.create_file(ROOT_INODE, std::ffi::OsStr::new("new.txt"), 0o644)
             .unwrap();
-        let child_ino = store
-            .get_children(ROOT_INODE)
+        let child_ino = tree
+            .children(ROOT_INODE)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        store.write_file(child_ino, 0, b"new content").unwrap();
-        save(&store).unwrap();
+        tree.write_file(child_ino, 0, b"new content").unwrap();
+        save(&tree).unwrap();
 
-        let store2 = load(&path, None).unwrap();
-        let children = store2.get_children(ROOT_INODE).unwrap();
+        let tree2 = load(&path, None).unwrap();
+        let children: Vec<_> = tree2.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, std::ffi::OsStr::new("new.txt"));
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"new content");
     }
 
@@ -691,53 +626,51 @@ mod tests {
     fn save_created_entries_encrypted() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "t5.pna", &[]);
-        let mut store = load(&path, Some("secretpwd".to_string())).unwrap();
-        store
-            .create_file(ROOT_INODE, std::ffi::OsStr::new("enc.txt"), 0o644)
+        let mut tree = load(&path, Some("secretpwd".to_string())).unwrap();
+        tree.create_file(ROOT_INODE, std::ffi::OsStr::new("enc.txt"), 0o644)
             .unwrap();
-        let child_ino = store
-            .get_children(ROOT_INODE)
+        let child_ino = tree
+            .children(ROOT_INODE)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        store.write_file(child_ino, 0, b"secret").unwrap();
-        save(&store).unwrap();
+        tree.write_file(child_ino, 0, b"secret").unwrap();
+        save(&tree).unwrap();
 
         // Must be loadable with password.
-        let store2 = load(&path, Some("secretpwd".to_string())).unwrap();
-        let children = store2.get_children(ROOT_INODE).unwrap();
+        let tree2 = load(&path, Some("secretpwd".to_string())).unwrap();
+        let children: Vec<_> = tree2.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"secret");
 
-        // The reloaded entry should be Loaded (no fSIZ from write_file)
-        // and carry a cipher config.
-        let child_ino2 = store2
-            .get_children(ROOT_INODE)
+        // The reloaded entry should be Clean and carry a cipher config.
+        let child_ino2 = tree2
+            .children(ROOT_INODE)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        let node = store2.get_node(child_ino2).unwrap();
-        if let NodeContent::File(FileContent::Loaded {
+        let node = tree2.get(child_ino2).unwrap();
+        if let FsContent::File(FileData::Clean {
             cipher: Some(c), ..
         }) = &node.content
         {
             assert!(c.encryption != pna::Encryption::No);
         } else {
-            panic!("expected Loaded with cipher");
+            panic!("expected Clean with cipher");
         }
 
         // Verify that loading without password doesn't yield plaintext
-        let store_nopass = load(&path, None);
+        let tree_nopass = load(&path, None);
         // Either load fails entirely, or the data is not readable as plaintext
-        if let Ok(s) = store_nopass {
-            let children = s.get_children(ROOT_INODE).unwrap();
+        if let Ok(s) = tree_nopass {
+            let children: Vec<_> = s.children(ROOT_INODE).unwrap().collect();
             if !children.is_empty() {
                 let data = read_first_child_data(&s, ROOT_INODE);
                 assert_ne!(data, b"secret", "data should be encrypted, not plaintext");
@@ -771,28 +704,27 @@ mod tests {
         archive.finalize().unwrap();
 
         // Load with password (stores cipher config), then try to save without password.
-        let mut store = load(&path, Some("pwd".to_string())).unwrap();
-        // Force-load so the node transitions from Unloaded to Loaded (which carries cipher).
-        // We do this by triggering write_file which internally force-loads.
-        let child_ino = store
-            .get_children(ROOT_INODE)
+        let mut tree = load(&path, Some("pwd".to_string())).unwrap();
+        // The node is already Clean with cipher (all entries decoded at load).
+        // Write to transition to Dirty (which preserves cipher).
+        let child_ino = tree
+            .children(ROOT_INODE)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        // Trigger force-load by writing (appending zero bytes doesn't change content).
-        store.write_file(child_ino, 0, b"data").unwrap();
-        // Now clear the password — the node is now Loaded/Modified with cipher config.
-        store.password = None;
+        tree.write_file(child_ino, 0, b"data").unwrap();
+        // Now clear the password — the node is now Dirty with cipher config.
+        tree.password = None;
 
-        let result = save(&store);
+        let result = save(&tree);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
     }
 
-    /// Test 7: Round-trip load → save → load gives same tree and content.
+    /// Test 7: Round-trip load -> save -> load gives same tree and content.
     #[test]
     fn save_roundtrip_same_content() {
         let dir = TempDir::new().unwrap();
@@ -801,60 +733,54 @@ mod tests {
             "rt.pna",
             &[("a/b/c.txt", b"nested"), ("top.txt", b"top")],
         );
-        let store1 = load(&path, None).unwrap();
-        save(&store1).unwrap();
+        let tree1 = load(&path, None).unwrap();
+        save(&tree1).unwrap();
 
-        let store2 = load(&path, None).unwrap();
+        let tree2 = load(&path, None).unwrap();
 
         // Check top.txt
-        let root_children = store2.get_children(ROOT_INODE).unwrap();
-        let top = root_children
-            .iter()
-            .find(|n| n.name == std::ffi::OsStr::new("top.txt"));
+        let top = tree2.lookup_child(ROOT_INODE, std::ffi::OsStr::new("top.txt"));
         assert!(top.is_some(), "top.txt not found");
         let top_ino = top.unwrap().attr.ino.0;
-        let buf = read_node_data(&store2, top_ino);
+        let buf = read_node_data(&tree2, top_ino);
         assert_eq!(buf, b"top");
 
         // Check a/b/c.txt
-        let a = root_children
-            .iter()
-            .find(|n| n.name == std::ffi::OsStr::new("a"))
+        let a = tree2
+            .lookup_child(ROOT_INODE, std::ffi::OsStr::new("a"))
             .unwrap();
         let a_ino = a.attr.ino.0;
-        let b_children = store2.get_children(a_ino).unwrap();
-        let b = b_children.first().unwrap();
+        let b = tree2.children(a_ino).unwrap().next().unwrap();
         let b_ino = b.attr.ino.0;
-        let c_children = store2.get_children(b_ino).unwrap();
-        let c = c_children.first().unwrap();
+        let c = tree2.children(b_ino).unwrap().next().unwrap();
         let c_ino = c.attr.ino.0;
-        let buf2 = read_node_data(&store2, c_ino);
+        let buf2 = read_node_data(&tree2, c_ino);
         assert_eq!(buf2, b"nested");
     }
 
-    /// Test 8: Round-trip load → write → save → load preserves written data.
+    /// Test 8: Round-trip load -> write -> save -> load preserves written data.
     #[test]
     fn save_roundtrip_write_preserved() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "rt2.pna", &[("file.txt", b"old")]);
-        let mut store = load(&path, None).unwrap();
-        let child_ino = store
-            .get_children(ROOT_INODE)
+        let mut tree = load(&path, None).unwrap();
+        let child_ino = tree
+            .children(ROOT_INODE)
             .unwrap()
-            .first()
+            .next()
             .unwrap()
             .attr
             .ino
             .0;
-        store.write_file(child_ino, 0, b"new").unwrap();
-        save(&store).unwrap();
+        tree.write_file(child_ino, 0, b"new").unwrap();
+        save(&tree).unwrap();
 
-        let store2 = load(&path, None).unwrap();
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let tree2 = load(&path, None).unwrap();
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"new");
     }
 
-    /// Test 9: Encrypted round-trip — load with password, save, reload, data matches.
+    /// Test 9: Encrypted round-trip -- load with password, save, reload, data matches.
     #[test]
     fn save_encrypted_roundtrip() {
         use pna::{CipherMode, Encryption};
@@ -880,12 +806,12 @@ mod tests {
         archive.finalize().unwrap();
 
         // Load + save with password.
-        let store = load(&path, Some("mypwd".to_string())).unwrap();
-        save(&store).unwrap();
+        let tree = load(&path, Some("mypwd".to_string())).unwrap();
+        save(&tree).unwrap();
 
         // Reload and verify.
-        let store2 = load(&path, Some("mypwd".to_string())).unwrap();
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let tree2 = load(&path, Some("mypwd".to_string())).unwrap();
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"encrypted content");
     }
 
@@ -899,18 +825,17 @@ mod tests {
         let stale = dir.path().join(".stale.pna.tmp.99999");
         std::fs::write(&stale, b"leftover").unwrap();
 
-        let store = load(&path, None).unwrap();
-        save(&store).unwrap();
+        let tree = load(&path, None).unwrap();
+        save(&tree).unwrap();
 
         // Stale file should be gone.
         assert!(!stale.exists(), "stale tmp should be cleaned up");
         // Archive should still be valid.
-        let store2 = load(&path, None).unwrap();
-        let data = read_first_child_data(&store2, ROOT_INODE);
+        let tree2 = load(&path, None).unwrap();
+        let data = read_first_child_data(&tree2, ROOT_INODE);
         assert_eq!(data, b"data");
     }
 
-    /// EntryBuilder writes fSIZ, so entries created with it should stay Unloaded
     /// fSIZ is only a hint and must not be trusted, so even entries created
     /// via EntryBuilder (which writes fSIZ) are fully decoded on load.
     #[test]
@@ -929,47 +854,40 @@ mod tests {
         archive.add_entry(builder.build().unwrap()).unwrap();
         archive.finalize().unwrap();
 
-        let store = load(&path, None).unwrap();
-        let children = store.get_children(ROOT_INODE).unwrap();
+        let tree = load(&path, None).unwrap();
+        let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
-        // fSIZ is not trusted — entry is always fully decoded
+        // fSIZ is not trusted -- entry is always fully decoded
         assert!(matches!(
             children[0].content,
-            NodeContent::File(FileContent::Loaded { .. })
+            FsContent::File(FileData::Clean { .. })
         ));
         // And attr.size should be correct
         assert_eq!(children[0].attr.size, 14); // "has known size" = 14 bytes
     }
 
-    /// Test: directory mtime survives save→load round-trip.
+    /// Test: directory mtime survives save->load round-trip.
     #[test]
     fn save_roundtrip_preserves_directory_mtime() {
         let dir = TempDir::new().unwrap();
         let path = create_plain_archive(&dir, "dirs.pna", &[]);
-        let mut store = load(&path, None).unwrap();
+        let mut tree = load(&path, None).unwrap();
         // Create a directory and set a specific mtime
-        store
-            .make_dir(ROOT_INODE, std::ffi::OsStr::new("mydir"), 0o755, 0)
+        tree.make_dir(ROOT_INODE, std::ffi::OsStr::new("mydir"), 0o755, 0)
             .unwrap();
-        let dir_ino = store
-            .get_children(ROOT_INODE)
-            .unwrap()
-            .iter()
-            .find(|n| n.name == std::ffi::OsStr::new("mydir"))
+        let dir_ino = tree
+            .lookup_child(ROOT_INODE, std::ffi::OsStr::new("mydir"))
             .unwrap()
             .attr
             .ino
             .0;
         let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1700000000);
-        store
-            .set_times(dir_ino, None, Some(fuser::TimeOrNow::SpecificTime(t)))
+        tree.set_times(dir_ino, None, Some(fuser::TimeOrNow::SpecificTime(t)))
             .unwrap();
-        save(&store).unwrap();
-        let store2 = load(&path, None).unwrap();
-        let children = store2.get_children(ROOT_INODE).unwrap();
-        let dir_node = children
-            .iter()
-            .find(|n| n.name == std::ffi::OsStr::new("mydir"))
+        save(&tree).unwrap();
+        let tree2 = load(&path, None).unwrap();
+        let dir_node = tree2
+            .lookup_child(ROOT_INODE, std::ffi::OsStr::new("mydir"))
             .unwrap();
         // Verify mtime survived (truncated to seconds)
         let mtime_secs = dir_node
@@ -987,13 +905,12 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path =
             create_plain_archive(&dir, "unlink.pna", &[("a.txt", b"aaa"), ("b.txt", b"bbb")]);
-        let mut store = load(&path, None).unwrap();
-        store
-            .unlink(ROOT_INODE, std::ffi::OsStr::new("a.txt"))
+        let mut tree = load(&path, None).unwrap();
+        tree.unlink(ROOT_INODE, std::ffi::OsStr::new("a.txt"))
             .unwrap();
-        save(&store).unwrap();
-        let store2 = load(&path, None).unwrap();
-        let children = store2.get_children(ROOT_INODE).unwrap();
+        save(&tree).unwrap();
+        let tree2 = load(&path, None).unwrap();
+        let children: Vec<_> = tree2.children(ROOT_INODE).unwrap().collect();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, std::ffi::OsStr::new("b.txt"));
     }

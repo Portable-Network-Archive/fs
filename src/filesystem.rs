@@ -1,5 +1,5 @@
 use crate::archive_io;
-use crate::archive_store::{ArchiveStore, FileContent, NodeContent};
+use crate::file_tree::{FileTree, FsContent};
 use fuser::{
     BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
     OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
@@ -10,7 +10,7 @@ use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::{Duration, SystemTime};
 
 /// When to flush dirty data back to the archive.
@@ -23,7 +23,7 @@ pub(crate) enum WriteStrategy {
 }
 
 pub(crate) struct PnaFS {
-    store: Mutex<ArchiveStore>,
+    tree: RwLock<FileTree>,
     write_strategy: Option<WriteStrategy>,
 }
 
@@ -33,19 +33,19 @@ impl PnaFS {
         password: Option<String>,
         write_strategy: Option<WriteStrategy>,
     ) -> io::Result<Self> {
-        let store = archive_io::load(&archive, password)?;
+        let tree = archive_io::load(&archive, password)?;
         Ok(Self {
-            store: Mutex::new(store),
+            tree: RwLock::new(tree),
             write_strategy,
         })
     }
 
-    /// Save the archive and mark the store clean. Returns `Ok(())` even when
+    /// Save the archive and mark the tree clean. Returns `Ok(())` even when
     /// there is nothing to save.
-    fn save_if_dirty(store: &mut ArchiveStore) -> io::Result<()> {
-        if store.is_dirty() {
-            archive_io::save(store)?;
-            store.mark_clean();
+    fn save_if_dirty(tree: &mut FileTree) -> io::Result<()> {
+        if tree.is_dirty() {
+            archive_io::save(tree)?;
+            tree.mark_clean();
         }
         Ok(())
     }
@@ -54,12 +54,10 @@ impl PnaFS {
 impl Filesystem for PnaFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         info!("[Implemented] lookup(parent: {parent:#x?}, name {name:?})");
-        let store = self.store.lock().unwrap();
-        let children = store.get_children(parent.0).unwrap_or_default();
-        let entry = children.iter().find(|it| it.name == name);
-        if let Some(entry) = entry {
+        let tree = self.tree.read().unwrap();
+        if let Some(node) = tree.lookup_child(parent.0, name) {
             let ttl = Duration::from_secs(1);
-            reply.entry(&ttl, &entry.attr, Generation(0));
+            reply.entry(&ttl, &node.attr, Generation(0));
         } else {
             reply.error(Errno::ENOENT);
         }
@@ -68,8 +66,8 @@ impl Filesystem for PnaFS {
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         info!("[Implemented] getattr(ino: {ino:#x?}, fh: {fh:#x?})");
         let ttl = Duration::from_secs(1);
-        let store = self.store.lock().unwrap();
-        if let Some(node) = store.get_node(ino.0) {
+        let tree = self.tree.read().unwrap();
+        if let Some(node) = tree.get(ino.0) {
             reply.attr(&ttl, &node.attr);
         } else {
             reply.error(Errno::ENOENT);
@@ -78,9 +76,9 @@ impl Filesystem for PnaFS {
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         info!("[Implemented] readlink(ino: {ino:#x?})");
-        let store = self.store.lock().unwrap();
-        if let Some(node) = store.get_node(ino.0) {
-            if let NodeContent::Symlink(target) = &node.content {
+        let tree = self.tree.read().unwrap();
+        if let Some(node) = tree.get(ino.0) {
+            if let FsContent::Symlink(target) = &node.content {
                 reply.data(target.as_bytes());
             } else {
                 reply.error(Errno::EINVAL);
@@ -92,12 +90,12 @@ impl Filesystem for PnaFS {
 
     fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         info!("[Implemented] open(ino: {ino:#x?}, flags: {flags:#x?})");
-        let store = self.store.lock().unwrap();
-        if store.get_node(ino.0).is_none() {
+        let tree = self.tree.read().unwrap();
+        if tree.get(ino.0).is_none() {
             reply.error(Errno::ENOENT);
             return;
         }
-        drop(store);
+        drop(tree);
         if self.write_strategy.is_none() && flags.acc_mode() != OpenAccMode::O_RDONLY {
             reply.error(Errno::EROFS);
             return;
@@ -117,27 +115,17 @@ impl Filesystem for PnaFS {
         reply: ReplyData,
     ) {
         info!("[Implemented] read(ino: {ino:#x?}, offset: {offset}, size: {size})");
-        let store = self.store.lock().unwrap();
-        let node = match store.get_node(ino.0) {
+        let tree = self.tree.read().unwrap();
+        let node = match tree.get(ino.0) {
             Some(n) => n,
             None => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
-        // All file entries are fully decoded at load() time (fSIZ is only a
-        // hint and cannot be trusted), so no force-load is needed here.
         let data = match &node.content {
-            NodeContent::File(FileContent::Loaded { data, .. })
-            | NodeContent::File(FileContent::Modified { data, .. })
-            | NodeContent::File(FileContent::Created(data)) => data.as_slice(),
-            NodeContent::File(FileContent::Unloaded(..)) => {
-                // Should not happen: all entries decoded at load time
-                log::error!("read: unexpected Unloaded state for ino {ino:#x?}");
-                reply.error(Errno::EIO);
-                return;
-            }
-            NodeContent::Directory | NodeContent::Symlink(_) => {
+            FsContent::File(fd) => fd.data(),
+            FsContent::Directory(_) | FsContent::Symlink(_) => {
                 reply.error(Errno::EISDIR);
                 return;
             }
@@ -167,8 +155,8 @@ impl Filesystem for PnaFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let mut store = self.store.lock().unwrap();
-        match store.write_file(ino.0, offset, data) {
+        let mut tree = self.tree.write().unwrap();
+        match tree.write_file(ino.0, offset, data) {
             Ok(written) => reply.written(written as u32),
             Err(e) => reply.error(e),
         }
@@ -183,8 +171,8 @@ impl Filesystem for PnaFS {
         reply: ReplyEmpty,
     ) {
         info!("[Implemented] flush(ino: {ino:#x?}, fh: {fh:?}, lock_owner: {lock_owner:?})");
-        let store = self.store.lock().unwrap();
-        if store.get_node(ino.0).is_some() {
+        let tree = self.tree.read().unwrap();
+        if tree.get(ino.0).is_some() {
             reply.ok();
         } else {
             reply.error(Errno::ENOENT);
@@ -203,8 +191,8 @@ impl Filesystem for PnaFS {
     ) {
         info!("[Implemented] release(ino: {_ino:#x?})");
         if self.write_strategy == Some(WriteStrategy::Immediate) {
-            let mut store = self.store.lock().unwrap();
-            if let Err(e) = Self::save_if_dirty(&mut store) {
+            let mut tree = self.tree.write().unwrap();
+            if let Err(e) = Self::save_if_dirty(&mut tree) {
                 log::error!("Failed to save on release: {e}");
                 reply.error(Errno::EIO);
                 return;
@@ -223,8 +211,8 @@ impl Filesystem for PnaFS {
     ) {
         info!("[Implemented] fsync(ino: {_ino:#x?})");
         if self.write_strategy.is_some() {
-            let mut store = self.store.lock().unwrap();
-            if let Err(e) = Self::save_if_dirty(&mut store) {
+            let mut tree = self.tree.write().unwrap();
+            if let Err(e) = Self::save_if_dirty(&mut tree) {
                 log::error!("Failed to save on fsync: {e}");
                 reply.error(Errno::EIO);
                 return;
@@ -256,30 +244,30 @@ impl Filesystem for PnaFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let mut store = self.store.lock().unwrap();
+        let mut tree = self.tree.write().unwrap();
         // Handle truncate (size change).
         if let Some(new_size) = size {
-            if let Err(e) = store.set_size(ino.0, new_size) {
+            if let Err(e) = tree.set_size(ino.0, new_size) {
                 reply.error(e);
                 return;
             }
         }
         // Handle time changes.
         if atime.is_some() || mtime.is_some() {
-            if let Err(e) = store.set_times(ino.0, atime, mtime) {
+            if let Err(e) = tree.set_times(ino.0, atime, mtime) {
                 reply.error(e);
                 return;
             }
         }
         // Handle mode/uid/gid.
         if mode.is_some() || uid.is_some() || gid.is_some() {
-            if let Err(e) = store.set_attr_full(ino.0, mode, uid, gid) {
+            if let Err(e) = tree.set_attr_full(ino.0, mode, uid, gid) {
                 reply.error(e);
                 return;
             }
         }
         let ttl = Duration::from_secs(1);
-        match store.get_node(ino.0) {
+        match tree.get(ino.0) {
             Some(node) => reply.attr(&ttl, &node.attr),
             None => reply.error(Errno::ENOENT),
         }
@@ -300,37 +288,32 @@ impl Filesystem for PnaFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let mut store = self.store.lock().unwrap();
+        let mut tree = self.tree.write().unwrap();
         // Check parent
-        match store.get_node(parent.0) {
+        match tree.get(parent.0) {
             None => {
                 reply.error(Errno::ENOENT);
                 return;
             }
-            Some(n) if !matches!(n.content, NodeContent::Directory) => {
+            Some(n) if !matches!(n.content, FsContent::Directory(_)) => {
                 reply.error(Errno::ENOTDIR);
                 return;
             }
             _ => {}
         }
-        let existing = store
-            .get_children(parent.0)
-            .unwrap_or_default()
-            .iter()
-            .find(|n| n.name == name)
-            .map(|n| n.attr.ino.0);
+        let existing = tree.lookup_child(parent.0, name).map(|n| n.attr.ino.0);
         if let Some(ino) = existing {
             if (flags & libc::O_EXCL) != 0 {
                 reply.error(Errno::EEXIST);
                 return;
             }
             if (flags & libc::O_TRUNC) != 0 {
-                if let Err(e) = store.set_size(ino, 0) {
+                if let Err(e) = tree.set_size(ino, 0) {
                     reply.error(e);
                     return;
                 }
             }
-            let node = store.get_node(ino).unwrap();
+            let node = tree.get(ino).unwrap();
             reply.created(
                 &Duration::from_secs(1),
                 &node.attr,
@@ -339,7 +322,7 @@ impl Filesystem for PnaFS {
                 FopenFlags::empty(),
             );
         } else {
-            match store.create_file(parent.0, name, mode & !umask) {
+            match tree.create_file(parent.0, name, mode & !umask) {
                 Ok(node) => {
                     let attr = node.attr;
                     reply.created(
@@ -369,8 +352,8 @@ impl Filesystem for PnaFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let mut store = self.store.lock().unwrap();
-        match store.make_dir(parent.0, name, mode, umask) {
+        let mut tree = self.tree.write().unwrap();
+        match tree.make_dir(parent.0, name, mode, umask) {
             Ok(node) => {
                 let attr = node.attr;
                 reply.entry(&Duration::from_secs(1), &attr, Generation(0));
@@ -385,8 +368,8 @@ impl Filesystem for PnaFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let mut store = self.store.lock().unwrap();
-        match store.unlink(parent.0, name) {
+        let mut tree = self.tree.write().unwrap();
+        match tree.unlink(parent.0, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -409,8 +392,8 @@ impl Filesystem for PnaFS {
             reply.error(Errno::EROFS);
             return;
         }
-        let mut store = self.store.lock().unwrap();
-        match store.rename(parent.0, name, newparent.0, newname, flags) {
+        let mut tree = self.tree.write().unwrap();
+        match tree.rename(parent.0, name, newparent.0, newname, flags) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -425,8 +408,11 @@ impl Filesystem for PnaFS {
         mut reply: ReplyDirectory,
     ) {
         info!("[Implemented] readdir(ino: {ino:#x?}, fh: {fh:?}, offset: {offset})");
-        let store = self.store.lock().unwrap();
-        let children = store.get_children(ino.0).unwrap_or_default();
+        let tree = self.tree.read().unwrap();
+        let children: Vec<_> = match tree.children(ino.0) {
+            Some(iter) => iter.collect(),
+            None => Vec::new(),
+        };
 
         let mut current_offset = offset + 1;
         for entry in children.into_iter().skip(offset as usize) {
@@ -442,8 +428,8 @@ impl Filesystem for PnaFS {
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         info!("[Implemented] getxattr(ino: {ino:#x?}, name: {name:?}, size: {size})");
-        let store = self.store.lock().unwrap();
-        if let Some(node) = store.get_node(ino.0) {
+        let tree = self.tree.read().unwrap();
+        if let Some(node) = tree.get(ino.0) {
             if let Some(value) = node.xattrs.get(name) {
                 if size == 0 {
                     reply.size(value.len() as u32);
@@ -460,8 +446,8 @@ impl Filesystem for PnaFS {
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         info!("[Implemented] listxattr(ino: {ino:#x?}, size: {size})");
-        let store = self.store.lock().unwrap();
-        if let Some(node) = store.get_node(ino.0) {
+        let tree = self.tree.read().unwrap();
+        if let Some(node) = tree.get(ino.0) {
             let keys = node
                 .xattrs
                 .keys()
@@ -485,8 +471,8 @@ impl Filesystem for PnaFS {
     fn destroy(&mut self) {
         info!("[Implemented] destroy()");
         if self.write_strategy.is_some() {
-            let store = self.store.get_mut().unwrap();
-            if let Err(e) = Self::save_if_dirty(store) {
+            let tree = self.tree.get_mut().unwrap();
+            if let Err(e) = Self::save_if_dirty(tree) {
                 eprintln!("pnafs: CRITICAL: failed to save archive on unmount: {e}");
                 log::error!("Failed to save archive on destroy: {e}");
             }

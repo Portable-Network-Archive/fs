@@ -3,7 +3,6 @@ use clap::Parser;
 use std::io;
 
 mod archive_io;
-mod archive_store;
 mod cli;
 mod command;
 mod file_tree;

@@ -150,7 +150,7 @@ impl std::fmt::Debug for FsNode {
 pub(crate) struct FileTree {
     inodes: HashMap<Inode, FsNode>,
     next_inode: Inode,
-    password: Option<String>,
+    pub(crate) password: Option<String>,
     archive_path: PathBuf,
     dirty: bool,
 }
