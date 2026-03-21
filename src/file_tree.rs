@@ -1,4 +1,4 @@
-use fuser::{FileAttr, FileType, INodeNo};
+use fuser::{Errno, FileAttr, FileType, INodeNo, TimeOrNow};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
 use pna::Permission;
@@ -48,6 +48,56 @@ pub(crate) enum FileData {
     },
     /// Newly created file; has never been written to the archive.
     New(Vec<u8>),
+}
+
+impl FileData {
+    /// Clean -> Dirty. No-op when already Dirty or New.
+    pub(crate) fn promote_to_dirty(&mut self) {
+        if let FileData::Clean { data, cipher } = self {
+            let data = std::mem::take(data);
+            let cipher = cipher.take();
+            *self = FileData::Dirty { data, cipher };
+        }
+    }
+
+    pub(crate) fn make_clean(&mut self, has_password: bool) {
+        match self {
+            FileData::Dirty { data, cipher } => {
+                let data = std::mem::take(data);
+                let cipher = cipher.take();
+                *self = FileData::Clean { data, cipher };
+            }
+            FileData::New(data) => {
+                let data = std::mem::take(data);
+                let cipher = if has_password {
+                    Some(CipherConfig {
+                        encryption: pna::Encryption::Aes,
+                        cipher_mode: pna::CipherMode::CTR,
+                    })
+                } else {
+                    None
+                };
+                *self = FileData::Clean { data, cipher };
+            }
+            FileData::Clean { .. } => {}
+        }
+    }
+
+    pub(crate) fn data_mut(&mut self) -> &mut Vec<u8> {
+        match self {
+            FileData::Clean { data, .. } | FileData::Dirty { data, .. } | FileData::New(data) => {
+                data
+            }
+        }
+    }
+
+    pub(crate) fn data(&self) -> &[u8] {
+        match self {
+            FileData::Clean { data, .. } | FileData::Dirty { data, .. } | FileData::New(data) => {
+                data
+            }
+        }
+    }
 }
 
 pub(crate) struct DirContent {
@@ -208,6 +258,263 @@ impl FileTree {
         Ok(ino)
     }
 
+    // ── Write API ─────────────────────────────────────────────────────
+
+    pub(crate) fn create_file(
+        &mut self,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<&FsNode, Errno> {
+        let parent_node = self.inodes.get(&parent).ok_or(Errno::ENOENT)?;
+        if !matches!(parent_node.content, FsContent::Directory(_)) {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.lookup_child(parent, name).is_some() {
+            return Err(Errno::EEXIST);
+        }
+        let ino = self.next_inode();
+        let now = SystemTime::now();
+        let node = FsNode {
+            name: name.to_owned(),
+            parent: None,
+            xattrs: HashMap::new(),
+            content: FsContent::File(FileData::New(Vec::new())),
+            attr: FileAttr {
+                ino: INodeNo(ino),
+                size: 0,
+                blocks: 1,
+                atime: now,
+                mtime: now,
+                ctime: now,
+                crtime: now,
+                kind: FileType::RegularFile,
+                perm: mode as u16,
+                nlink: 1,
+                uid: current_uid(),
+                gid: current_gid(),
+                rdev: 0,
+                blksize: 512,
+                flags: 0,
+            },
+        };
+        self.insert_node(node, Some(parent))
+            .map_err(|_| Errno::EIO)?;
+        self.dirty = true;
+        Ok(self.inodes.get(&ino).unwrap())
+    }
+
+    pub(crate) fn write_file(
+        &mut self,
+        ino: Inode,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, Errno> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let offset = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+
+        let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
+        let file_data = match &mut node.content {
+            FsContent::Directory(_) => return Err(Errno::EISDIR),
+            FsContent::Symlink(_) => return Err(Errno::EIO),
+            FsContent::File(fd) => fd,
+        };
+        file_data.promote_to_dirty();
+        let buf = file_data.data_mut();
+        if offset > buf.len() {
+            buf.resize(offset, 0);
+        }
+        let end = offset + data.len();
+        if end > buf.len() {
+            buf.resize(end, 0);
+        }
+        buf[offset..end].copy_from_slice(data);
+        node.attr.size = buf.len() as u64;
+        self.dirty = true;
+        Ok(data.len())
+    }
+
+    pub(crate) fn set_size(&mut self, ino: Inode, size: u64) -> Result<(), Errno> {
+        let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
+        let file_data = match &mut node.content {
+            FsContent::Directory(_) => return Err(Errno::EISDIR),
+            FsContent::Symlink(_) => return Err(Errno::EIO),
+            FsContent::File(fd) => fd,
+        };
+        file_data.promote_to_dirty();
+        let size_usize = usize::try_from(size).map_err(|_| Errno::EFBIG)?;
+        let buf = file_data.data_mut();
+        buf.resize(size_usize, 0);
+        node.attr.size = size;
+        self.dirty = true;
+        Ok(())
+    }
+
+    pub(crate) fn set_times(
+        &mut self,
+        ino: Inode,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+    ) -> Result<(), Errno> {
+        let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
+        let mut changed = false;
+        match atime {
+            Some(TimeOrNow::SpecificTime(t)) => {
+                node.attr.atime = t;
+                changed = true;
+            }
+            Some(TimeOrNow::Now) => {
+                node.attr.atime = SystemTime::now();
+                changed = true;
+            }
+            None => {}
+        }
+        match mtime {
+            Some(TimeOrNow::SpecificTime(t)) => {
+                node.attr.mtime = t;
+                changed = true;
+            }
+            Some(TimeOrNow::Now) => {
+                node.attr.mtime = SystemTime::now();
+                changed = true;
+            }
+            None => {}
+        }
+        if changed {
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn make_dir(
+        &mut self,
+        parent: Inode,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+    ) -> Result<&FsNode, Errno> {
+        let parent_node = self.inodes.get(&parent).ok_or(Errno::ENOENT)?;
+        if !matches!(parent_node.content, FsContent::Directory(_)) {
+            return Err(Errno::ENOTDIR);
+        }
+        if self.lookup_child(parent, name).is_some() {
+            return Err(Errno::EEXIST);
+        }
+        let ino = self.next_inode();
+        let effective_mode = (mode & !umask) as u16;
+        let mut node = make_dir_node(ino, name.to_owned());
+        node.attr.perm = effective_mode;
+        self.insert_node(node, Some(parent))
+            .map_err(|_| Errno::EIO)?;
+        self.inodes.get_mut(&parent).unwrap().attr.nlink += 1;
+        self.dirty = true;
+        Ok(self.inodes.get(&ino).unwrap())
+    }
+
+    pub(crate) fn unlink(&mut self, parent: Inode, name: &OsStr) -> Result<(), Errno> {
+        let target_ino = {
+            let parent_node = self.inodes.get(&parent).ok_or(Errno::ENOENT)?;
+            let dir = match &parent_node.content {
+                FsContent::Directory(d) => d,
+                _ => return Err(Errno::ENOTDIR),
+            };
+            dir.get(name).ok_or(Errno::ENOENT)?
+        };
+        let target = self.inodes.get(&target_ino).ok_or(Errno::ENOENT)?;
+        if matches!(target.content, FsContent::Directory(_)) {
+            #[cfg(target_os = "macos")]
+            return Err(Errno::EPERM);
+            #[cfg(not(target_os = "macos"))]
+            return Err(Errno::EISDIR);
+        }
+        // Remove from parent's children
+        let parent_node = self.inodes.get_mut(&parent).unwrap();
+        if let FsContent::Directory(dir) = &mut parent_node.content {
+            dir.children.remove(name);
+        }
+        // Remove from inodes
+        self.inodes.remove(&target_ino);
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Transitions all in-memory dirty file states back to clean equivalents
+    /// and clears the `dirty` flag.
+    ///
+    /// - `Dirty { data, cipher }` -> `Clean { data, cipher }`
+    /// - `New(data)` + password present -> `Clean { data, cipher: Some(Aes/CTR) }`
+    /// - `New(data)` + no password -> `Clean { data, cipher: None }`
+    /// - `Clean` -> unchanged
+    pub(crate) fn mark_clean(&mut self) {
+        let has_password = self.password.is_some();
+        for node in self.inodes.values_mut() {
+            if let FsContent::File(ref mut file_data) = node.content {
+                file_data.make_clean(has_password);
+            }
+        }
+        self.dirty = false;
+    }
+
+    // ── ENOSYS stubs ─────────────────────────────────────────────────
+
+    pub(crate) fn rmdir(&mut self, _parent: Inode, _name: &OsStr) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    pub(crate) fn rename(
+        &mut self,
+        _old_parent: Inode,
+        _old_name: &OsStr,
+        _new_parent: Inode,
+        _new_name: &OsStr,
+        _flags: fuser::RenameFlags,
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    pub(crate) fn set_attr_full(
+        &mut self,
+        _ino: Inode,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    pub(crate) fn create_symlink(
+        &mut self,
+        _parent: Inode,
+        _name: &OsStr,
+        _target: &std::path::Path,
+    ) -> Result<&FsNode, Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    pub(crate) fn create_hardlink(
+        &mut self,
+        _parent: Inode,
+        _name: &OsStr,
+        _target: Inode,
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    pub(crate) fn set_xattr(
+        &mut self,
+        _ino: Inode,
+        _name: &OsStr,
+        _value: &[u8],
+    ) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    pub(crate) fn remove_xattr(&mut self, _ino: Inode, _name: &OsStr) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
     /// Constructs an empty tree with just the root directory node, intended
     /// for use in unit tests.
     #[cfg(test)]
@@ -322,11 +629,47 @@ pub(crate) fn get_gid(permission: Option<&Permission>) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fuser::TimeOrNow;
+    use std::ffi::OsStr;
     use std::path::PathBuf;
+
+    /// Compare two `fuser::Errno` values by their raw code, since `Errno` does
+    /// not implement `PartialEq`.
+    fn errno_eq(a: fuser::Errno, b: fuser::Errno) -> bool {
+        a.code() == b.code()
+    }
+
+    /// Panic unless `a` and `b` refer to the same errno code.
+    #[track_caller]
+    fn assert_errno(a: fuser::Errno, b: fuser::Errno) {
+        assert_eq!(
+            a.code(),
+            b.code(),
+            "expected errno {:?} ({}), got {:?} ({})",
+            b,
+            b.code(),
+            a,
+            a.code(),
+        );
+    }
 
     fn make_tree() -> FileTree {
         FileTree::new_for_test(PathBuf::from("/tmp/test.pna"), None)
     }
+
+    fn make_tree_with_file(content: &[u8]) -> (FileTree, Inode) {
+        let mut tree = make_tree();
+        let node = tree
+            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644)
+            .unwrap();
+        let ino = node.attr.ino.0;
+        if !content.is_empty() {
+            tree.write_file(ino, 0, content).unwrap();
+        }
+        (tree, ino)
+    }
+
+    // ── Read API (carried over from Task 1) ─────────────────────────
 
     #[test]
     fn get_root_exists() {
@@ -357,5 +700,864 @@ mod tests {
     fn lookup_child_not_found() {
         let tree = make_tree();
         assert!(tree.lookup_child(ROOT_INODE, OsStr::new("nope")).is_none());
+    }
+
+    // ── create_file ─────────────────────────────────────────────────
+
+    #[test]
+    fn create_file_happy_path() {
+        let mut tree = make_tree();
+        let node = tree
+            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644)
+            .unwrap();
+        assert_eq!(node.name, "a.txt");
+        assert_eq!(node.attr.kind, FileType::RegularFile);
+        assert_eq!(node.attr.perm, 0o644);
+        assert!(matches!(
+            node.content,
+            FsContent::File(FileData::New(ref d)) if d.is_empty()
+        ));
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn create_file_existing_name_returns_eexist() {
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644)
+            .unwrap();
+        let err = tree
+            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644)
+            .unwrap_err();
+        assert_errno(err, fuser::Errno::EEXIST);
+    }
+
+    #[test]
+    fn create_file_bad_parent_returns_enoent() {
+        let mut tree = make_tree();
+        let err = tree
+            .create_file(9999, OsStr::new("x.txt"), 0o644)
+            .unwrap_err();
+        assert_errno(err, fuser::Errno::ENOENT);
+    }
+
+    #[test]
+    fn create_file_parent_is_file_returns_enotdir() {
+        let (mut tree, file_ino) = make_tree_with_file(b"");
+        let err = tree
+            .create_file(file_ino, OsStr::new("x.txt"), 0o644)
+            .unwrap_err();
+        assert_errno(err, fuser::Errno::ENOTDIR);
+    }
+
+    #[test]
+    fn create_file_in_subdir() {
+        let mut tree = make_tree();
+        let subdir = tree
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0)
+            .unwrap();
+        let subdir_ino = subdir.attr.ino.0;
+        let node = tree
+            .create_file(subdir_ino, OsStr::new("nested.txt"), 0o644)
+            .unwrap();
+        assert_eq!(node.name, OsStr::new("nested.txt"));
+    }
+
+    // ── write_file ──────────────────────────────────────────────────
+
+    #[test]
+    fn write_file_at_offset_zero() {
+        let (mut tree, ino) = make_tree_with_file(b"");
+        let written = tree.write_file(ino, 0, b"hello").unwrap();
+        assert_eq!(written, 5);
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.size, 5);
+    }
+
+    #[test]
+    fn write_file_sparse_zero_fills() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        tree.write_file(ino, 10, b"!").unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.size, 11);
+        if let FsContent::File(fd) = &node.content {
+            let data = fd.data();
+            assert_eq!(data[5..10], [0u8; 5]);
+            assert_eq!(data[10], b'!');
+        } else {
+            panic!("expected File content");
+        }
+    }
+
+    #[test]
+    fn write_file_empty_data_is_noop() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        let written = tree.write_file(ino, 0, b"").unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(tree.get(ino).unwrap().attr.size, 5);
+    }
+
+    #[test]
+    fn write_file_bad_ino_returns_enoent() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.write_file(9999, 0, b"x").unwrap_err(),
+            fuser::Errno::ENOENT,
+        );
+    }
+
+    #[test]
+    fn write_file_on_dir_returns_eisdir() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.write_file(ROOT_INODE, 0, b"x").unwrap_err(),
+            fuser::Errno::EISDIR,
+        );
+    }
+
+    #[test]
+    fn write_file_append_to_existing() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        let written = tree.write_file(ino, 5, b" world").unwrap();
+        assert_eq!(written, 6);
+        if let FsContent::File(fd) = &tree.get(ino).unwrap().content {
+            assert_eq!(fd.data(), b"hello world");
+        } else {
+            panic!("expected File content");
+        }
+    }
+
+    #[test]
+    fn write_file_overwrites_clean_becomes_dirty() {
+        // Get a Clean node: create -> write -> mark_clean
+        let mut tree = make_tree();
+        let node = tree
+            .create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644)
+            .unwrap();
+        let ino = node.attr.ino.0;
+        tree.write_file(ino, 0, b"abc").unwrap();
+        tree.mark_clean();
+        // Now content is Clean{[a,b,c], cipher:None}
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+        // Write -> should transition to Dirty
+        let written = tree.write_file(ino, 1, b"XY").unwrap();
+        assert_eq!(written, 2);
+        let node = tree.get(ino).unwrap();
+        if let FsContent::File(FileData::Dirty { data, cipher }) = &node.content {
+            assert_eq!(data.as_slice(), b"aXY");
+            assert!(cipher.is_none());
+        } else {
+            panic!("expected Dirty, got something else");
+        }
+    }
+
+    #[test]
+    fn write_file_empty_data_noop_on_clean() {
+        // Get Clean state: create -> write -> mark_clean
+        let mut tree = make_tree();
+        let node = tree
+            .create_file(ROOT_INODE, OsStr::new("h.txt"), 0o644)
+            .unwrap();
+        let ino = node.attr.ino.0;
+        tree.write_file(ino, 0, b"abc").unwrap();
+        tree.mark_clean();
+        // Verify Clean
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+        tree.mark_clean();
+        // Empty write -- should stay Clean, NOT become Dirty
+        tree.write_file(ino, 0, b"").unwrap();
+        assert!(
+            matches!(
+                tree.get(ino).unwrap().content,
+                FsContent::File(FileData::Clean { .. })
+            ),
+            "empty write should not transition Clean to Dirty"
+        );
+    }
+
+    #[test]
+    fn write_file_empty_data_does_not_set_dirty() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        tree.mark_clean();
+        assert!(!tree.is_dirty());
+        tree.write_file(ino, 0, b"").unwrap();
+        assert!(!tree.is_dirty());
+    }
+
+    #[test]
+    fn write_file_mid_overwrite_preserves_trailing() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        tree.write_file(ino, 1, b"XY").unwrap();
+        if let FsContent::File(fd) = &tree.get(ino).unwrap().content {
+            assert_eq!(fd.data(), b"hXYlo");
+        } else {
+            panic!("expected File content");
+        }
+    }
+
+    // Equivalent of write_file_on_loaded_from_archive: use mark_clean to
+    // simulate the Clean state that archive_io::load would produce.
+    #[test]
+    fn write_file_on_clean_from_mark_clean() {
+        let (mut tree, ino) = make_tree_with_file(b"original");
+        tree.mark_clean();
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+        let written = tree.write_file(ino, 0, b"data").unwrap();
+        assert_eq!(written, 4);
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Dirty { .. })
+        ));
+    }
+
+    // ── set_size ────────────────────────────────────────────────────
+
+    #[test]
+    fn set_size_truncate() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        tree.set_size(ino, 3).unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.size, 3);
+        if let FsContent::File(fd) = &node.content {
+            assert_eq!(fd.data(), b"hel");
+        } else {
+            panic!("expected File");
+        }
+    }
+
+    #[test]
+    fn set_size_truncate_to_zero() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        tree.set_size(ino, 0).unwrap();
+        assert_eq!(tree.get(ino).unwrap().attr.size, 0);
+        if let FsContent::File(fd) = &tree.get(ino).unwrap().content {
+            assert!(fd.data().is_empty());
+        } else {
+            panic!("expected File");
+        }
+    }
+
+    #[test]
+    fn set_size_extend_zero_pads() {
+        let (mut tree, ino) = make_tree_with_file(b"hi");
+        tree.set_size(ino, 5).unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.size, 5);
+        if let FsContent::File(fd) = &tree.get(ino).unwrap().content {
+            let data = fd.data();
+            assert_eq!(&data[..2], b"hi");
+            assert_eq!(&data[2..5], &[0, 0, 0]);
+        } else {
+            panic!("expected File");
+        }
+    }
+
+    #[test]
+    fn set_size_on_dir_returns_eisdir() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.set_size(ROOT_INODE, 0).unwrap_err(),
+            fuser::Errno::EISDIR,
+        );
+    }
+
+    #[test]
+    fn set_size_same_length_noop() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        tree.set_size(ino, 5).unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.size, 5);
+        if let FsContent::File(fd) = &node.content {
+            assert_eq!(fd.data(), b"hello");
+        } else {
+            panic!("expected File");
+        }
+    }
+
+    // Equivalent of set_size_on_loaded_from_archive: use mark_clean.
+    #[test]
+    fn set_size_on_clean_from_mark_clean() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        tree.mark_clean();
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+        tree.set_size(ino, 0).unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.size, 0);
+        // Should be Dirty after Clean + truncate
+        assert!(matches!(
+            node.content,
+            FsContent::File(FileData::Dirty { .. })
+        ));
+    }
+
+    #[test]
+    fn set_size_bad_ino_returns_enoent() {
+        let mut tree = make_tree();
+        let err = tree.set_size(9999, 0).unwrap_err();
+        assert!(errno_eq(err, fuser::Errno::ENOENT));
+    }
+
+    // ── set_times ───────────────────────────────────────────────────
+
+    #[test]
+    fn set_times_specific() {
+        let (mut tree, ino) = make_tree_with_file(b"");
+        let t1 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
+        let t2 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(2000);
+        tree.set_times(
+            ino,
+            Some(TimeOrNow::SpecificTime(t1)),
+            Some(TimeOrNow::SpecificTime(t2)),
+        )
+        .unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.atime, t1);
+        assert_eq!(node.attr.mtime, t2);
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn set_times_bad_ino_returns_enoent() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.set_times(9999, None, None).unwrap_err(),
+            fuser::Errno::ENOENT,
+        );
+    }
+
+    #[test]
+    fn set_times_now_atime_only() {
+        let (mut tree, ino) = make_tree_with_file(b"");
+        let before = SystemTime::now();
+        let mtime_before = tree.get(ino).unwrap().attr.mtime;
+        tree.set_times(ino, Some(TimeOrNow::Now), None).unwrap();
+        let node = tree.get(ino).unwrap();
+        assert!(node.attr.atime >= before);
+        assert_eq!(node.attr.mtime, mtime_before);
+    }
+
+    #[test]
+    fn set_times_mtime_only() {
+        let (mut tree, ino) = make_tree_with_file(b"");
+        let atime_before = tree.get(ino).unwrap().attr.atime;
+        let t2 = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5000);
+        tree.set_times(ino, None, Some(TimeOrNow::SpecificTime(t2)))
+            .unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.atime, atime_before);
+        assert_eq!(node.attr.mtime, t2);
+    }
+
+    #[test]
+    fn set_times_none_none_stays_clean() {
+        let (mut tree, ino) = make_tree_with_file(b"");
+        tree.mark_clean(); // clear dirty
+        assert!(!tree.is_dirty());
+        tree.set_times(ino, None, None).unwrap();
+        assert!(!tree.is_dirty());
+    }
+
+    #[test]
+    fn set_times_now_mtime_only() {
+        let (mut tree, ino) = make_tree_with_file(b"");
+        let before = SystemTime::now();
+        tree.set_times(ino, None, Some(TimeOrNow::Now)).unwrap();
+        let node = tree.get(ino).unwrap();
+        assert!(node.attr.mtime >= before);
+    }
+
+    #[test]
+    fn set_times_on_directory_succeeds() {
+        let mut tree = make_tree();
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(5000);
+        tree.set_times(ROOT_INODE, Some(TimeOrNow::SpecificTime(t)), None)
+            .unwrap();
+        assert_eq!(tree.get(ROOT_INODE).unwrap().attr.atime, t);
+    }
+
+    // Equivalent of set_times_loaded_no_state_change: use mark_clean to get Clean.
+    #[test]
+    fn set_times_clean_no_state_change() {
+        let (mut tree, ino) = make_tree_with_file(b"data");
+        tree.mark_clean();
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+        let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(7000);
+        tree.set_times(ino, Some(TimeOrNow::SpecificTime(t)), None)
+            .unwrap();
+        // Should still be Clean (set_times doesn't change content state)
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+        assert_eq!(tree.get(ino).unwrap().attr.atime, t);
+    }
+
+    // ── make_dir ────────────────────────────────────────────────────
+
+    #[test]
+    fn make_dir_happy_path() {
+        let mut tree = make_tree();
+        let node = tree
+            .make_dir(ROOT_INODE, OsStr::new("mydir"), 0o755, 0)
+            .unwrap();
+        assert_eq!(node.attr.nlink, 2);
+        assert_eq!(node.attr.kind, FileType::Directory);
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn make_dir_increments_parent_nlink() {
+        let mut tree = make_tree();
+        let parent_nlink_before = tree.get(ROOT_INODE).unwrap().attr.nlink;
+        tree.make_dir(ROOT_INODE, OsStr::new("mydir"), 0o755, 0)
+            .unwrap();
+        let parent_nlink_after = tree.get(ROOT_INODE).unwrap().attr.nlink;
+        assert_eq!(parent_nlink_after, parent_nlink_before + 1);
+    }
+
+    #[test]
+    fn make_dir_existing_name_returns_eexist() {
+        let mut tree = make_tree();
+        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0)
+            .unwrap();
+        assert_errno(
+            tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0)
+                .unwrap_err(),
+            fuser::Errno::EEXIST,
+        );
+    }
+
+    #[test]
+    fn make_dir_applies_umask() {
+        let mut tree = make_tree();
+        let node = tree
+            .make_dir(ROOT_INODE, OsStr::new("masked"), 0o777, 0o022)
+            .unwrap();
+        assert_eq!(node.attr.perm, 0o755);
+    }
+
+    #[test]
+    fn make_dir_bad_parent_returns_enoent() {
+        let mut tree = make_tree();
+        let err = tree.make_dir(9999, OsStr::new("x"), 0o755, 0).unwrap_err();
+        assert!(errno_eq(err, fuser::Errno::ENOENT));
+    }
+
+    #[test]
+    fn make_dir_parent_is_file_returns_enotdir() {
+        let (mut tree, file_ino) = make_tree_with_file(b"");
+        let err = tree
+            .make_dir(file_ino, OsStr::new("x"), 0o755, 0)
+            .unwrap_err();
+        assert!(errno_eq(err, fuser::Errno::ENOTDIR));
+    }
+
+    // ── unlink ──────────────────────────────────────────────────────
+
+    #[test]
+    fn unlink_removes_file_completely() {
+        let (mut tree, ino) = make_tree_with_file(b"hi");
+        tree.unlink(ROOT_INODE, OsStr::new("test.txt")).unwrap();
+        assert!(tree.get(ino).is_none());
+        let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
+        assert!(children.is_empty());
+        assert!(tree.is_dirty());
+    }
+
+    #[test]
+    fn unlink_nonexistent_returns_enoent() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.unlink(ROOT_INODE, OsStr::new("ghost.txt"))
+                .unwrap_err(),
+            fuser::Errno::ENOENT,
+        );
+    }
+
+    #[test]
+    fn unlink_directory_returns_eperm_or_eisdir() {
+        let mut tree = make_tree();
+        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0)
+            .unwrap();
+        let err = tree.unlink(ROOT_INODE, OsStr::new("d")).unwrap_err();
+        assert!(
+            errno_eq(err, fuser::Errno::EPERM) || errno_eq(err, fuser::Errno::EISDIR),
+            "expected EPERM or EISDIR, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn unlink_then_recreate_same_name() {
+        let (mut tree, old_ino) = make_tree_with_file(b"hi");
+        tree.unlink(ROOT_INODE, OsStr::new("test.txt")).unwrap();
+        let new_node = tree
+            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644)
+            .unwrap();
+        assert_ne!(new_node.attr.ino.0, old_ino);
+        let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
+        assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn unlink_recreate_data_isolation() {
+        let (mut tree, old_ino) = make_tree_with_file(b"old data");
+        tree.unlink(ROOT_INODE, OsStr::new("test.txt")).unwrap();
+        let new_node = tree
+            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644)
+            .unwrap();
+        let new_ino = new_node.attr.ino.0;
+        tree.write_file(new_ino, 0, b"new data").unwrap();
+        // Verify old data is completely gone
+        assert!(tree.get(old_ino).is_none());
+        if let FsContent::File(fd) = &tree.get(new_ino).unwrap().content {
+            assert_eq!(fd.data(), b"new data");
+        } else {
+            panic!("expected File");
+        }
+    }
+
+    // ── write + truncate interaction ────────────────────────────────
+
+    #[test]
+    fn write_then_truncate_preserves_prefix() {
+        let (mut tree, ino) = make_tree_with_file(b"hello world");
+        tree.set_size(ino, 5).unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.attr.size, 5);
+        if let FsContent::File(fd) = &node.content {
+            assert_eq!(fd.data(), b"hello");
+        } else {
+            panic!("expected File");
+        }
+    }
+
+    // ── mark_clean ──────────────────────────────────────────────────
+
+    #[test]
+    fn mark_clean_transitions_new_to_clean() {
+        let (mut tree, ino) = make_tree_with_file(b"hello");
+        assert!(tree.is_dirty());
+        tree.mark_clean();
+        assert!(!tree.is_dirty());
+        let node = tree.get(ino).unwrap();
+        assert!(matches!(
+            node.content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+    }
+
+    #[test]
+    fn mark_clean_new_with_password_gets_cipher() {
+        let mut tree =
+            FileTree::new_for_test(PathBuf::from("/tmp/t.pna"), Some("secret".to_string()));
+        let node = tree
+            .create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644)
+            .unwrap();
+        let ino = node.attr.ino.0;
+        tree.mark_clean();
+        let node = tree.get(ino).unwrap();
+        if let FsContent::File(FileData::Clean { cipher, .. }) = &node.content {
+            assert!(cipher.is_some());
+        } else {
+            panic!("expected Clean");
+        }
+    }
+
+    #[test]
+    fn mark_clean_new_without_password_gets_no_cipher() {
+        let (mut tree, ino) = make_tree_with_file(b"data");
+        tree.mark_clean();
+        let node = tree.get(ino).unwrap();
+        if let FsContent::File(FileData::Clean { cipher, .. }) = &node.content {
+            assert!(cipher.is_none());
+        } else {
+            panic!("expected Clean");
+        }
+    }
+
+    #[test]
+    fn mark_clean_dirty_to_clean() {
+        // Get Dirty state: create -> write -> mark_clean -> write again
+        let mut tree = make_tree();
+        let node = tree
+            .create_file(ROOT_INODE, OsStr::new("g.txt"), 0o644)
+            .unwrap();
+        let ino = node.attr.ino.0;
+        tree.write_file(ino, 0, b"abc").unwrap();
+        tree.mark_clean();
+        // Now Clean; write again -> Dirty
+        tree.write_file(ino, 0, b"XYZ").unwrap();
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Dirty { .. })
+        ));
+        tree.mark_clean();
+        assert!(!tree.is_dirty());
+        let node = tree.get(ino).unwrap();
+        if let FsContent::File(FileData::Clean { data, cipher }) = &node.content {
+            assert_eq!(data.as_slice(), b"XYZ");
+            assert!(cipher.is_none());
+        } else {
+            panic!("expected Clean");
+        }
+    }
+
+    #[test]
+    fn mark_clean_dirty_with_cipher_preserves_cipher() {
+        // Build a tree with password so cipher gets set
+        let mut tree =
+            FileTree::new_for_test(PathBuf::from("/tmp/t.pna"), Some("secret".to_string()));
+        // Create file -> write -> mark_clean: New+pwd -> Clean{cipher=Some(AES-CTR)}
+        let node = tree
+            .create_file(ROOT_INODE, OsStr::new("enc.txt"), 0o644)
+            .unwrap();
+        let ino = node.attr.ino.0;
+        tree.write_file(ino, 0, b"hello").unwrap();
+        tree.mark_clean();
+        // Now Clean{data=[hello], cipher=Some(AES-CTR)}
+        let cipher_cfg = {
+            let node = tree.get(ino).unwrap();
+            match &node.content {
+                FsContent::File(FileData::Clean {
+                    cipher: Some(c), ..
+                }) => CipherConfig {
+                    encryption: c.encryption,
+                    cipher_mode: c.cipher_mode,
+                },
+                _ => panic!("expected Clean with cipher"),
+            }
+        };
+        // Write again: Clean -> Dirty{data, cipher=Some(AES-CTR)}
+        tree.write_file(ino, 0, b"world").unwrap();
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Dirty {
+                cipher: Some(_),
+                ..
+            })
+        ));
+        // mark_clean: Dirty{cipher=Some} -> Clean{cipher=Some}, cipher preserved
+        tree.mark_clean();
+        assert!(!tree.is_dirty());
+        let node = tree.get(ino).unwrap();
+        match &node.content {
+            FsContent::File(FileData::Clean {
+                data,
+                cipher: Some(c),
+            }) => {
+                assert_eq!(data.as_slice(), b"world");
+                assert_eq!(c.encryption as u8, cipher_cfg.encryption as u8);
+                assert_eq!(c.cipher_mode as u8, cipher_cfg.cipher_mode as u8);
+            }
+            _ => panic!("expected Clean with cipher"),
+        }
+    }
+
+    // Equivalent of mark_clean_loaded_stays_loaded: use mark_clean twice.
+    #[test]
+    fn mark_clean_clean_stays_clean() {
+        let (mut tree, ino) = make_tree_with_file(b"lazy");
+        tree.mark_clean();
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+        tree.mark_clean();
+        assert!(!tree.is_dirty());
+        // Should still be Clean
+        assert!(matches!(
+            tree.get(ino).unwrap().content,
+            FsContent::File(FileData::Clean { .. })
+        ));
+    }
+
+    // ── ENOSYS stubs ────────────────────────────────────────────────
+
+    #[test]
+    fn rmdir_returns_enosys() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.rmdir(ROOT_INODE, OsStr::new("x")).unwrap_err(),
+            fuser::Errno::ENOSYS,
+        );
+    }
+
+    #[test]
+    fn rename_returns_enosys() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.rename(
+                ROOT_INODE,
+                OsStr::new("a"),
+                ROOT_INODE,
+                OsStr::new("b"),
+                fuser::RenameFlags::empty(),
+            )
+            .unwrap_err(),
+            fuser::Errno::ENOSYS,
+        );
+    }
+
+    #[test]
+    fn set_attr_full_returns_enosys() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.set_attr_full(ROOT_INODE, None, None, None)
+                .unwrap_err(),
+            fuser::Errno::ENOSYS,
+        );
+    }
+
+    #[test]
+    fn create_symlink_returns_enosys() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.create_symlink(ROOT_INODE, OsStr::new("s"), Path::new("/target"))
+                .unwrap_err(),
+            fuser::Errno::ENOSYS,
+        );
+    }
+
+    #[test]
+    fn create_hardlink_returns_enosys() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.create_hardlink(ROOT_INODE, OsStr::new("h"), 2)
+                .unwrap_err(),
+            fuser::Errno::ENOSYS,
+        );
+    }
+
+    #[test]
+    fn set_xattr_returns_enosys() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.set_xattr(ROOT_INODE, OsStr::new("x"), b"v")
+                .unwrap_err(),
+            fuser::Errno::ENOSYS,
+        );
+    }
+
+    #[test]
+    fn remove_xattr_returns_enosys() {
+        let mut tree = make_tree();
+        assert_errno(
+            tree.remove_xattr(ROOT_INODE, OsStr::new("x")).unwrap_err(),
+            fuser::Errno::ENOSYS,
+        );
+    }
+
+    // ── FileData state machine unit tests ───────────────────────────
+
+    #[test]
+    fn promote_to_dirty_from_clean() {
+        let mut fd = FileData::Clean {
+            data: vec![1, 2, 3],
+            cipher: None,
+        };
+        fd.promote_to_dirty();
+        assert!(matches!(fd, FileData::Dirty { .. }));
+        if let FileData::Dirty { data, cipher } = &fd {
+            assert_eq!(data, &[1, 2, 3]);
+            assert!(cipher.is_none());
+        }
+    }
+
+    #[test]
+    fn promote_to_dirty_noop_on_dirty() {
+        let mut fd = FileData::Dirty {
+            data: vec![4, 5],
+            cipher: None,
+        };
+        fd.promote_to_dirty();
+        assert!(matches!(fd, FileData::Dirty { .. }));
+    }
+
+    #[test]
+    fn promote_to_dirty_noop_on_new() {
+        let mut fd = FileData::New(vec![6, 7]);
+        fd.promote_to_dirty();
+        assert!(matches!(fd, FileData::New(_)));
+    }
+
+    #[test]
+    fn make_clean_from_dirty() {
+        let mut fd = FileData::Dirty {
+            data: vec![10, 20],
+            cipher: Some(CipherConfig {
+                encryption: pna::Encryption::Aes,
+                cipher_mode: pna::CipherMode::CTR,
+            }),
+        };
+        fd.make_clean(false);
+        if let FileData::Clean { data, cipher } = &fd {
+            assert_eq!(data, &[10, 20]);
+            assert!(cipher.is_some());
+        } else {
+            panic!("expected Clean");
+        }
+    }
+
+    #[test]
+    fn make_clean_from_new_with_password() {
+        let mut fd = FileData::New(vec![30]);
+        fd.make_clean(true);
+        if let FileData::Clean { data, cipher } = &fd {
+            assert_eq!(data, &[30]);
+            assert!(cipher.is_some());
+        } else {
+            panic!("expected Clean");
+        }
+    }
+
+    #[test]
+    fn make_clean_from_new_without_password() {
+        let mut fd = FileData::New(vec![40]);
+        fd.make_clean(false);
+        if let FileData::Clean { data, cipher } = &fd {
+            assert_eq!(data, &[40]);
+            assert!(cipher.is_none());
+        } else {
+            panic!("expected Clean");
+        }
+    }
+
+    #[test]
+    fn make_clean_noop_on_clean() {
+        let mut fd = FileData::Clean {
+            data: vec![50],
+            cipher: None,
+        };
+        fd.make_clean(true);
+        if let FileData::Clean { data, cipher } = &fd {
+            assert_eq!(data, &[50]);
+            // cipher should remain None since Clean is a no-op
+            assert!(cipher.is_none());
+        } else {
+            panic!("expected Clean");
+        }
+    }
+
+    #[test]
+    fn data_and_data_mut_accessors() {
+        let mut fd = FileData::New(vec![1, 2, 3]);
+        assert_eq!(fd.data(), &[1, 2, 3]);
+        fd.data_mut().push(4);
+        assert_eq!(fd.data(), &[1, 2, 3, 4]);
     }
 }
