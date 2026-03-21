@@ -1,7 +1,7 @@
 use crate::{
     cli::PasswordArgs,
     command::{Command, ask_password},
-    filesystem::PnaFS,
+    filesystem::{PnaFS, WriteStrategy},
 };
 use clap::{Args, ValueHint};
 use fuser::{Config, MountOption, SessionACL, mount2};
@@ -33,6 +33,15 @@ struct MountOptions {
         help = "Allow all users to access files on this filesystem. By default access is restricted to the user who mounted it"
     )]
     allow_other: bool,
+    #[arg(long, help = "Enable write mode (default: read-only)")]
+    write: bool,
+    #[arg(
+        long,
+        default_value = "lazy",
+        requires = "write",
+        help = "When to flush: lazy (on unmount) or immediate (on file close)"
+    )]
+    write_strategy: WriteStrategy,
 }
 
 impl Command for MountArgs {
@@ -49,7 +58,13 @@ fn mount_archive(
     password: Option<String>,
     mount_options: MountOptions,
 ) -> io::Result<()> {
-    let fs = PnaFS::new(archive.into(), password);
+    let write_strategy = if mount_options.write {
+        Some(mount_options.write_strategy)
+    } else {
+        None
+    };
+
+    let fs = PnaFS::new(archive.into(), password, write_strategy)?;
     create_dir_all(&mount_point)?;
 
     let acl = if mount_options.allow_other {
@@ -61,7 +76,10 @@ fn mount_archive(
     };
 
     let mut config = Config::default();
-    config.mount_options = vec![MountOption::FSName("pnafs".to_owned()), MountOption::RO];
+    config.mount_options = vec![MountOption::FSName("pnafs".to_owned())];
+    if write_strategy.is_none() {
+        config.mount_options.push(MountOption::RO);
+    }
     config.acl = acl;
 
     mount2(fs, mount_point, &config)?;

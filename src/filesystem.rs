@@ -1,32 +1,61 @@
-use crate::file_manager::FileManager;
+use crate::archive_io;
+use crate::archive_store::{ArchiveStore, FileContent, NodeContent};
 use fuser::{
-    Errno, FileHandle, Filesystem, Generation, INodeNo, LockOwner, OpenFlags, ReplyAttr, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyXattr, Request,
+    BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
+    OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 use log::info;
 use std::ffi::{CString, OsStr};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
+
+/// When to flush dirty data back to the archive.
+#[derive(Copy, Clone, PartialEq, clap::ValueEnum)]
+pub(crate) enum WriteStrategy {
+    /// Flush only on unmount (destroy).
+    Lazy,
+    /// Flush on every file close (release).
+    Immediate,
+}
 
 pub(crate) struct PnaFS {
-    manager: Mutex<FileManager>,
+    store: Mutex<ArchiveStore>,
+    write_strategy: Option<WriteStrategy>,
 }
 
 impl PnaFS {
-    pub(crate) fn new(archive: PathBuf, password: Option<String>) -> Self {
-        Self {
-            manager: Mutex::new(FileManager::new(archive, password)),
+    pub(crate) fn new(
+        archive: PathBuf,
+        password: Option<String>,
+        write_strategy: Option<WriteStrategy>,
+    ) -> io::Result<Self> {
+        let store = archive_io::load(&archive, password)?;
+        Ok(Self {
+            store: Mutex::new(store),
+            write_strategy,
+        })
+    }
+
+    /// Save the archive and mark the store clean. Returns `Ok(())` even when
+    /// there is nothing to save.
+    fn save_if_dirty(store: &mut ArchiveStore) -> io::Result<()> {
+        if store.is_dirty() {
+            archive_io::save(store)?;
+            store.mark_clean();
         }
+        Ok(())
     }
 }
 
 impl Filesystem for PnaFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         info!("[Implemented] lookup(parent: {parent:#x?}, name {name:?})");
-        let manager = self.manager.lock().unwrap();
-        let children = manager.get_children(parent.0).unwrap();
+        let store = self.store.lock().unwrap();
+        let children = store.get_children(parent.0).unwrap_or_default();
         let entry = children.iter().find(|it| it.name == name);
         if let Some(entry) = entry {
             let ttl = Duration::from_secs(1);
@@ -39,35 +68,110 @@ impl Filesystem for PnaFS {
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         info!("[Implemented] getattr(ino: {ino:#x?}, fh: {fh:#x?})");
         let ttl = Duration::from_secs(1);
-        let manager = self.manager.lock().unwrap();
-        let file = manager.get_file(ino.0).unwrap();
-        reply.attr(&ttl, &file.attr);
+        let store = self.store.lock().unwrap();
+        if let Some(node) = store.get_node(ino.0) {
+            reply.attr(&ttl, &node.attr);
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
+        info!("[Implemented] readlink(ino: {ino:#x?})");
+        let store = self.store.lock().unwrap();
+        if let Some(node) = store.get_node(ino.0) {
+            if let NodeContent::Symlink(target) = &node.content {
+                reply.data(target.as_bytes());
+            } else {
+                reply.error(Errno::EINVAL);
+            }
+        } else {
+            reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        info!("[Implemented] open(ino: {ino:#x?}, flags: {flags:#x?})");
+        let store = self.store.lock().unwrap();
+        if store.get_node(ino.0).is_none() {
+            reply.error(Errno::ENOENT);
+            return;
+        }
+        drop(store);
+        if self.write_strategy.is_none() && flags.acc_mode() != OpenAccMode::O_RDONLY {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn read(
         &self,
         _req: &Request,
         ino: INodeNo,
-        fh: FileHandle,
+        _fh: FileHandle,
         offset: u64,
         size: u32,
-        flags: OpenFlags,
-        lock_owner: Option<LockOwner>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        info!(
-            "[Implemented] read(ino: {ino:#x?}, fh: {fh:?}, offset: {offset}, size: {size}, \
-            flags: {flags:#x?}, lock_owner: {lock_owner:?})"
-        );
-        let mut manager = self.manager.lock().unwrap();
-        if let Some(file) = manager.get_file_mut(ino.0) {
-            let offset = offset as usize;
-            let size = size as usize;
-            let data = file.data.as_slice();
-            reply.data(&data[data.len().min(offset)..data.len().min(offset + size)])
-        } else {
-            reply.error(Errno::ENOENT)
+        info!("[Implemented] read(ino: {ino:#x?}, offset: {offset}, size: {size})");
+        let store = self.store.lock().unwrap();
+        let node = match store.get_node(ino.0) {
+            Some(n) => n,
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
         };
+        // All file entries are fully decoded at load() time (fSIZ is only a
+        // hint and cannot be trusted), so no force-load is needed here.
+        let data = match &node.content {
+            NodeContent::File(FileContent::Loaded { data, .. })
+            | NodeContent::File(FileContent::Modified { data, .. })
+            | NodeContent::File(FileContent::Created(data)) => data.as_slice(),
+            NodeContent::File(FileContent::Unloaded(..)) => {
+                // Should not happen: all entries decoded at load time
+                log::error!("read: unexpected Unloaded state for ino {ino:#x?}");
+                reply.error(Errno::EIO);
+                return;
+            }
+            NodeContent::Directory | NodeContent::Symlink(_) => {
+                reply.error(Errno::EISDIR);
+                return;
+            }
+        };
+        let offset = offset as usize;
+        let size = size as usize;
+        reply.data(&data[data.len().min(offset)..data.len().min(offset + size)]);
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        info!(
+            "[Implemented] write(ino: {ino:#x?}, offset: {offset}, data.len(): {})",
+            data.len()
+        );
+        if self.write_strategy.is_none() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        match store.write_file(ino.0, offset, data) {
+            Ok(written) => reply.written(written as u32),
+            Err(e) => reply.error(e),
+        }
     }
 
     fn flush(
@@ -79,11 +183,236 @@ impl Filesystem for PnaFS {
         reply: ReplyEmpty,
     ) {
         info!("[Implemented] flush(ino: {ino:#x?}, fh: {fh:?}, lock_owner: {lock_owner:?})");
-        let manager = self.manager.lock().unwrap();
-        if manager.get_file(ino.0).is_some() {
+        let store = self.store.lock().unwrap();
+        if store.get_node(ino.0).is_some() {
             reply.ok();
         } else {
             reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn release(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        info!("[Implemented] release(ino: {_ino:#x?})");
+        if self.write_strategy == Some(WriteStrategy::Immediate) {
+            let mut store = self.store.lock().unwrap();
+            if let Err(e) = Self::save_if_dirty(&mut store) {
+                log::error!("Failed to save on release: {e}");
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        info!("[Implemented] fsync(ino: {_ino:#x?})");
+        if self.write_strategy.is_some() {
+            let mut store = self.store.lock().unwrap();
+            if let Err(e) = Self::save_if_dirty(&mut store) {
+                log::error!("Failed to save on fsync: {e}");
+                reply.error(Errno::EIO);
+                return;
+            }
+        }
+        reply.ok();
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        info!("[Implemented] setattr(ino: {ino:#x?}, mode: {mode:?}, size: {size:?})");
+        if self.write_strategy.is_none() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        // Handle truncate (size change).
+        if let Some(new_size) = size {
+            if let Err(e) = store.set_size(ino.0, new_size) {
+                reply.error(e);
+                return;
+            }
+        }
+        // Handle time changes.
+        if atime.is_some() || mtime.is_some() {
+            if let Err(e) = store.set_times(ino.0, atime, mtime) {
+                reply.error(e);
+                return;
+            }
+        }
+        // Handle mode/uid/gid.
+        if mode.is_some() || uid.is_some() || gid.is_some() {
+            if let Err(e) = store.set_attr_full(ino.0, mode, uid, gid) {
+                reply.error(e);
+                return;
+            }
+        }
+        let ttl = Duration::from_secs(1);
+        match store.get_node(ino.0) {
+            Some(node) => reply.attr(&ttl, &node.attr),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        info!("[Implemented] create(parent: {parent:#x?}, name: {name:?}, mode: {mode})");
+        if self.write_strategy.is_none() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        // Check parent
+        match store.get_node(parent.0) {
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+            Some(n) if !matches!(n.content, NodeContent::Directory) => {
+                reply.error(Errno::ENOTDIR);
+                return;
+            }
+            _ => {}
+        }
+        let existing = store
+            .get_children(parent.0)
+            .unwrap_or_default()
+            .iter()
+            .find(|n| n.name == name)
+            .map(|n| n.attr.ino.0);
+        if let Some(ino) = existing {
+            if (flags & libc::O_EXCL) != 0 {
+                reply.error(Errno::EEXIST);
+                return;
+            }
+            if (flags & libc::O_TRUNC) != 0 {
+                if let Err(e) = store.set_size(ino, 0) {
+                    reply.error(e);
+                    return;
+                }
+            }
+            let node = store.get_node(ino).unwrap();
+            reply.created(
+                &Duration::from_secs(1),
+                &node.attr,
+                Generation(0),
+                FileHandle(0),
+                FopenFlags::empty(),
+            );
+        } else {
+            match store.create_file(parent.0, name, mode & !umask) {
+                Ok(node) => {
+                    let attr = node.attr;
+                    reply.created(
+                        &Duration::from_secs(1),
+                        &attr,
+                        Generation(0),
+                        FileHandle(0),
+                        FopenFlags::empty(),
+                    );
+                }
+                Err(e) => reply.error(e),
+            }
+        }
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        info!("[Implemented] mkdir(parent: {parent:#x?}, name: {name:?}, mode: {mode})");
+        if self.write_strategy.is_none() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        match store.make_dir(parent.0, name, mode, umask) {
+            Ok(node) => {
+                let attr = node.attr;
+                reply.entry(&Duration::from_secs(1), &attr, Generation(0));
+            }
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        info!("[Implemented] unlink(parent: {parent:#x?}, name: {name:?})");
+        if self.write_strategy.is_none() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        match store.unlink(parent.0, name) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
+        }
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        info!(
+            "[Implemented] rename(parent: {parent:#x?}, name: {name:?}, newparent: {newparent:#x?}, newname: {newname:?})"
+        );
+        if self.write_strategy.is_none() {
+            reply.error(Errno::EROFS);
+            return;
+        }
+        let mut store = self.store.lock().unwrap();
+        match store.rename(parent.0, name, newparent.0, newname, flags) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -96,8 +425,8 @@ impl Filesystem for PnaFS {
         mut reply: ReplyDirectory,
     ) {
         info!("[Implemented] readdir(ino: {ino:#x?}, fh: {fh:?}, offset: {offset})");
-        let manager = self.manager.lock().unwrap();
-        let children = manager.get_children(ino.0).unwrap();
+        let store = self.store.lock().unwrap();
+        let children = store.get_children(ino.0).unwrap_or_default();
 
         let mut current_offset = offset + 1;
         for entry in children.into_iter().skip(offset as usize) {
@@ -113,9 +442,9 @@ impl Filesystem for PnaFS {
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         info!("[Implemented] getxattr(ino: {ino:#x?}, name: {name:?}, size: {size})");
-        let mut manager = self.manager.lock().unwrap();
-        if let Some(file) = manager.get_file_mut(ino.0) {
-            if let Some(value) = file.data.xattrs().get(name) {
+        let store = self.store.lock().unwrap();
+        if let Some(node) = store.get_node(ino.0) {
+            if let Some(value) = node.xattrs.get(name) {
                 if size == 0 {
                     reply.size(value.len() as u32);
                 } else {
@@ -131,11 +460,10 @@ impl Filesystem for PnaFS {
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         info!("[Implemented] listxattr(ino: {ino:#x?}, size: {size})");
-        let mut manager = self.manager.lock().unwrap();
-        if let Some(file) = manager.get_file_mut(ino.0) {
-            let keys = file
-                .data
-                .xattrs()
+        let store = self.store.lock().unwrap();
+        if let Some(node) = store.get_node(ino.0) {
+            let keys = node
+                .xattrs
                 .keys()
                 .flat_map(|key| {
                     CString::new(key.as_bytes())
@@ -151,6 +479,17 @@ impl Filesystem for PnaFS {
             }
         } else {
             reply.error(Errno::ENOENT);
+        }
+    }
+
+    fn destroy(&mut self) {
+        info!("[Implemented] destroy()");
+        if self.write_strategy.is_some() {
+            let store = self.store.get_mut().unwrap();
+            if let Err(e) = Self::save_if_dirty(store) {
+                eprintln!("pnafs: CRITICAL: failed to save archive on unmount: {e}");
+                log::error!("Failed to save archive on destroy: {e}");
+            }
         }
     }
 }
