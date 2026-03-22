@@ -254,4 +254,25 @@ CONTENT="$(cat "$MOUNTPOINT/seed.txt")"
 unmount_wait
 echo "PASS"
 
+echo "=== Test 19: Deep nested directory with multiple files ==="
+mount_rw
+mkdir -p "$MOUNTPOINT/a/b/c/d"
+echo "file1" > "$MOUNTPOINT/a/file_a.txt"
+echo "file2" > "$MOUNTPOINT/a/b/file_b.txt"
+echo "file3" > "$MOUNTPOINT/a/b/c/file_c.txt"
+echo "file4" > "$MOUNTPOINT/a/b/c/d/file_d.txt"
+unmount_wait
+mount_rw
+[ -d "$MOUNTPOINT/a/b/c/d" ] || { echo "FAIL: deep dir missing"; exit 1; }
+CONTENT1="$(cat "$MOUNTPOINT/a/file_a.txt")"
+CONTENT2="$(cat "$MOUNTPOINT/a/b/file_b.txt")"
+CONTENT3="$(cat "$MOUNTPOINT/a/b/c/file_c.txt")"
+CONTENT4="$(cat "$MOUNTPOINT/a/b/c/d/file_d.txt")"
+[ "$CONTENT1" = "file1" ] || { echo "FAIL: file_a: $CONTENT1"; exit 1; }
+[ "$CONTENT2" = "file2" ] || { echo "FAIL: file_b: $CONTENT2"; exit 1; }
+[ "$CONTENT3" = "file3" ] || { echo "FAIL: file_c: $CONTENT3"; exit 1; }
+[ "$CONTENT4" = "file4" ] || { echo "FAIL: file_d: $CONTENT4"; exit 1; }
+unmount_wait
+echo "PASS"
+
 echo "All write tests passed."
