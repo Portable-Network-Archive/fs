@@ -24,7 +24,7 @@ id_tree = "1.8.0"
 libc = "0.2.183"
 log = "0.4.29"
 memmap2 = "0.9.10"
-pna = "0.31.0"
+pna = "0.32.0"
 rpassword = "7.4.0"
 simple_logger = { version = "5.2.0" , optional = true }
 
