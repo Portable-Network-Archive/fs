@@ -58,6 +58,19 @@ jobs:
         run: |
           chmod +x -R scripts/tests
           ./scripts/tests/run.sh
+      - name: Upload proptest regressions on failure
+        # `cargo test` runs `roundtrip_proptest::save_load_roundtrip_*`
+        # at its in-tree default (64 cases). A new counter-example
+        # appended to proptest-regressions/ would otherwise vanish with
+        # the runner — preserve it so the seed can be replayed and
+        # committed back. Per-matrix entry name keeps the 8 parallel
+        # runs from clobbering each other.
+        if: failure()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.2
+        with:
+          name: proptest-regressions-${{ matrix.os }}-${{ matrix.rust }}
+          path: proptest-regressions/
+          if-no-files-found: ignore
 
   posix_conformance:
     # POSIX conformance via pjdfstest. Architectural failures (special-file
