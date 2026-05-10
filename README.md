@@ -40,7 +40,7 @@ Make sure you have `pkg-config` and the `fuse` library installed. These are usua
 
 #### FreeBSD
 
-Rust can be installed via the `lang/rust` port. You will need to install `sysutils/fusefs-libs` for the `cairo install` command to succeed.
+Rust can be installed via the `lang/rust` port. You will need to install `sysutils/fusefs-libs` for the `cargo install` command to succeed.
 
 ### Installation
 
@@ -60,6 +60,17 @@ Mount archive:
 ```bash
 $ pnafs mount archive.pna /mnt/pnafs/
 ```
+
+### Testing
+
+```bash
+cargo test --locked --release
+```
+
+Mount-level shell harnesses (POSIX conformance, randomised I/O,
+multi-process stress) live under `scripts/tests/` — see
+[`scripts/tests/README.md`](scripts/tests/README.md) for what each one
+covers, host requirements, and how to reproduce failures.
 
 ### Troubleshooting
 

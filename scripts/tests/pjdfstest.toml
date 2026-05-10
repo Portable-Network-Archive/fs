@@ -1,0 +1,51 @@
+# pjdfstest configuration for pnafs (Portable-Network-Archive Filesystem).
+#
+# Use this file as the live spec of "what should pass". When pnafs gains a
+# feature, remove the corresponding entry from `expected_failures`. When a
+# real bug is found, fix the bug rather than hiding the failure.
+#
+# Reference: https://saidsay-so.github.io/pjdfstest/configuration-file.html
+
+[features]
+# Opt-in features pnafs supports. Each entry enables a group of pjdfstest
+# tests that the upstream config gates off by default. Anything unsupported
+# (chflags, NFSv4 ACLs, BSD-only flags) intentionally stays off.
+posix_fallocate = []
+rename_ctime    = []
+stat_st_birthtime = []
+utime_now       = []
+utimensat       = []
+
+[settings]
+# pnafs persists mtime through PNA archive metadata at second granularity, so
+# keep naptime conservative. Lower this if/when sub-second mtime is preserved
+# across save/load cycles.
+naptime = 1.0
+
+# pjdfstest's EROFS tests rely on `mount -o remount,ro <mountpoint>`.
+# Two paths were investigated, both blocked upstream:
+#   * Default path (via `mount.fuse` helper): re-execs the FS source name
+#     (`pnafs`) under `/bin/sh`, which fails on PATH resolution.
+#   * `mount -i` (helper bypass): the kernel rejects with
+#     `fsconfig() failed: fuse: No changes allowed in reconfigure` —
+#     FUSE has no `reconfigure` op, so a perfect helper would still fail.
+# Until either gap moves upstream, EROFS tests stay off.
+allow_remount = false
+
+# All POSIX-conformance tests pass on Linux. The 48 skipped tests need
+# allow_remount or features pnafs hasn't opted into yet — they aren't
+# failures.
+expected_failures = []
+
+# pjdfstest requires three resolvable system users at startup, even in
+# rootless mode (it pre-loads them for tests that switch users). Tests that
+# actually need to switch will be skipped without privileges, but the users
+# themselves must exist. test_pjdfstest.sh refuses to create them by
+# default — run with `PJDFSTEST_CREATE_USERS=1` (or create them manually)
+# only on disposable hosts.
+[dummy_auth]
+entries = [
+    ["nobody",    "nogroup"],
+    ["tests",     "tests"],
+    ["pjdfstest", "pjdfstest"],
+]
