@@ -34,6 +34,7 @@ logging = ["dep:simple_logger"]
 macos-no-mount = ["fuser/macos-no-mount"]
 
 [dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
 
 # The profile that 'cargo dist' will build with

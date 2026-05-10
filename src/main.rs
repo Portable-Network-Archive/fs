@@ -8,6 +8,9 @@ mod command;
 mod file_tree;
 mod filesystem;
 
+#[cfg(test)]
+mod roundtrip_proptest;
+
 fn main() -> io::Result<()> {
     let args = cli::Cli::parse();
     #[cfg(feature = "logging")]

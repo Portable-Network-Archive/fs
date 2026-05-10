@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 11437327bae020eb69db6d4f43b745c1a4193f9f22be6653223b41d4c8145baa # shrinks to specs = [FileSpec { path: "a", content: [], perm: 0, uid: 0, gid: 47, xattrs: {} }]
+cc bfd064c2ac2271e73778097790fff6ccdc582e27391dad31f6d5ad29255766d0 # shrinks to specs = [FileSpec { path: "g", content: [], perm: 0, uid: 0, gid: 0, xattrs: {} }, FileSpec { path: "g/a", content: [], perm: 0, uid: 0, gid: 0, xattrs: {} }]
