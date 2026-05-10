@@ -1,0 +1,42 @@
+# fsx-rs configuration for pnafs.
+#
+# fsx generates a pseudorandom sequence of read/write/truncate/mmap
+# operations against a single test file and verifies expected bytes on
+# every read. Use `-S <seed>` from the harness to make failures
+# reproducible. Reference:
+# https://github.com/asomers/fsx-rs/blob/master/doc/fsx.toml
+
+# Cap the test file at 1 MiB; large enough to exercise resize logic
+# without bloating archive save time.
+flen = 1048576
+
+# msync on an archive-backed mmap is a no-op (the bytes are already in
+# the in-memory FsContent::File buffer); skip it to avoid pointless
+# round-trips through FUSE.
+nomsyncafterwrite = true
+
+[opsize]
+max = 65536
+min = 0
+align = 1
+
+[weights]
+# All ops fsx-rs knows about, exercised at non-zero weight. `sendfile`
+# routes through pnafs's `read` handler at the kernel level (no extra
+# FUSE op needed); `posix_fadvise` is consumed by the kernel without
+# crossing into FUSE. Both are validated by 20 000-op runs across
+# several seeds before being enabled here.
+read = 10
+write = 10
+mapread = 10
+mapwrite = 10
+truncate = 1
+close_open = 1
+invalidate = 1
+fsync = 1
+fdatasync = 1
+posix_fallocate = 1
+punch_hole = 1
+copy_file_range = 1
+sendfile = 1
+posix_fadvise = 1

@@ -58,3 +58,133 @@ jobs:
         run: |
           chmod +x -R scripts/tests
           ./scripts/tests/run.sh
+
+  posix_conformance:
+    # POSIX conformance via pjdfstest. Architectural failures (special-file
+    # types not representable in PNA, hardlinks, privileged-only tests) are
+    # listed under `expected_failures` in scripts/tests/pjdfstest.toml; any
+    # other regression breaks this job. Update the expected_failures list
+    # deliberately when a feature lands or a real bug is fixed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: install_rust
+        uses: ./.github/actions/setup-rust
+        with:
+          channel: stable
+          default: false
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y fuse3 libfuse3-dev libacl1-dev acl
+          # The harness mounts pnafs with --allow-other so pjdfstest's
+          # seteuid()-to-nobody/tests/pjdfstest tests can reach the FS;
+          # FUSE rejects --allow-other from non-root users unless
+          # `user_allow_other` is set in /etc/fuse.conf. The runner is
+          # ephemeral, so toggling it here is safe.
+          echo user_allow_other | sudo tee -a /etc/fuse.conf
+      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: target
+          key: ${{ runner.os }}-pjdfstest-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'scripts/tests/test_pjdfstest.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-pjdfstest-rust-${{ steps.install_rust.outputs.version }}
+      - name: Install portable-network-archive from crates.io
+        uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
+        with:
+          crate: portable-network-archive
+          cache-key: pjdfstest-${{ runner.os }}
+      - name: Install pnafs
+        run: cargo +stable install --locked --path .
+      - name: Run pjdfstest
+        # The runner is ephemeral, so let the harness auto-create the
+        # dummy users pjdfstest needs (nobody / tests / pjdfstest). The
+        # script refuses to touch /etc/passwd unless this flag is set.
+        env:
+          PJDFSTEST_CREATE_USERS: "1"
+        shell: bash
+        run: |
+          chmod +x scripts/tests/test_pjdfstest.sh
+          ./scripts/tests/test_pjdfstest.sh
+
+  fsx:
+    # Random read / write / truncate / mmap I/O against a pnafs --write
+    # mount via the Rust port of fsx. Reproducible: any failure prints
+    # the seed and a per-op log so the same sequence can be replayed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: install_rust
+        uses: ./.github/actions/setup-rust
+        with:
+          channel: stable
+          default: false
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y fuse3 libfuse3-dev
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target
+          key: ${{ runner.os }}-fsx-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'scripts/tests/test_fsx.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-fsx-rust-${{ steps.install_rust.outputs.version }}
+      - name: Install portable-network-archive from crates.io
+        uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
+        with:
+          crate: portable-network-archive
+          cache-key: fsx-${{ runner.os }}
+      - name: Install pnafs
+        run: cargo +stable install --locked --path .
+      - name: Run fsx
+        # Surface the seed + op log out of the test workdir so a failed
+        # run is reproducible from the artifact.
+        env:
+          FSX_ARTIFACTS_OUT: ${{ github.workspace }}/fsx-artifacts
+        shell: bash
+        run: |
+          chmod +x scripts/tests/test_fsx.sh
+          ./scripts/tests/test_fsx.sh
+      - name: Upload fsx artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.2
+        with:
+          name: fsx-artifacts
+          path: ${{ github.workspace }}/fsx-artifacts
+          if-no-files-found: ignore
+
+  fsstress:
+    # Multi-process stress: N workers issue random FS ops (mkdir, unlink,
+    # rename, write, truncate, ...) against a shared subtree. Targets the
+    # RwLock<FileTree> contention and (nlink, open_count) orphan paths
+    # that single-threaded suites can't trigger.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - id: install_rust
+        uses: ./.github/actions/setup-rust
+        with:
+          channel: stable
+          default: false
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y fuse3 libfuse3-dev
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: target
+          key: ${{ runner.os }}-fsstress-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'scripts/tests/test_fsstress.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-fsstress-rust-${{ steps.install_rust.outputs.version }}
+      - name: Install portable-network-archive from crates.io
+        uses: baptiste0928/cargo-install@f204293d9709061b7bc1756fec3ec4e2cd57dec0 # v3.4.0
+        with:
+          crate: portable-network-archive
+          cache-key: fsstress-${{ runner.os }}
+      - name: Install pnafs
+        run: cargo +stable install --locked --path .
+      - name: Run fsstress
+        shell: bash
+        run: |
+          chmod +x scripts/tests/test_fsstress.sh
+          ./scripts/tests/test_fsstress.sh
