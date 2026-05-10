@@ -1437,15 +1437,21 @@ fn search_group(name: &str, id: u64) -> Option<Group> {
     Group::from_gid((id as u32).into()).ok().flatten()
 }
 
-/// Resolve the UID for a PNA permission entry, falling back to the current
-/// process UID when the username / numeric id cannot be found.
+/// Resolve the UID for a PNA permission entry. If the archive's
+/// `uname` or numeric uid resolves to a local user we prefer that
+/// (handles uid remapping across systems where the same user has a
+/// different id). Otherwise the numeric uid from the archive is
+/// authoritative — silently substituting the running process's uid
+/// would lose the saved owner across a save → load cycle. Only when
+/// no `Permission` is attached at all do we fall back to the caller's
+/// uid.
 pub(crate) fn get_uid(permission: Option<&Permission>) -> u32 {
     #[cfg(unix)]
     {
-        permission
-            .and_then(|it| search_owner(it.uname(), it.uid()))
-            .map_or_else(Uid::current, |it| it.uid)
-            .as_raw()
+        match permission {
+            Some(p) => search_owner(p.uname(), p.uid()).map_or(p.uid() as u32, |u| u.uid.as_raw()),
+            None => Uid::current().as_raw(),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -1454,15 +1460,17 @@ pub(crate) fn get_uid(permission: Option<&Permission>) -> u32 {
     }
 }
 
-/// Resolve the GID for a PNA permission entry, falling back to the current
-/// process GID when the group name / numeric id cannot be found.
+/// Resolve the GID for a PNA permission entry. Mirrors [`get_uid`]:
+/// archive's numeric gid is authoritative when neither `gname` nor the
+/// numeric id resolves locally; the process gid only applies when no
+/// permission record is present.
 pub(crate) fn get_gid(permission: Option<&Permission>) -> u32 {
     #[cfg(unix)]
     {
-        permission
-            .and_then(|it| search_group(it.gname(), it.gid()))
-            .map_or_else(Gid::current, |it| it.gid)
-            .as_raw()
+        match permission {
+            Some(p) => search_group(p.gname(), p.gid()).map_or(p.gid() as u32, |g| g.gid.as_raw()),
+            None => Gid::current().as_raw(),
+        }
     }
     #[cfg(not(unix))]
     {
@@ -2651,6 +2659,55 @@ mod tests {
                 .unwrap(),
             b"green"
         );
+    }
+
+    // ── get_uid / get_gid fallback ────────────────────────────────
+
+    /// PNA archives store `uname` / `gname` plus numeric ids. When the
+    /// archive came from a different host, the names won't resolve
+    /// locally and the numeric id may also have no matching entry in
+    /// /etc/passwd or /etc/group. In that case the saved numeric id is
+    /// authoritative — substituting the *current process's* uid/gid
+    /// silently loses the recorded owner on every save → load cycle.
+    /// This test pins that behaviour for a uid/gid that won't normally
+    /// exist on a CI host.
+    #[test]
+    fn get_uid_preserves_archive_id_when_name_does_not_resolve() {
+        // gname empty + numeric id that is unlikely to exist in /etc/group.
+        let permission = pna::Permission::new(
+            0xfeed_face as u64,
+            String::new(),
+            0u64,
+            String::new(),
+            0o644,
+        );
+        let uid = get_uid(Some(&permission));
+        // Archive uid must round-trip even though there's no local user.
+        assert_eq!(uid, 0xfeed_face);
+    }
+
+    #[test]
+    fn get_gid_preserves_archive_id_when_name_does_not_resolve() {
+        let permission = pna::Permission::new(
+            0u64,
+            String::new(),
+            0xdead_beef as u64,
+            String::new(),
+            0o644,
+        );
+        let gid = get_gid(Some(&permission));
+        assert_eq!(gid, 0xdead_beef);
+    }
+
+    /// Sanity check the unchanged path: `None` permission means there's
+    /// no archive record to honour, so falling back to the caller's
+    /// id is correct. (Observable here only as "the result is *some*
+    /// integer" — the actual value depends on the test runner.)
+    #[test]
+    fn get_uid_falls_back_to_current_when_permission_absent() {
+        // Should not panic; value is whatever the test process is.
+        let _ = get_uid(None);
+        let _ = get_gid(None);
     }
 
     #[test]
