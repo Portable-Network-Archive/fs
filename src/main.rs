@@ -2,9 +2,10 @@ use crate::command::Command;
 use clap::Parser;
 use std::io;
 
+mod archive_io;
 mod cli;
 mod command;
-mod file_manager;
+mod file_tree;
 mod filesystem;
 
 fn main() -> io::Result<()> {
