@@ -6,7 +6,7 @@ PNA-FS is a virtual filesystem that allows users to mount their PNA file and int
 
 ### Requirements
 
-PNA-FS requires the stable branch of the Rust programming language, which can be installed following the instructions on [rustup.rs](https://rustup.rs). If you already have Rust installed, make sure that it is updated to the latest version (≥1.76):
+PNA-FS requires the stable branch of the Rust programming language, which can be installed following the instructions on [rustup.rs](https://rustup.rs). If you already have Rust installed, make sure that it is updated to the latest version (≥1.88):
 
 ```bash
 $ rustup update stable
