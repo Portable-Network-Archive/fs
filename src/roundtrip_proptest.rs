@@ -8,18 +8,48 @@
 //! which specs survive the filter; the explicit `prop_recursive`
 //! generator avoids that trap.
 //!
+//! Node types covered by the generator (Phase 2 onwards):
+//!
+//! * **File** — content, perm, owner, xattrs, all round-trip.
+//! * **Dir** — perm, owner, xattrs, nlink invariant, all round-trip.
+//! * **Symlink** — target string round-trips (PNA stores it as the entry
+//!   payload).
+//! * **Special** (block / char / fifo / socket) — pnafs accepts them
+//!   in-memory but PNA has no on-disk kind for them, so `save()` drops
+//!   them with a logged warning. The property checks the **inverse**:
+//!   nodes spec'd as Special are absent from the post-load snapshot.
+//! * **Hardlink** — handled as a sidecar table (`HardlinkRef`) instead
+//!   of a `NodeSpec` variant, because a hardlink references *another*
+//!   node and proptest's `prop_recursive` cannot express that
+//!   cross-reference cleanly. After the primary tree is built we walk
+//!   the table, resolve each `(source_index, dest_parent_index,
+//!   dest_name)` modulo the primary inventory, and call `create_hardlink`
+//!   when none of (a) name collision, (b) source-is-dir, (c) dest is
+//!   itself a non-dir blocks it. Hardlinks that can't materialise are
+//!   simply skipped — the property is about what *did* get materialised,
+//!   not about every triple succeeding.
+//!
 //! Properties layered here:
 //!
 //! 1. `save_load_roundtrip_preserves_tree` — every observable field
-//!    (paths, file content, permission bits, owner uid/gid, xattrs,
-//!    directory nlink) survives a `save → load` cycle, and a second
-//!    `save → load` is a fixed point (observational idempotence).
+//!    (paths, file content, perm, owner uid/gid, xattrs, file size,
+//!    directory nlink) survives `save → load`, and a second cycle is a
+//!    fixed point. Special-typed spec entries are asserted to be
+//!    absent post-load (the PNA-format-limit inverse property).
+//!    Hardlinked siblings observe the same content / perm / owner /
+//!    xattrs and the source's `nlink` reflects every successful link.
 //!
 //! 2. `plain_save_is_byte_identical_when_replayed` — saving a tree,
-//!    loading it, and saving the result must produce the **same archive
-//!    bytes**. Anything the format records non-deterministically (e.g.
-//!    iteration order of a `HashMap`-backed metadata field) would show
-//!    up here long before it became a user-visible corruption.
+//!    loading it, and saving again produces byte-identical archives.
+//!    Catches non-determinism the snapshot-equality check cannot see.
+//!
+//! All operations are issued directly against `FileTree` — the
+//! property test does **not** go through FUSE. That avoids needing
+//! privileges (e.g. `mknod` with a non-zero `rdev` is normally
+//! gated on `CAP_SYS_ADMIN` over FUSE) and keeps cases fast, but it
+//! also means kernel-level checks (`DefaultPermissions`, mount
+//! flags, etc.) are not exercised here — those live in
+//! `scripts/tests/test_pjdfstest.sh` and friends.
 //!
 //! Implicit invariants the byte-identity property leans on, documented
 //! so a future refactor doesn't break them silently:
@@ -36,7 +66,7 @@
 //!   conventional system has entries for; see comment there.
 
 use crate::archive_io;
-use crate::file_tree::{FileTree, FsContent, Inode, Owner, ROOT_INODE};
+use crate::file_tree::{FileTree, FsContent, Inode, Owner, ROOT_INODE, SpecialKind};
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -45,8 +75,7 @@ use std::path::Path;
 
 // ── Spec types ─────────────────────────────────────────────────────
 
-/// Per-inode metadata the generator chooses. Distinct from `Vec<u8>`
-/// content so dir nodes can carry the same set of fields.
+/// Per-inode metadata the generator chooses.
 #[derive(Debug, Clone)]
 struct NodeMeta {
     perm: u16,
@@ -55,20 +84,66 @@ struct NodeMeta {
     xattrs: BTreeMap<String, Vec<u8>>,
 }
 
-/// One node in the generated tree. The map of children is a
-/// `BTreeMap` so sibling names are deduplicated by construction (no
-/// need for a post-filter), and proptest can shrink it by removing
-/// individual entries without restructuring the rest.
+#[derive(Debug, Clone, Copy)]
+enum SpecKind {
+    BlockDevice,
+    CharDevice,
+    Fifo,
+    Socket,
+}
+
+impl SpecKind {
+    fn to_tree(self) -> SpecialKind {
+        match self {
+            SpecKind::BlockDevice => SpecialKind::BlockDevice,
+            SpecKind::CharDevice => SpecialKind::CharDevice,
+            SpecKind::Fifo => SpecialKind::Fifo,
+            SpecKind::Socket => SpecialKind::Socket,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum NodeSpec {
     File {
         meta: NodeMeta,
         content: Vec<u8>,
     },
+    Symlink {
+        meta: NodeMeta,
+        target: String,
+    },
+    Special {
+        meta: NodeMeta,
+        kind: SpecKind,
+        rdev: u32,
+    },
     Dir {
         meta: NodeMeta,
         children: BTreeMap<String, NodeSpec>,
     },
+}
+
+/// A hardlink request that references the primary tree by
+/// `proptest::sample::Index`. `Index` is proptest's standard "pick
+/// from a runtime-known collection" strategy: when the surrounding
+/// tree shrinks, `Index::index(len)` continues to pick *some* element
+/// of the shrunk collection rather than jumping to an unrelated
+/// element. A plain `u32 % len` would defeat shrink monotonicity —
+/// shrinking the tree by removing files would silently re-target every
+/// hardlink, and proptest's "minimal" counter-example would mix
+/// failures from different placements.
+#[derive(Debug, Clone)]
+struct HardlinkRef {
+    source: proptest::sample::Index,
+    dest_dir: proptest::sample::Index,
+    dest_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct TestInput {
+    root: BTreeMap<String, NodeSpec>,
+    hardlinks: Vec<HardlinkRef>,
 }
 
 // ── Generators ─────────────────────────────────────────────────────
@@ -124,14 +199,40 @@ fn arb_meta() -> impl Strategy<Value = NodeMeta> {
         })
 }
 
+/// 1–4 components joined with `/`. Used as a symlink target so the
+/// FUSE side has something path-shaped to round-trip.
+fn arb_symlink_target() -> impl Strategy<Value = String> {
+    prop::collection::vec(arb_segment(), 1..=4).prop_map(|p| p.join("/"))
+}
+
+fn arb_spec_kind() -> impl Strategy<Value = SpecKind> {
+    prop_oneof![
+        Just(SpecKind::BlockDevice),
+        Just(SpecKind::CharDevice),
+        Just(SpecKind::Fifo),
+        Just(SpecKind::Socket),
+    ]
+}
+
+/// One leaf node. Files dominate the distribution (weight 4) since
+/// they exercise the richest code path; the other three are
+/// represented but won't drown out file generation.
+fn arb_leaf() -> impl Strategy<Value = NodeSpec> {
+    prop_oneof![
+        4 => (arb_meta(), prop::collection::vec(any::<u8>(), 0..=128))
+            .prop_map(|(meta, content)| NodeSpec::File { meta, content }),
+        1 => (arb_meta(), arb_symlink_target())
+            .prop_map(|(meta, target)| NodeSpec::Symlink { meta, target }),
+        1 => (arb_meta(), arb_spec_kind(), prop::num::u32::ANY)
+            .prop_map(|(meta, kind, rdev)| NodeSpec::Special { meta, kind, rdev }),
+    ]
+}
+
 /// Tree of nodes generated bottom-up. `prop_recursive` lets proptest
 /// shrink the entire subtree structure (depth, branching, leaf
 /// contents) coherently.
 fn arb_node() -> impl Strategy<Value = NodeSpec> {
-    let leaf = (arb_meta(), prop::collection::vec(any::<u8>(), 0..=128))
-        .prop_map(|(meta, content)| NodeSpec::File { meta, content });
-
-    leaf.prop_recursive(
+    arb_leaf().prop_recursive(
         // Depth: archives 3-4 levels deep are typical, deeper still
         // round-trips but balloons case time.
         4,
@@ -160,6 +261,27 @@ fn arb_root_children() -> impl Strategy<Value = BTreeMap<String, NodeSpec>> {
     prop::collection::btree_map(arb_segment(), arb_node(), 0..=4)
 }
 
+fn arb_hardlink_ref() -> impl Strategy<Value = HardlinkRef> {
+    (
+        any::<proptest::sample::Index>(),
+        any::<proptest::sample::Index>(),
+        arb_segment(),
+    )
+        .prop_map(|(source, dest_dir, dest_name)| HardlinkRef {
+            source,
+            dest_dir,
+            dest_name,
+        })
+}
+
+fn arb_test_input() -> impl Strategy<Value = TestInput> {
+    (
+        arb_root_children(),
+        prop::collection::vec(arb_hardlink_ref(), 0..=4),
+    )
+        .prop_map(|(root, hardlinks)| TestInput { root, hardlinks })
+}
+
 // ── Build / compare ────────────────────────────────────────────────
 
 /// Bootstrap an empty PNA archive at `archive_path` so `load()` has
@@ -184,7 +306,10 @@ fn apply_xattrs(
 
 fn build_child(tree: &mut FileTree, parent: Inode, name: &str, spec: &NodeSpec) -> io::Result<()> {
     let owner = match spec {
-        NodeSpec::File { meta, .. } | NodeSpec::Dir { meta, .. } => Owner::new(meta.uid, meta.gid),
+        NodeSpec::File { meta, .. }
+        | NodeSpec::Symlink { meta, .. }
+        | NodeSpec::Special { meta, .. }
+        | NodeSpec::Dir { meta, .. } => Owner::new(meta.uid, meta.gid),
     };
     match spec {
         NodeSpec::File { meta, content } => {
@@ -198,6 +323,31 @@ fn build_child(tree: &mut FileTree, parent: Inode, name: &str, spec: &NodeSpec) 
                 tree.write_file(ino, 0, content)
                     .map_err(|e| io::Error::other(format!("write_file: {e:?}")))?;
             }
+            apply_xattrs(tree, ino, &meta.xattrs)?;
+        }
+        NodeSpec::Symlink { meta, target } => {
+            let ino = tree
+                .create_symlink(parent, OsStr::new(name), Path::new(target), owner)
+                .map_err(|e| io::Error::other(format!("create_symlink: {e:?}")))?
+                .attr
+                .ino
+                .0;
+            apply_xattrs(tree, ino, &meta.xattrs)?;
+        }
+        NodeSpec::Special { meta, kind, rdev } => {
+            let ino = tree
+                .create_special(
+                    parent,
+                    OsStr::new(name),
+                    kind.to_tree(),
+                    meta.perm,
+                    *rdev,
+                    owner,
+                )
+                .map_err(|e| io::Error::other(format!("create_special: {e:?}")))?
+                .attr
+                .ino
+                .0;
             apply_xattrs(tree, ino, &meta.xattrs)?;
         }
         NodeSpec::Dir { meta, children } => {
@@ -216,18 +366,104 @@ fn build_child(tree: &mut FileTree, parent: Inode, name: &str, spec: &NodeSpec) 
     Ok(())
 }
 
-/// Build the tree under `archive_path` matching `root_children` and
-/// save it.
-fn build_and_save(
-    archive_path: &Path,
-    root_children: &BTreeMap<String, NodeSpec>,
-) -> io::Result<()> {
+/// Walk `root` recursively, recording the archive path of every File
+/// node and the path of every Directory node (including the root,
+/// represented as the empty string). The order is DFS-by-BTreeMap-key
+/// so it is reproducible across runs.
+fn inventory(root: &BTreeMap<String, NodeSpec>) -> (Vec<String>, Vec<String>) {
+    let mut files = Vec::new();
+    let mut dirs = vec![String::new()];
+    fn walk(
+        prefix: &str,
+        spec: &BTreeMap<String, NodeSpec>,
+        files: &mut Vec<String>,
+        dirs: &mut Vec<String>,
+    ) {
+        for (name, node) in spec {
+            let p = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match node {
+                NodeSpec::File { .. } => files.push(p),
+                NodeSpec::Dir { children, .. } => {
+                    dirs.push(p.clone());
+                    walk(&p, children, files, dirs);
+                }
+                NodeSpec::Symlink { .. } | NodeSpec::Special { .. } => {}
+            }
+        }
+    }
+    walk("", root, &mut files, &mut dirs);
+    (files, dirs)
+}
+
+/// Materialise as many of the generator's hardlink requests as the
+/// state allows. Returns the set of *successfully* placed
+/// `(source_path, dest_path)` pairs so the property can assert
+/// observable equivalence at those locations.
+fn apply_hardlinks(
+    tree: &mut FileTree,
+    root: &BTreeMap<String, NodeSpec>,
+    requests: &[HardlinkRef],
+) -> Vec<(String, String)> {
+    let (files, dirs) = inventory(root);
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let mut placed = Vec::new();
+    for req in requests {
+        let source_path = &files[req.source.index(files.len())];
+        let dest_dir = &dirs[req.dest_dir.index(dirs.len())];
+        let dest_path = if dest_dir.is_empty() {
+            req.dest_name.clone()
+        } else {
+            format!("{dest_dir}/{}", req.dest_name)
+        };
+        if dest_path == *source_path {
+            continue;
+        }
+        let Some(source_ino) = tree.resolve_path(Path::new(source_path)) else {
+            continue;
+        };
+        let dest_parent_ino = if dest_dir.is_empty() {
+            ROOT_INODE
+        } else {
+            match tree.resolve_path(Path::new(dest_dir)) {
+                Some(i) => i,
+                None => continue,
+            }
+        };
+        // Skip on collision instead of failing — the request is just
+        // proposing a placement; collisions are common at this density.
+        if tree
+            .lookup_child(dest_parent_ino, OsStr::new(&req.dest_name))
+            .is_some()
+        {
+            continue;
+        }
+        if tree
+            .create_hardlink(dest_parent_ino, OsStr::new(&req.dest_name), source_ino)
+            .is_ok()
+        {
+            placed.push((source_path.clone(), dest_path));
+        }
+    }
+    placed
+}
+
+/// Build the tree under `archive_path` matching `input`, materialise
+/// hardlinks, and save.
+fn build_and_save(archive_path: &Path, input: &TestInput) -> io::Result<Vec<(String, String)>> {
     bootstrap_empty(archive_path)?;
     let mut tree = archive_io::load(archive_path, None)?;
-    for (name, spec) in root_children {
+    for (name, spec) in &input.root {
         build_child(&mut tree, ROOT_INODE, name, spec)?;
     }
-    archive_io::save(&mut tree)
+    let placed = apply_hardlinks(&mut tree, &input.root, &input.hardlinks);
+    archive_io::save(&mut tree)?;
+    Ok(placed)
 }
 
 /// Walk `tree` and pull out everything we expect to round-trip, keyed
@@ -305,17 +541,19 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
     /// SPEC: `load(save(T)) ≅ T` for every generated tree T, observed
-    /// over (path, kind, content, perm, uid, gid, xattrs, nlink). A
-    /// second `save → load` cycle must be a fixed point (no
-    /// observational drift), which catches non-determinism in the
-    /// save path that AST equality between in-memory tree and reload
-    /// alone would miss.
+    /// over (path, kind, content, perm, uid, gid, xattrs, nlink,
+    /// size). A second `save → load` cycle must be a fixed point.
+    ///
+    /// Special-typed entries disappear (PNA format has no on-disk
+    /// kind for them); the property asserts the inverse explicitly.
+    /// Hardlinked siblings observe the same metadata and the source
+    /// inode's `nlink` reflects every successful placement.
     #[test]
-    fn save_load_roundtrip_preserves_tree(root in arb_root_children()) {
+    fn save_load_roundtrip_preserves_tree(input in arb_test_input()) {
         let dir = tempfile::TempDir::new().unwrap();
         let archive = dir.path().join("rt.pna");
 
-        build_and_save(&archive, &root).unwrap();
+        let placed_links = build_and_save(&archive, &input).unwrap();
         let after_first_load = archive_io::load(&archive, None).unwrap();
         let snap_first = snapshot(&after_first_load);
 
@@ -326,8 +564,42 @@ proptest! {
 
         prop_assert_eq!(&snap_first, &snap_second, "second round-trip drifted");
 
-        // Spot-check the generated specs survived intact.
-        check_root(&snap_first, &root)?;
+        // Count successfully-placed hardlinks per source path so
+        // every File leaf can be checked against `nlink == 1 + extra`
+        // — including those with zero links, where a load-time
+        // regression that defaulted nlink to 0 would otherwise pass
+        // silently.
+        let mut extra_links_per_source: BTreeMap<String, usize> = BTreeMap::new();
+        for (src, _dst) in &placed_links {
+            *extra_links_per_source.entry(src.clone()).or_insert(0) += 1;
+        }
+
+        // Persistent specs (File / Dir / Symlink) survived intact.
+        check_root(&snap_first, &input.root, &extra_links_per_source)?;
+
+        // Special spec entries: PNA cannot persist these, so the save
+        // path drops them with a logged warning. Assert they are
+        // absent post-load.
+        check_special_absences(&snap_first, &input.root)?;
+
+        // Hardlinks: at every placed destination, the observed node
+        // must be byte-equal to the observed node at the source path.
+        // `prop_assert_eq!(src_obs, dst_obs)` exercises the full
+        // `ObservedNode` `PartialEq`, which compares
+        // kind / perm / uid / gid / nlink / size / blksize / xattrs —
+        // any field that drifts between the two views of the same
+        // inode lights up here.
+        for (src, dst) in &placed_links {
+            let src_obs = snap_first.get(src)
+                .ok_or_else(|| TestCaseError::fail(format!("hardlink source missing: {src}")))?;
+            let dst_obs = snap_first.get(dst)
+                .ok_or_else(|| TestCaseError::fail(format!("hardlink dest missing: {dst}")))?;
+            prop_assert_eq!(
+                src_obs, dst_obs,
+                "hardlink content/metadata mismatch between {} and {}",
+                src, dst
+            );
+        }
 
         // POSIX nlink invariant for every directory in the snapshot,
         // including the root.
@@ -354,11 +626,11 @@ proptest! {
     /// check above can't catch e.g. xattr or chunk ordering drift if
     /// it doesn't change the AST. Byte equality does.
     #[test]
-    fn plain_save_is_byte_identical_when_replayed(root in arb_root_children()) {
+    fn plain_save_is_byte_identical_when_replayed(input in arb_test_input()) {
         let dir = tempfile::TempDir::new().unwrap();
         let archive = dir.path().join("byte.pna");
 
-        build_and_save(&archive, &root).unwrap();
+        build_and_save(&archive, &input).unwrap();
         let bytes_first = std::fs::read(&archive).unwrap();
 
         let mut tree = archive_io::load(&archive, None).unwrap();
@@ -401,9 +673,10 @@ fn count_immediate_subdirs(snap: &BTreeMap<String, ObservedNode>, path: &str) ->
 fn check_root(
     snap: &BTreeMap<String, ObservedNode>,
     root: &BTreeMap<String, NodeSpec>,
+    extra_links_per_source: &BTreeMap<String, usize>,
 ) -> Result<(), TestCaseError> {
     for (name, spec) in root {
-        check_node(snap, name, spec)?;
+        check_node(snap, name, spec, extra_links_per_source)?;
     }
     Ok(())
 }
@@ -412,13 +685,15 @@ fn check_node(
     snap: &BTreeMap<String, ObservedNode>,
     path: &str,
     spec: &NodeSpec,
+    extra_links_per_source: &BTreeMap<String, usize>,
 ) -> Result<(), TestCaseError> {
+    // Special entries are checked separately by `check_special_absences`.
+    if matches!(spec, NodeSpec::Special { .. }) {
+        return Ok(());
+    }
     let observed = snap
         .get(path)
         .ok_or_else(|| TestCaseError::fail(format!("missing path {path:?}")))?;
-    // Every node carries the constructor-default blocksize. Any load
-    // path that defaulted this to 0 (e.g. on a future format change)
-    // would surface here.
     prop_assert_eq!(observed.blksize, 512, "blksize drift at {}", path);
     match spec {
         NodeSpec::File { meta, content } => {
@@ -436,7 +711,65 @@ fn check_node(
                 observed.size,
                 content.len(),
             );
+            // Every File starts with `nlink = 1`. Each hardlink that
+            // successfully placed and points at this path adds one.
+            // A leaf File untouched by any hardlink must observe
+            // exactly `nlink == 1`; without this assertion a
+            // regression that defaulted `nlink` to 0 on load would
+            // pass silently for the common case (no hardlinks).
+            let extra = extra_links_per_source.get(path).copied().unwrap_or(0);
+            prop_assert_eq!(
+                observed.nlink as usize,
+                1 + extra,
+                "File {} has nlink {} but {} hardlink(s) placed",
+                path,
+                observed.nlink,
+                extra
+            );
             check_meta(observed, meta, path)?;
+        }
+        NodeSpec::Symlink { meta, target } => {
+            match &observed.kind {
+                Observed::Symlink { target: t } => {
+                    prop_assert_eq!(t, target, "symlink target mismatch at {}", path);
+                }
+                other => prop_assert!(false, "expected Symlink at {:?}, got {:?}", path, other),
+            }
+            // Symlinks always carry perm `0o777` regardless of what the
+            // caller passed: `file_tree::FileTree::create_symlink`
+            // (file_tree.rs:1184-1211) hardcodes the mode to match
+            // POSIX, where `chmod` on a symlink itself is a no-op —
+            // the bits never matter to the kernel. Pin the contract
+            // here so a regression that started honouring the caller's
+            // perm would surface. If `create_symlink`'s mode handling
+            // ever changes, this expectation and the file_tree side
+            // must move together.
+            prop_assert_eq!(
+                observed.perm,
+                0o777,
+                "symlink at {} should have perm 0o777, got {:o}",
+                path,
+                observed.perm
+            );
+            prop_assert_eq!(observed.uid, meta.uid, "symlink uid mismatch at {}", path);
+            prop_assert_eq!(observed.gid, meta.gid, "symlink gid mismatch at {}", path);
+            prop_assert_eq!(
+                &observed.xattrs,
+                &meta.xattrs,
+                "symlink xattrs drift at {}",
+                path
+            );
+            // Hardlinks-to-symlinks are not supported by the FS API
+            // pnafs exposes (`create_hardlink` rejects directories
+            // and only accepts a source inode that is a regular
+            // file), so a symlink's nlink is always 1.
+            prop_assert_eq!(
+                observed.nlink,
+                1,
+                "symlink {} has nlink {}, expected 1",
+                path,
+                observed.nlink
+            );
         }
         NodeSpec::Dir { meta, children } => {
             prop_assert!(
@@ -452,11 +785,58 @@ fn check_node(
                 } else {
                     format!("{path}/{cn}")
                 };
-                check_node(snap, &child_path, cs)?;
+                check_node(snap, &child_path, cs, extra_links_per_source)?;
             }
         }
+        NodeSpec::Special { .. } => unreachable!("filtered above"),
     }
     Ok(())
+}
+
+/// Walk the spec tree; for every Special node, assert it does NOT
+/// appear in the snapshot — the PNA save path drops it deliberately.
+///
+/// **Maintenance**: if PNA ever grows an on-disk `DataKind` for
+/// special files (see `archive_io::save`'s `FsContent::Special`
+/// branch and the forward-compatibility note on
+/// `file_tree::FileTree::create_special`), this inverse property
+/// must flip to a *presence* check — call into `check_node` for
+/// Special variants and add `Observed::Special { kind, rdev }`
+/// equality there. The current absence assertion is correct only
+/// while PNA cannot persist these nodes.
+fn check_special_absences(
+    snap: &BTreeMap<String, ObservedNode>,
+    root: &BTreeMap<String, NodeSpec>,
+) -> Result<(), TestCaseError> {
+    fn walk(
+        snap: &BTreeMap<String, ObservedNode>,
+        prefix: &str,
+        spec: &BTreeMap<String, NodeSpec>,
+    ) -> Result<(), TestCaseError> {
+        for (name, node) in spec {
+            let p = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            match node {
+                NodeSpec::Special { .. } => {
+                    prop_assert!(
+                        !snap.contains_key(&p),
+                        "Special at {:?} should have been dropped on save but is present \
+                         (PNA format has no DataKind for special files)",
+                        p
+                    );
+                }
+                NodeSpec::Dir { children, .. } => {
+                    walk(snap, &p, children)?;
+                }
+                NodeSpec::File { .. } | NodeSpec::Symlink { .. } => {}
+            }
+        }
+        Ok(())
+    }
+    walk(snap, "", root)
 }
 
 fn check_meta(observed: &ObservedNode, meta: &NodeMeta, path: &str) -> Result<(), TestCaseError> {
