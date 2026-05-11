@@ -10,6 +10,7 @@ be verified through an actual mount point.
 ./scripts/tests/test_pjdfstest.sh       # POSIX conformance via pjdfstest
 ./scripts/tests/test_fsx.sh             # randomised I/O via fsx-rs
 ./scripts/tests/test_fsstress.sh        # multi-process stress via fsstress
+./scripts/tests/proptest_sweep.sh       # heavy proptest sweep (no FUSE)
 ```
 
 Each external tool is cloned into `target/<tool>/` on first run
@@ -95,3 +96,14 @@ semantics, and leaving mknod on here only floods the output.
 Reproducible with `FSSTRESS_SEED=<n>`.
 
 [3]: https://github.com/billziss-gh/secfs.test
+
+## `proptest_sweep.sh` — heavy proptest sweep
+
+The in-tree default for the round-trip property tests in
+`src/roundtrip_proptest.rs` is 64 cases per property — fast enough for
+the `cargo test` iteration loop. Before a release or when touching
+`archive_io.rs` / `file_tree.rs` / `roundtrip_proptest.rs`, run this
+script to widen the sample. Defaults to `PROPTEST_CASES=100000`;
+override via env. The `FILTER` env scopes the run (e.g. `FILTER=plain`
+to skip the slower encrypted block). The script does not need FUSE —
+all proptest cases drive `FileTree` directly.

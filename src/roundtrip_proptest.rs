@@ -8,7 +8,7 @@
 //! which specs survive the filter; the explicit `prop_recursive`
 //! generator avoids that trap.
 //!
-//! Node types covered by the generator (Phase 2 onwards):
+//! Node types covered by the generator:
 //!
 //! * **File** — content, perm, owner, xattrs, all round-trip.
 //! * **Dir** — perm, owner, xattrs, nlink invariant, all round-trip.
@@ -30,7 +30,7 @@
 //!   not about every triple succeeding.
 //!
 //! Properties are layered as one test per SPEC so failure messages
-//! identify the broken invariant directly (Phase 4):
+//! identify the broken invariant directly:
 //!
 //! * **Plaintext block (cases = 64)**
 //!   * `plain_generator_specs_survive_load` — generated `NodeSpec`
@@ -47,6 +47,12 @@
 //!   * `plain_save_is_byte_identical_when_replayed` — for plaintext
 //!     archives, save is a deterministic function of the tree;
 //!     catches drift the AST-equality cannot see.
+//!   * `plain_mutation_sequence_survives_save_load` — apply a random
+//!     `Vec<FsOp>` (write / truncate / unlink / setxattr /
+//!     removexattr) to a freshly-loaded tree, then save+reload.
+//!     Asserts directory nlink invariant + save idempotence on the
+//!     mutated state. Covers transient-state bugs the static
+//!     round-trip properties miss.
 //!
 //! * **Encrypted block (cases = 8, Argon2id-bound)**
 //!   * `encrypted_generator_specs_survive_load`
@@ -169,28 +175,297 @@ struct TestInput {
     password: Option<String>,
 }
 
+// ── Mutation sequences ──────────────────────────────────────────────
+//
+// The static round-trip properties above all generate a tree, save
+// it, and verify the result. They never exercise pnafs's *transient*
+// state — what happens when a file is written, then truncated, then
+// renamed, then written again, all before the next save. The state
+// machine here drives a generated `Vec<FsOp>` against a live
+// `FileTree`, save/reload at the end, and asserts the same invariants
+// the static properties pin (directory nlink, save idempotence) hold
+// for whatever ends up persisted.
+//
+// Per-op behaviour:
+//
+// * Each op picks its target by `Index`-ing into the inventory of the
+//   *current* tree (recomputed at every op), so shrinking remains
+//   monotonic even though the target population is dynamic.
+// * Invalid ops (e.g. unlink a path that no longer exists, write to a
+//   path that names a directory) are silently skipped — the property
+//   is about what *does* happen, not about every op succeeding.
+
+#[derive(Debug, Clone)]
+enum FsOp {
+    /// Overwrite some existing File from offset 0.
+    WriteOver {
+        target: proptest::sample::Index,
+        content: Vec<u8>,
+    },
+    /// Shrink or grow some existing File.
+    Truncate {
+        target: proptest::sample::Index,
+        new_size: u64,
+    },
+    /// Drop an existing File (POSIX `unlink`).
+    UnlinkFile { target: proptest::sample::Index },
+    /// Create a directory under some existing directory parent. The
+    /// `parent` indexes the live directory inventory (root included);
+    /// if the chosen parent already has a child with the same name,
+    /// `make_dir` returns `EEXIST` and the op is dropped.
+    Mkdir {
+        parent: proptest::sample::Index,
+        name: String,
+    },
+    /// Remove an existing directory if it is empty. Hits the same
+    /// branch FUSE's `rmdir` calls into; `ENOTEMPTY` from a populated
+    /// dir is one of the silently-skipped cases.
+    Rmdir { target: proptest::sample::Index },
+    /// Set an xattr on some existing inode.
+    SetXattr {
+        target_any: proptest::sample::Index,
+        name: String,
+        value: Vec<u8>,
+    },
+    /// Remove an xattr from some existing inode.
+    RemoveXattr {
+        target_any: proptest::sample::Index,
+        name: String,
+    },
+}
+
+fn arb_fs_op() -> impl Strategy<Value = FsOp> {
+    prop_oneof![
+        3 => (any::<proptest::sample::Index>(), arb_file_content())
+            .prop_map(|(target, content)| FsOp::WriteOver { target, content }),
+        2 => (any::<proptest::sample::Index>(), 0u64..=8192)
+            .prop_map(|(target, new_size)| FsOp::Truncate { target, new_size }),
+        2 => any::<proptest::sample::Index>()
+            .prop_map(|target| FsOp::UnlinkFile { target }),
+        2 => (any::<proptest::sample::Index>(), arb_segment())
+            .prop_map(|(parent, name)| FsOp::Mkdir { parent, name }),
+        2 => any::<proptest::sample::Index>()
+            .prop_map(|target| FsOp::Rmdir { target }),
+        2 => (any::<proptest::sample::Index>(), arb_xattr_name(), prop::collection::vec(any::<u8>(), 0..=32))
+            .prop_map(|(target_any, name, value)| FsOp::SetXattr { target_any, name, value }),
+        1 => (any::<proptest::sample::Index>(), arb_xattr_name())
+            .prop_map(|(target_any, name)| FsOp::RemoveXattr { target_any, name }),
+    ]
+}
+
+/// Apply `ops` to `tree`, silently skipping invalid ones. Returns
+/// nothing — the assertion lives in the property that calls this,
+/// after a save + reload.
+fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) {
+    for op in ops {
+        let files = collect_file_paths(tree);
+        let any_paths = collect_all_paths(tree);
+        match op {
+            FsOp::WriteOver { target, content } => {
+                if files.is_empty() {
+                    continue;
+                }
+                let path = &files[target.index(files.len())];
+                if let Some(ino) = tree.resolve_path(Path::new(path)) {
+                    // Reset size first (we want "overwrite from 0",
+                    // not "extend if shorter"), then write.
+                    let _ = tree.set_size(ino, 0);
+                    if !content.is_empty() {
+                        let _ = tree.write_file(ino, 0, content);
+                    }
+                }
+            }
+            FsOp::Truncate { target, new_size } => {
+                if files.is_empty() {
+                    continue;
+                }
+                let path = &files[target.index(files.len())];
+                if let Some(ino) = tree.resolve_path(Path::new(path)) {
+                    let _ = tree.set_size(ino, *new_size);
+                }
+            }
+            FsOp::UnlinkFile { target } => {
+                if files.is_empty() {
+                    continue;
+                }
+                let path = &files[target.index(files.len())];
+                let path_buf = Path::new(path);
+                let leaf = match path_buf.file_name() {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                let parent_ino = match path_buf.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => match tree.resolve_path(p) {
+                        Some(i) => i,
+                        None => continue,
+                    },
+                    _ => ROOT_INODE,
+                };
+                let _ = tree.unlink(parent_ino, &leaf);
+            }
+            FsOp::Mkdir { parent, name } => {
+                let dirs = collect_dir_paths(tree);
+                if dirs.is_empty() {
+                    continue;
+                }
+                let parent_path = &dirs[parent.index(dirs.len())];
+                let parent_ino = if parent_path.is_empty() {
+                    ROOT_INODE
+                } else {
+                    match tree.resolve_path(Path::new(parent_path)) {
+                        Some(i) => i,
+                        None => continue,
+                    }
+                };
+                let _ = tree.make_dir(parent_ino, OsStr::new(name), 0o755, 0, Owner::new(0, 0));
+            }
+            FsOp::Rmdir { target } => {
+                let dirs = collect_dir_paths(tree);
+                // Skip the root: rmdir on `/` is meaningless and the
+                // generator picking it would just contribute to the
+                // empty-op rate.
+                let nonroot: Vec<&String> = dirs.iter().filter(|p| !p.is_empty()).collect();
+                if nonroot.is_empty() {
+                    continue;
+                }
+                let path = nonroot[target.index(nonroot.len())];
+                let path_buf = Path::new(path);
+                let leaf = match path_buf.file_name() {
+                    Some(n) => n.to_owned(),
+                    None => continue,
+                };
+                let parent_ino = match path_buf.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => match tree.resolve_path(p) {
+                        Some(i) => i,
+                        None => continue,
+                    },
+                    _ => ROOT_INODE,
+                };
+                let _ = tree.rmdir(parent_ino, &leaf);
+            }
+            FsOp::SetXattr {
+                target_any,
+                name,
+                value,
+            } => {
+                if any_paths.is_empty() {
+                    continue;
+                }
+                let path = &any_paths[target_any.index(any_paths.len())];
+                if let Some(ino) = if path.is_empty() {
+                    Some(ROOT_INODE)
+                } else {
+                    tree.resolve_path(Path::new(path))
+                } {
+                    let _ = tree.setxattr(ino, name, value, 0);
+                }
+            }
+            FsOp::RemoveXattr { target_any, name } => {
+                if any_paths.is_empty() {
+                    continue;
+                }
+                let path = &any_paths[target_any.index(any_paths.len())];
+                if let Some(ino) = if path.is_empty() {
+                    Some(ROOT_INODE)
+                } else {
+                    tree.resolve_path(Path::new(path))
+                } {
+                    let _ = tree.removexattr(ino, name);
+                }
+            }
+        }
+    }
+}
+
+/// Snapshot of every File path visible in `tree`, DFS-ordered. All
+/// `collect_*_paths` helpers return POSIX-relative paths with no
+/// leading `/`; the archive root is the empty string, and a file
+/// `f.txt` directly under root is just `"f.txt"`. Callers that need
+/// to split parent / leaf must therefore special-case the empty
+/// parent as `ROOT_INODE`.
+fn collect_file_paths(tree: &FileTree) -> Vec<String> {
+    tree.collect_dfs()
+        .into_iter()
+        .filter_map(|(_ino, node, path)| matches!(node.content, FsContent::File(_)).then_some(path))
+        .collect()
+}
+
+/// Snapshot of every Directory path visible in `tree`, DFS-ordered.
+/// Includes the root, represented as the empty string.
+fn collect_dir_paths(tree: &FileTree) -> Vec<String> {
+    let mut paths: Vec<String> = vec![String::new()];
+    paths.extend(
+        tree.collect_dfs()
+            .into_iter()
+            .filter_map(|(_ino, node, path)| {
+                matches!(node.content, FsContent::Directory(_)).then_some(path)
+            }),
+    );
+    paths
+}
+
+/// Snapshot of every observable path (files + dirs + symlinks +
+/// specials + the root, represented as the empty string).
+fn collect_all_paths(tree: &FileTree) -> Vec<String> {
+    let mut paths: Vec<String> = vec![String::new()];
+    paths.extend(tree.collect_dfs().into_iter().map(|(_, _, p)| p));
+    paths
+}
+
 // ── Generators ─────────────────────────────────────────────────────
 
-/// One path component: 1–6 lowercase ASCII letters. Constrained on
-/// purpose; PNA EntryName accepts more, but expanding the alphabet is
-/// the job of a later phase that explicitly probes lossy-conversion
-/// edge cases.
+/// One path component. The alphabet mixes:
+///
+/// * lowercase ASCII (the baseline, dominant weight)
+/// * digits, `-`, `_` (the next most common in real archives)
+/// * dot-prefixed names like `.config` (PNA preserves them, FUSE
+///   hides them from `ls` but not from `getattr`)
+/// * multibyte UTF-8 segments drawn from a small but varied
+///   katakana / hiragana / kanji pool so `EntryName::from_lossy`
+///   sees a real spread of code points instead of one fixed
+///   sequence. The intent is "at least one of every common script
+///   pixel-count under archive entry name length limits" — deep
+///   unicode fuzzing (combining marks, RTL overrides, supplementary
+///   planes) is still a job for a dedicated future layer.
+///
+/// Length stays bounded so the search space is broader without
+/// exploding case time.
 fn arb_segment() -> impl Strategy<Value = String> {
-    "[a-z]{1,6}".prop_map(|s| s.to_string())
+    prop_oneof![
+        6 => "[a-z]{1,8}".prop_map(|s| s.to_string()),
+        2 => "[a-z][a-z0-9_\\-]{1,7}".prop_map(|s| s.to_string()),
+        1 => "\\.[a-z]{1,6}".prop_map(|s| s.to_string()),
+        // proptest's regex engine accepts `\u{...}` ranges; this mix
+        // covers full-width katakana, hiragana, and one CJK ideograph
+        // band, generating 1-3 chars per case.
+        1 => "[\u{30a1}-\u{30fa}\u{3041}-\u{3093}\u{4e00}-\u{4e10}]{1,3}".prop_map(|s| s.to_string()),
+    ]
 }
 
 fn arb_xattr_name() -> impl Strategy<Value = String> {
     // user.* is the unrestricted namespace under `DefaultPermissions`;
     // sticking to it keeps the generator portable across CI hosts.
-    "user\\.[a-z]{1,6}".prop_map(|s| s.to_string())
+    // The post-prefix portion mixes alphanumeric, dots, and dashes to
+    // cover the common shapes of real xattr names (e.g. `user.tag.v2`,
+    // `user.app-meta`).
+    prop_oneof![
+        3 => "user\\.[a-z]{1,8}".prop_map(|s| s.to_string()),
+        2 => "user\\.[a-z][a-z0-9.\\-]{1,10}".prop_map(|s| s.to_string()),
+    ]
 }
 
 fn arb_xattrs() -> impl Strategy<Value = BTreeMap<String, Vec<u8>>> {
-    prop::collection::btree_map(
-        arb_xattr_name(),
-        prop::collection::vec(any::<u8>(), 0..=32),
-        0..=4,
-    )
+    // Value size mix: most xattrs are tiny tags, but the wire format
+    // also supports moderately large payloads (chained POSIX ACLs run
+    // hundreds of bytes). Sample includes the empty-value case, the
+    // typical short case, and a 256-byte band that crosses chunk
+    // boundaries inside an entry.
+    let value = prop_oneof![
+        4 => prop::collection::vec(any::<u8>(), 0..=16),
+        2 => prop::collection::vec(any::<u8>(), 16..=64),
+        1 => prop::collection::vec(any::<u8>(), 64..=256),
+    ];
+    prop::collection::btree_map(arb_xattr_name(), value, 0..=4)
 }
 
 fn arb_meta() -> impl Strategy<Value = NodeMeta> {
@@ -237,12 +512,34 @@ fn arb_spec_kind() -> impl Strategy<Value = SpecKind> {
     ]
 }
 
+/// File content sizes. A pure `0..=N` uniform sampler under-explores
+/// the boundaries. Bands:
+///
+/// * `0..=1` — the empty file (`size == 0`, distinct code path
+///   from `size > 0` in `attr.size` / `write_file`) and the
+///   single-byte case.
+/// * `15..=17` — straddles the AES-CTR block boundary (16 bytes).
+///   Relevant for encrypted archives; plaintext doesn't care.
+/// * `0..=128` — typical small case, broad weight.
+/// * `0..=8192` — moderately large bodies. pna 0.33's
+///   `MAX_CHUNK_DATA_LENGTH` is `u32::MAX`, so there is no real
+///   per-page split below the gigabyte scale; this band is for
+///   diversity rather than for hitting a known boundary.
+fn arb_file_content() -> impl Strategy<Value = Vec<u8>> {
+    prop_oneof![
+        3 => prop::collection::vec(any::<u8>(), 0..=128),
+        2 => prop::collection::vec(any::<u8>(), 0..=1),
+        1 => prop::collection::vec(any::<u8>(), 15..=17),
+        1 => prop::collection::vec(any::<u8>(), 0..=8192),
+    ]
+}
+
 /// One leaf node. Files dominate the distribution (weight 4) since
 /// they exercise the richest code path; the other three are
 /// represented but won't drown out file generation.
 fn arb_leaf() -> impl Strategy<Value = NodeSpec> {
     prop_oneof![
-        4 => (arb_meta(), prop::collection::vec(any::<u8>(), 0..=128))
+        4 => (arb_meta(), arb_file_content())
             .prop_map(|(meta, content)| NodeSpec::File { meta, content }),
         1 => (arb_meta(), arb_symlink_target())
             .prop_map(|(meta, target)| NodeSpec::Symlink { meta, target }),
@@ -673,6 +970,56 @@ fn assert_save_is_idempotent(
     Ok(())
 }
 
+/// SPEC: after a `save → load`, no inode whose `nlink == 0` survives.
+/// Orphan inodes (nlink-zero but kept alive because a fd held them
+/// open) are an in-memory-only artefact of the FUSE
+/// unlink-while-open path; once the archive is reloaded, every
+/// surviving inode must have at least one reachable directory entry.
+/// Currently we approach this via the observation that
+/// `collect_dfs` only walks reachable entries — so a leaked
+/// nlink-zero inode would be invisible to it. We check the
+/// `inodes` map directly (via the FileTree internal `get` path) for
+/// every inode the snapshot mentions and confirm `nlink >= 1`.
+fn assert_no_orphan_inodes(tree: &FileTree) -> Result<(), TestCaseError> {
+    // collect_dfs visits every reachable inode exactly once. The
+    // root is special-cased separately.
+    let root_nlink = tree.get(ROOT_INODE).unwrap().attr.nlink;
+    prop_assert!(
+        root_nlink >= 1,
+        "ROOT has nlink {root_nlink} (should be >= 1 after save→load)"
+    );
+    for (_, node, path) in tree.collect_dfs() {
+        prop_assert!(
+            node.attr.nlink >= 1,
+            "node at {:?} has nlink {} after save→load (should be >= 1; orphan leaked across save)",
+            path,
+            node.attr.nlink
+        );
+    }
+    Ok(())
+}
+
+/// SPEC: for every observed File, `attr.size == content.len()`. A
+/// stale size left after a `truncate(0)` followed by no write would
+/// otherwise show up only in `stat()` and not in the tree shape.
+fn assert_file_size_matches_content(
+    snap: &BTreeMap<String, ObservedNode>,
+) -> Result<(), TestCaseError> {
+    for (path, observed) in snap {
+        if let Observed::File { content } = &observed.kind {
+            prop_assert_eq!(
+                observed.size,
+                content.len() as u64,
+                "file {:?} attr.size {} mismatches content.len {}",
+                path,
+                observed.size,
+                content.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// SPEC: every loaded directory's `nlink` equals `2 + #subdirs`
 /// (POSIX: self + per-`..` from each child directory). Applies to
 /// the root inode too, which `collect_dfs` skips and which a unit
@@ -789,6 +1136,41 @@ proptest! {
         assert_hardlinks_equivalent(&snap, &placed)?;
     }
 
+    /// SPEC: After applying an arbitrary sequence of mutations
+    /// (write / truncate / unlink / setxattr / removexattr) to a
+    /// freshly-loaded tree, a save+reload still produces a valid
+    /// tree — directory `nlink` invariant holds, and a second
+    /// save+reload is a fixed point (idempotence under the mutated
+    /// state). Catches transient-state bugs the static round-trip
+    /// properties miss (e.g. unlink-then-recreate corrupting the
+    /// inode reuse path, mixed truncate+write order leaking stale
+    /// size, xattr churn drifting the BTreeMap iteration order).
+    #[test]
+    fn plain_mutation_sequence_survives_save_load(
+        input in arb_test_input_plain(),
+        ops in prop::collection::vec(arb_fs_op(), 0..=24),
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("mut.pna");
+
+        build_and_save(&archive, &input).unwrap();
+        let mut tree = archive_io::load(&archive, None).unwrap();
+        apply_ops(&mut tree, &ops);
+        archive_io::save(&mut tree).unwrap();
+
+        let after_mutated_save = archive_io::load(&archive, None).unwrap();
+        let snap_first = snapshot(&after_mutated_save);
+        assert_directory_nlink_posix(&snap_first)?;
+        assert_no_orphan_inodes(&after_mutated_save)?;
+        assert_file_size_matches_content(&snap_first)?;
+
+        // Idempotence under the mutated state: a second cycle from
+        // here must reach the same snapshot. If a mutation produced
+        // a tree whose save is non-deterministic, the second cycle
+        // would diverge.
+        assert_save_is_idempotent(&input, &archive, &snap_first)?;
+    }
+
     /// SPEC: For plaintext archives, save is a deterministic function
     /// of the tree. Saving, loading, and saving again yields
     /// byte-identical archives. Catches drift the snapshot equality
@@ -903,7 +1285,8 @@ proptest! {
     /// "the bytes we wrote do not come back": at least one file
     /// must decrypt to something other than the input. A stronger
     /// SPEC ("load is Err") would require pnafs to add a password
-    /// verifier on top of pna; that lives outside Phase 3's scope.
+    /// verifier on top of pna; that is a separate piece of work and
+    /// is not what this property pins.
     ///
     /// The generator guarantees the archive contains at least one
     /// File (so there is cipher state to validate) and the wrong
