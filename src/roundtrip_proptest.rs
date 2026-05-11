@@ -2,11 +2,14 @@
 //!
 //! Each property generates a tree **constructively** — directories carry
 //! their own children — so proptest's shrinker walks the same tree
-//! structure the assertion sees. Post-hoc filters (the old pattern of
-//! generating a flat path list and discarding conflicts) make minimal
-//! counter-examples lie, because shrinking by element removal changes
-//! which specs survive the filter; the explicit `prop_recursive`
-//! generator avoids that trap.
+//! structure the assertion sees. An alternative design that emits a
+//! flat path list and post-filters out conflicts (duplicate paths,
+//! parent / child collisions) makes the shrinker lie: removing one
+//! element from the list can change which neighbouring elements
+//! survive the filter, so the "minimal" counter-example proptest
+//! reports is rarely the true minimum. The constructive
+//! `prop_recursive` generator below avoids that trap by making the
+//! tree shape the unit of generation and shrinkage.
 //!
 //! Node types covered by the generator:
 //!
@@ -422,11 +425,10 @@ fn collect_all_paths(tree: &FileTree) -> Vec<String> {
 ///   hides them from `ls` but not from `getattr`)
 /// * multibyte UTF-8 segments drawn from a small but varied
 ///   katakana / hiragana / kanji pool so `EntryName::from_lossy`
-///   sees a real spread of code points instead of one fixed
-///   sequence. The intent is "at least one of every common script
-///   pixel-count under archive entry name length limits" — deep
-///   unicode fuzzing (combining marks, RTL overrides, supplementary
-///   planes) is still a job for a dedicated future layer.
+///   sees a real spread of code points. Deep unicode fuzzing
+///   (combining marks, RTL overrides, supplementary planes) is out
+///   of scope here — a dedicated fuzzer is the right tool for that
+///   territory.
 ///
 /// Length stays bounded so the search space is broader without
 /// exploding case time.
@@ -910,9 +912,10 @@ enum Observed {
 // ── Properties ─────────────────────────────────────────────────────
 //
 // One property per invariant. Failure messages name the SPEC that
-// broke; a single combined property would print the same outer test
-// name for every kind of regression, which made the previous
-// versions of this test painful to triage.
+// broke; bundling multiple invariants into a single property would
+// print the same generic test name for every kind of regression and
+// force the reader to open the test source to see what actually
+// failed.
 //
 // Several helpers cache the result of `build_and_save` plus one
 // reload so each property doesn't replay the costly part of the
@@ -1101,8 +1104,10 @@ proptest! {
 
     /// SPEC: For plaintext archives, every loaded directory satisfies
     /// the POSIX `nlink = 2 + #subdirs` invariant — including the
-    /// root, which `collect_dfs` does not emit. A regression to
-    /// `nlink: 1` (the original load-path bug) would show up here.
+    /// root, which `collect_dfs` does not emit. A load path that
+    /// defaulted every directory's `nlink` to 1 (a class of bug that
+    /// is easy to introduce when each `FsNode` is constructed
+    /// independently of its surrounding tree) would show up here.
     #[test]
     fn plain_loaded_directories_have_posix_nlink(input in arb_test_input_plain()) {
         let dir = tempfile::TempDir::new().unwrap();

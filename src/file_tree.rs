@@ -2388,13 +2388,16 @@ mod tests {
 
     #[test]
     fn rename_replacing_dir_with_dir_keeps_parent_nlink_correct() {
-        // Reproducer for the parent-nlink leak the adversarial review
-        // flagged: the dest-existing branch of rename calls drop_link on
-        // the destination's inode, which decrements the *child's* nlink,
+        // Reproducer for a subtle parent-nlink invariant in rename:
+        // the dest-existing branch calls `drop_link` on the
+        // destination's inode, which decrements the *child's* nlink,
         // but the parent dir's nlink (which counts ".." backrefs from
-        // each child dir) was never adjusted. Replacing dir-with-dir
-        // should leave the parent's nlink unchanged because the child
-        // count stays the same.
+        // each child dir) must also be adjusted in step. Replacing
+        // dir-with-dir under the same parent leaves the child count
+        // unchanged, so the parent's nlink must stay where it was.
+        // A naive implementation that only handles the child side
+        // leaks a `+1` into the parent on every dir-replacing-dir
+        // rename.
         let mut tree = make_tree();
         // Setup: /a (subdir), /b (empty subdir to be the rename target).
         let a_ino = tree
