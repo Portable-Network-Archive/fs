@@ -31,15 +31,21 @@ file close). Plain and encrypted archive variants are covered.
 
 ## `test_pjdfstest.sh` — POSIX conformance
 
-Runs the Rust port of [pjdfstest][1] against the mount. Of the 398
-tests in the suite, **382 pass and 16 are skipped** on Linux — every
-test that runs passes; the skipped ones need pjdfstest's `chflags`
-(BSD-only flag), NFSv4 ACLs, or `allow_remount` opt-ins to even be
-attempted. `allow_remount` in particular cannot be honoured because
-the kernel FUSE driver has no `reconfigure` op, so an in-place
-`mount -o remount,ro` of any FUSE filesystem fails before the request
-reaches user space. `pjdfstest.toml` is the live spec for what must
-pass; pjdfstest's `[features]` toggles for capabilities pnafs supports
+Runs the Rust port of [pjdfstest][1] against the mount. Every test
+pjdfstest runs against pnafs on Linux currently passes; the only
+tests that don't run are the ones gated on capabilities the platform
+or the format does not provide:
+
+* `chflags` — a BSD-only inode-flags syscall pjdfstest probes via
+  its `chflags` opt-in feature.
+* NFSv4 ACLs — gated on pjdfstest's `nfsv4_acls` opt-in.
+* `allow_remount` — pjdfstest exercises read-only-mount semantics by
+  calling `mount -o remount,ro <mountpoint>`. The kernel FUSE driver
+  has no `reconfigure` op, so an in-place remount of any FUSE
+  filesystem fails before the request reaches user space.
+
+`pjdfstest.toml` is the live spec for what must pass; pjdfstest's
+`[features]` toggles for the capabilities pnafs supports
 (`posix_fallocate`, `rename_ctime`, `utimensat`, `utime_now`,
 `stat_st_birthtime`) are enabled there.
 

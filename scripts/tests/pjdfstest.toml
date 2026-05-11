@@ -32,9 +32,12 @@ naptime = 1.0
 # Until either gap moves upstream, EROFS tests stay off.
 allow_remount = false
 
-# All POSIX-conformance tests pass on Linux. The 48 skipped tests need
-# allow_remount or features pnafs hasn't opted into yet — they aren't
-# failures.
+# All POSIX-conformance tests that run on Linux pass against pnafs.
+# Any test pjdfstest skips falls into one of three structural buckets:
+# `allow_remount` (FUSE has no in-place reconfigure op), `chflags`
+# (BSD-only inode flags), or NFSv4 ACLs. None of those are pnafs
+# bugs, and none should appear here. A non-empty `expected_failures`
+# list hides regressions, so it ships empty.
 expected_failures = []
 
 # pjdfstest requires three resolvable system users at startup, even in

@@ -18,10 +18,11 @@ use std::{fs, io};
 /// Remove any leftover `.{stem}.tmp.{pid}` files next to `archive_path`.
 /// Threshold beyond which a `.archive.tmp.<pid>` file is considered
 /// abandoned regardless of whether some process still holds that PID.
-/// Linux recycles PIDs, so the original kill-zero check has a long-tail
-/// false-positive that would keep stale tmp files indefinitely. Anything
-/// older than this almost certainly belongs to a previous mount that's
-/// since died.
+/// Linux recycles PIDs, so a pure `kill(pid, 0)` liveness check has a
+/// long-tail false-positive: another, unrelated process can re-use the
+/// PID of the writer that crashed, and the tmp file would survive
+/// indefinitely. Anything older than this threshold almost certainly
+/// belongs to a previous mount that has since died.
 const STALE_TMP_AGE: Duration = Duration::from_secs(60 * 60); // 1h
 
 pub(crate) fn cleanup_stale_tmp(archive_path: &Path) {
@@ -909,15 +910,19 @@ mod tests {
     }
 
     /// Save must be a deterministic function of the tree: two saves of
-    /// the same plaintext tree produce byte-identical archives. Without
-    /// the ordered-map xattr storage, `HashMap` iteration order varied
-    /// across separately-built trees and the second save would emit a
-    /// different chunk sequence, observable only at the byte level. The
-    /// property test (`plain_save_is_byte_identical_when_replayed`)
-    /// surfaced this; this case pins the contract with two xattrs
+    /// the same plaintext tree must produce byte-identical archives.
+    /// `FsNode.xattrs` is therefore an ordered map (`BTreeMap`) rather
+    /// than `HashMap` — `HashMap`'s `RandomState`-hashed iteration
+    /// order is run-to-run unspecified, so two separately-built
+    /// `FsNode` instances would emit chunks in different orders and
+    /// produce byte-different archives even though their observable
+    /// state matched. This case pins the contract using two xattrs
     /// whose insertion order is the opposite of their lexicographic
-    /// order, the only configuration where a non-ordered map would
-    /// reveal itself.
+    /// order — the only configuration where a non-ordered backing
+    /// map would visibly drift. The broader property
+    /// `plain_save_is_byte_identical_when_replayed` (in
+    /// `src/roundtrip_proptest.rs`) covers the same invariant over
+    /// randomly-shaped trees.
     #[test]
     fn save_is_byte_deterministic_across_a_no_op_reload() {
         let dir = TempDir::new().unwrap();
