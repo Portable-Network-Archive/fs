@@ -908,6 +908,46 @@ mod tests {
         assert_eq!(plain.get(node.attr.ino.0).unwrap().attr.size, 15);
     }
 
+    /// Save must be a deterministic function of the tree: two saves of
+    /// the same plaintext tree produce byte-identical archives. Without
+    /// the ordered-map xattr storage, `HashMap` iteration order varied
+    /// across separately-built trees and the second save would emit a
+    /// different chunk sequence, observable only at the byte level. The
+    /// property test (`plain_save_is_byte_identical_when_replayed`)
+    /// surfaced this; this case pins the contract with two xattrs
+    /// whose insertion order is the opposite of their lexicographic
+    /// order, the only configuration where a non-ordered map would
+    /// reveal itself.
+    #[test]
+    fn save_is_byte_deterministic_across_a_no_op_reload() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "stable.pna", &[("doc.txt", b"hello")]);
+
+        let mut tree = load(&path, None).unwrap();
+        let (_, node) = tree
+            .children(ROOT_INODE)
+            .unwrap()
+            .find(|(n, _)| n.to_str() == Some("doc.txt"))
+            .unwrap();
+        let ino = node.attr.ino.0;
+        // Insert xattrs whose insertion order is the reverse of their
+        // sort order — the difference would surface as different byte
+        // output if iteration ever became insertion-order-dependent.
+        tree.setxattr(ino, "user.zz", b"late", 0).unwrap();
+        tree.setxattr(ino, "user.aa", b"early", 0).unwrap();
+        save(&mut tree).unwrap();
+        let bytes_first = std::fs::read(&path).unwrap();
+
+        let mut tree2 = load(&path, None).unwrap();
+        save(&mut tree2).unwrap();
+        let bytes_second = std::fs::read(&path).unwrap();
+
+        assert_eq!(
+            bytes_first, bytes_second,
+            "no-op reload-and-save produced byte-different archives"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // save() tests
     // -----------------------------------------------------------------------
