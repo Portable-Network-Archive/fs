@@ -29,19 +29,28 @@
 //!   simply skipped — the property is about what *did* get materialised,
 //!   not about every triple succeeding.
 //!
-//! Properties layered here:
+//! Properties layered here (Phase 3 onwards):
 //!
-//! 1. `save_load_roundtrip_preserves_tree` — every observable field
-//!    (paths, file content, perm, owner uid/gid, xattrs, file size,
-//!    directory nlink) survives `save → load`, and a second cycle is a
-//!    fixed point. Special-typed spec entries are asserted to be
-//!    absent post-load (the PNA-format-limit inverse property).
-//!    Hardlinked siblings observe the same content / perm / owner /
-//!    xattrs and the source's `nlink` reflects every successful link.
+//! * **Plaintext block (cases = 64)**
+//!   * `plain_save_load_roundtrip_preserves_tree` — every observable
+//!     field survives `save → load`, and a second cycle is a fixed
+//!     point. Special-typed entries are asserted absent post-load.
+//!     Hardlinked siblings observe the same metadata.
+//!   * `plain_save_is_byte_identical_when_replayed` — for plaintext
+//!     archives, save is a deterministic function of the tree.
+//!     Catches non-determinism the AST-equality check cannot see.
 //!
-//! 2. `plain_save_is_byte_identical_when_replayed` — saving a tree,
-//!    loading it, and saving again produces byte-identical archives.
-//!    Catches non-determinism the snapshot-equality check cannot see.
+//! * **Encrypted block (cases = 8, Argon2id-bound)**
+//!   * `encrypted_save_load_roundtrip_preserves_tree` — the AST-level
+//!     idempotence the plaintext byte-id property gives, decomposed
+//!     for the encrypted case where every save uses a fresh IV
+//!     (bytes drift but the tree shape stays identical).
+//!   * `encrypted_archive_rejects_wrong_password` — wrong-key load
+//!     either errors out (the ideal) or returns content that does
+//!     not match the input. pna 0.33's AES-CTR has no AEAD/MAC, so
+//!     `Err` is not always produced; the property asserts the
+//!     **observable** contract (no original bytes come back) rather
+//!     than the aspirational one (load fails outright).
 //!
 //! All operations are issued directly against `FileTree` — the
 //! property test does **not** go through FUSE. That avoids needing
@@ -144,6 +153,11 @@ struct HardlinkRef {
 struct TestInput {
     root: BTreeMap<String, NodeSpec>,
     hardlinks: Vec<HardlinkRef>,
+    /// If `Some`, save / load go through PNA's encrypted entry path
+    /// using this password. `None` means plaintext archives.
+    /// Encrypted archives use a random IV per save, so the byte-id
+    /// property is gated on `password.is_none()`.
+    password: Option<String>,
 }
 
 // ── Generators ─────────────────────────────────────────────────────
@@ -274,12 +288,62 @@ fn arb_hardlink_ref() -> impl Strategy<Value = HardlinkRef> {
         })
 }
 
-fn arb_test_input() -> impl Strategy<Value = TestInput> {
+fn arb_password_string() -> impl Strategy<Value = String> {
+    "[a-zA-Z0-9]{4,12}".prop_map(|s| s.to_string())
+}
+
+/// A root-children layout that is guaranteed to contain **at least one
+/// File** somewhere in the tree. Used by encryption-axis properties
+/// that need actual cipher content to assert against — generating
+/// trees with no files and then `prop_assume!`-filtering would burn
+/// the small budget those properties run at.
+fn arb_root_children_with_file() -> impl Strategy<Value = BTreeMap<String, NodeSpec>> {
+    (
+        arb_root_children(),
+        arb_segment(),
+        arb_meta(),
+        prop::collection::vec(any::<u8>(), 0..=128),
+    )
+        .prop_map(|(mut root, sentinel_name, meta, content)| {
+            // Force a uniquely-named File at the root so every
+            // generated tree is guaranteed to materialise at least
+            // one encrypted entry.
+            let key = format!("__file_{sentinel_name}");
+            root.insert(key, NodeSpec::File { meta, content });
+            root
+        })
+}
+
+/// Test inputs that always carry a password and a non-empty file
+/// inventory. The encryption-axis properties rely on both invariants
+/// — built into the generator so the property body is free of
+/// `prop_assume!` and runs every case productively.
+fn arb_test_input_encrypted() -> impl Strategy<Value = TestInput> {
+    (
+        arb_root_children_with_file(),
+        prop::collection::vec(arb_hardlink_ref(), 0..=4),
+        arb_password_string().prop_map(Some),
+    )
+        .prop_map(|(root, hardlinks, password)| TestInput {
+            root,
+            hardlinks,
+            password,
+        })
+}
+
+/// Test inputs that never carry a password. Used by the plaintext
+/// properties (round-trip + byte-identity); encrypted concerns live
+/// in their own block.
+fn arb_test_input_plain() -> impl Strategy<Value = TestInput> {
     (
         arb_root_children(),
         prop::collection::vec(arb_hardlink_ref(), 0..=4),
     )
-        .prop_map(|(root, hardlinks)| TestInput { root, hardlinks })
+        .prop_map(|(root, hardlinks)| TestInput {
+            root,
+            hardlinks,
+            password: None,
+        })
 }
 
 // ── Build / compare ────────────────────────────────────────────────
@@ -454,10 +518,15 @@ fn apply_hardlinks(
 }
 
 /// Build the tree under `archive_path` matching `input`, materialise
-/// hardlinks, and save.
+/// hardlinks, and save. The archive is created plaintext (an empty
+/// header), then loaded with the same password the input requests so
+/// `tree.password()` carries through to the save path. With
+/// `password: Some(_)`, every newly-created file picks up the
+/// password's default cipher at save time (see
+/// `archive_io::build_write_options`).
 fn build_and_save(archive_path: &Path, input: &TestInput) -> io::Result<Vec<(String, String)>> {
     bootstrap_empty(archive_path)?;
-    let mut tree = archive_io::load(archive_path, None)?;
+    let mut tree = archive_io::load(archive_path, input.password.clone())?;
     for (name, spec) in &input.root {
         build_child(&mut tree, ROOT_INODE, name, spec)?;
     }
@@ -534,99 +603,89 @@ enum Observed {
 
 // ── Properties ─────────────────────────────────────────────────────
 
-proptest! {
-    // Default 64 cases keeps `cargo test` under a few seconds.
-    // `PROPTEST_CASES=N cargo test` widens the sweep; the scheduled
-    // CI job runs at 10 000.
-    #![proptest_config(ProptestConfig::with_cases(64))]
+/// Full round-trip + idempotence assertion. Shared between the
+/// plaintext and encrypted property blocks so both populations get
+/// exactly the same verification (snapshot equality, generated-spec
+/// fidelity, Special-inverse, hardlink equivalence, directory nlink).
+/// The only difference between the two callers is the input
+/// distribution and the case budget.
+fn assert_roundtrip_preserves(input: &TestInput, archive: &Path) -> Result<(), TestCaseError> {
+    let placed_links = build_and_save(archive, input).unwrap();
+    let after_first_load = archive_io::load(archive, input.password.clone()).unwrap();
+    let snap_first = snapshot(&after_first_load);
 
-    /// SPEC: `load(save(T)) ≅ T` for every generated tree T, observed
-    /// over (path, kind, content, perm, uid, gid, xattrs, nlink,
-    /// size). A second `save → load` cycle must be a fixed point.
-    ///
-    /// Special-typed entries disappear (PNA format has no on-disk
-    /// kind for them); the property asserts the inverse explicitly.
-    /// Hardlinked siblings observe the same metadata and the source
-    /// inode's `nlink` reflects every successful placement.
-    #[test]
-    fn save_load_roundtrip_preserves_tree(input in arb_test_input()) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let archive = dir.path().join("rt.pna");
+    let mut tree = archive_io::load(archive, input.password.clone()).unwrap();
+    archive_io::save(&mut tree).unwrap();
+    let after_second_load = archive_io::load(archive, input.password.clone()).unwrap();
+    let snap_second = snapshot(&after_second_load);
 
-        let placed_links = build_and_save(&archive, &input).unwrap();
-        let after_first_load = archive_io::load(&archive, None).unwrap();
-        let snap_first = snapshot(&after_first_load);
+    prop_assert_eq!(&snap_first, &snap_second, "second round-trip drifted");
 
-        let mut tree = archive_io::load(&archive, None).unwrap();
-        archive_io::save(&mut tree).unwrap();
-        let after_second_load = archive_io::load(&archive, None).unwrap();
-        let snap_second = snapshot(&after_second_load);
+    let mut extra_links_per_source: BTreeMap<String, usize> = BTreeMap::new();
+    for (src, _dst) in &placed_links {
+        *extra_links_per_source.entry(src.clone()).or_insert(0) += 1;
+    }
+    check_root(&snap_first, &input.root, &extra_links_per_source)?;
+    check_special_absences(&snap_first, &input.root)?;
 
-        prop_assert_eq!(&snap_first, &snap_second, "second round-trip drifted");
-
-        // Count successfully-placed hardlinks per source path so
-        // every File leaf can be checked against `nlink == 1 + extra`
-        // — including those with zero links, where a load-time
-        // regression that defaulted nlink to 0 would otherwise pass
-        // silently.
-        let mut extra_links_per_source: BTreeMap<String, usize> = BTreeMap::new();
-        for (src, _dst) in &placed_links {
-            *extra_links_per_source.entry(src.clone()).or_insert(0) += 1;
-        }
-
-        // Persistent specs (File / Dir / Symlink) survived intact.
-        check_root(&snap_first, &input.root, &extra_links_per_source)?;
-
-        // Special spec entries: PNA cannot persist these, so the save
-        // path drops them with a logged warning. Assert they are
-        // absent post-load.
-        check_special_absences(&snap_first, &input.root)?;
-
-        // Hardlinks: at every placed destination, the observed node
-        // must be byte-equal to the observed node at the source path.
-        // `prop_assert_eq!(src_obs, dst_obs)` exercises the full
-        // `ObservedNode` `PartialEq`, which compares
-        // kind / perm / uid / gid / nlink / size / blksize / xattrs —
-        // any field that drifts between the two views of the same
-        // inode lights up here.
-        for (src, dst) in &placed_links {
-            let src_obs = snap_first.get(src)
-                .ok_or_else(|| TestCaseError::fail(format!("hardlink source missing: {src}")))?;
-            let dst_obs = snap_first.get(dst)
-                .ok_or_else(|| TestCaseError::fail(format!("hardlink dest missing: {dst}")))?;
-            prop_assert_eq!(
-                src_obs, dst_obs,
-                "hardlink content/metadata mismatch between {} and {}",
-                src, dst
-            );
-        }
-
-        // POSIX nlink invariant for every directory in the snapshot,
-        // including the root.
-        for (path, observed) in &snap_first {
-            if matches!(observed.kind, Observed::Directory) {
-                let subdir_count = count_immediate_subdirs(&snap_first, path);
-                prop_assert_eq!(
-                    observed.nlink as usize,
-                    2 + subdir_count,
-                    "directory {:?} has nlink {} but {} direct subdirs",
-                    path, observed.nlink, subdir_count
-                );
-            }
-        }
+    for (src, dst) in &placed_links {
+        let src_obs = snap_first
+            .get(src)
+            .ok_or_else(|| TestCaseError::fail(format!("hardlink source missing: {src}")))?;
+        let dst_obs = snap_first
+            .get(dst)
+            .ok_or_else(|| TestCaseError::fail(format!("hardlink dest missing: {dst}")))?;
+        prop_assert_eq!(
+            src_obs,
+            dst_obs,
+            "hardlink content/metadata mismatch between {} and {}",
+            src,
+            dst
+        );
     }
 
-    /// SPEC: For plain (unencrypted) archives, save is a deterministic
-    /// function of the tree. Saving, loading, and saving again must
-    /// yield byte-identical archives — there is no source of
-    /// run-to-run nondeterminism in the serialiser for this slice of
-    /// the input space.
-    ///
-    /// This is the strongest form of idempotence: the snapshot-equality
-    /// check above can't catch e.g. xattr or chunk ordering drift if
-    /// it doesn't change the AST. Byte equality does.
+    for (path, observed) in &snap_first {
+        if matches!(observed.kind, Observed::Directory) {
+            let subdir_count = count_immediate_subdirs(&snap_first, path);
+            prop_assert_eq!(
+                observed.nlink as usize,
+                2 + subdir_count,
+                "directory {:?} has nlink {} but {} direct subdirs",
+                path,
+                observed.nlink,
+                subdir_count
+            );
+        }
+    }
+    Ok(())
+}
+
+proptest! {
+    // Plaintext properties: 64 cases keeps `cargo test` under a few
+    // seconds locally. The scheduled CI job runs at
+    // `PROPTEST_CASES=10000` for the broad sweep.
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    /// SPEC: For plaintext archives, `load(save(T)) ≅ T` over the full
+    /// observable shape (paths, kinds, content, perm, owner, xattrs,
+    /// nlink, size). A second `save → load` cycle is a fixed point.
+    /// Special-typed entries disappear (PNA has no on-disk DataKind).
+    /// Hardlinked siblings observe the same metadata; their inode's
+    /// `nlink` reflects every successful placement.
     #[test]
-    fn plain_save_is_byte_identical_when_replayed(input in arb_test_input()) {
+    fn plain_save_load_roundtrip_preserves_tree(input in arb_test_input_plain()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("rt.pna");
+        assert_roundtrip_preserves(&input, &archive)?;
+    }
+
+    /// SPEC: For plaintext archives, save is a deterministic function
+    /// of the tree. Saving, loading, and saving again yields
+    /// byte-identical archives — there is no source of nondeterminism
+    /// in the plaintext serialiser. Catches drift the snapshot
+    /// equality cannot see (e.g. ordering of chunks inside an entry).
+    #[test]
+    fn plain_save_is_byte_identical_when_replayed(input in arb_test_input_plain()) {
         let dir = tempfile::TempDir::new().unwrap();
         let archive = dir.path().join("byte.pna");
 
@@ -650,7 +709,132 @@ proptest! {
     }
 }
 
+// Encrypted-archive properties live in their own `proptest!` block
+// with a much smaller case cap. PNA's encrypted save path runs
+// Argon2id key derivation per entry, which costs ~150 ms per call in
+// release mode (several times that in debug) — running encrypted
+// properties at the default 64 cases would push `cargo test` well
+// past the few-seconds budget. The scheduled CI sweep
+// (`PROPTEST_CASES` env) overrides the in-tree cap and walks a
+// proportionally wider sample. Every case in this block exercises
+// the encrypted save path; the generators guarantee `password.is_some()`
+// and at least one File entry, so no `prop_assume!` filters need to
+// burn cases.
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(8))]
+
+    /// SPEC: `load(save(T)) ≅ T` continues to hold when the archive
+    /// is encrypted, modulo the cipher state. The full observable
+    /// shape (paths, kinds, content, perm, owner, xattrs, nlink,
+    /// size) round-trips just as in the plaintext case — only the
+    /// archive bytes themselves are non-deterministic across saves.
+    /// This is the AST-level decomposition of the byte-id property
+    /// the plaintext block enforces; it's the strongest invariant
+    /// that survives the IV randomisation encryption introduces.
+    #[test]
+    fn encrypted_save_load_roundtrip_preserves_tree(input in arb_test_input_encrypted()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("rt-enc.pna");
+        assert_roundtrip_preserves(&input, &archive)?;
+    }
+
+    /// SPEC: An encrypted archive cannot be read back with a
+    /// different password in any **observably useful** way — the
+    /// content the original tree wrote must not come back from a
+    /// `load(wrong_password)` call.
+    ///
+    /// We do **not** require `load` to return `Err`: pna 0.33's
+    /// encrypted entries use AES-CTR with no AEAD / MAC, so the
+    /// kernel never raises on a wrong key — it just produces
+    /// different plaintext. The observable contract is therefore
+    /// "the bytes we wrote do not come back": at least one file
+    /// must decrypt to something other than the input. A stronger
+    /// SPEC ("load is Err") would require pnafs to add a password
+    /// verifier on top of pna; that lives outside Phase 3's scope.
+    ///
+    /// The generator guarantees the archive contains at least one
+    /// File (so there is cipher state to validate) and the wrong
+    /// password differs from the real one structurally (appending
+    /// `!`, which the password regex `[a-zA-Z0-9]{4,12}` cannot
+    /// produce).
+    #[test]
+    fn encrypted_archive_rejects_wrong_password(input in arb_test_input_encrypted()) {
+        let wrong = format!("{}!", input.password.as_deref().unwrap());
+        let (files, _dirs) = inventory(&input.root);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("wp.pna");
+        build_and_save(&archive, &input).unwrap();
+
+        // Snapshot the input file contents up-front so the
+        // mismatch check has the original values to compare
+        // against (the input tree is consumed by build_and_save).
+        let originals: BTreeMap<String, Vec<u8>> = files
+            .iter()
+            .filter_map(|p| {
+                lookup_file_content(&input.root, p).map(|c| (p.clone(), c))
+            })
+            .collect();
+
+        match archive_io::load(&archive, Some(wrong)) {
+            Err(_) => {
+                // Strong reject — desirable, but not the path pna
+                // currently takes in most cases.
+            }
+            Ok(reloaded) => {
+                // The portable contract: not every file may
+                // accidentally collide. For short files the
+                // birthday-style probability of a byte-for-byte
+                // accidental match is non-zero, so we require only
+                // that the **set** of (path, content) pairs differs
+                // somewhere — equivalently, at least one file
+                // reads back different bytes.
+                let any_mismatch = originals.iter().any(|(fp, orig)| {
+                    let observed = reloaded
+                        .resolve_path(Path::new(fp))
+                        .and_then(|ino| reloaded.get(ino))
+                        .and_then(|n| match &n.content {
+                            FsContent::File(fc) => Some(fc.data().to_vec()),
+                            _ => None,
+                        });
+                    match observed {
+                        Some(obs) => obs != *orig,
+                        None => true,
+                    }
+                });
+                prop_assert!(
+                    any_mismatch,
+                    "wrong-password load returned every file's content unchanged — \
+                     no decryption barrier"
+                );
+            }
+        }
+    }
+}
+
 // ── Helpers ────────────────────────────────────────────────────────
+
+/// Walk the spec tree looking for a File node at `path`. Returns its
+/// content if found, `None` otherwise (e.g. the path names a Dir or
+/// Symlink, or doesn't exist in the spec).
+fn lookup_file_content(root: &BTreeMap<String, NodeSpec>, path: &str) -> Option<Vec<u8>> {
+    let mut cur = root;
+    let mut parts = path.split('/').peekable();
+    while let Some(seg) = parts.next() {
+        let node = cur.get(seg)?;
+        if parts.peek().is_none() {
+            return match node {
+                NodeSpec::File { content, .. } => Some(content.clone()),
+                _ => None,
+            };
+        }
+        cur = match node {
+            NodeSpec::Dir { children, .. } => children,
+            _ => return None,
+        };
+    }
+    None
+}
 
 /// Number of immediate-child directories of `path` observed in `snap`.
 /// "Immediate" = exactly one `/`-separated segment deeper, no further.
