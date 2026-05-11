@@ -601,21 +601,26 @@ fn arb_password_string() -> impl Strategy<Value = String> {
 }
 
 /// A root-children layout that is guaranteed to contain **at least one
-/// File** somewhere in the tree. Used by encryption-axis properties
-/// that need actual cipher content to assert against — generating
-/// trees with no files and then `prop_assume!`-filtering would burn
-/// the small budget those properties run at.
+/// File with non-empty content**. Used by encryption-axis properties
+/// that need actual cipher state to assert against — an empty file
+/// has zero bytes of ciphertext, so two different keys would both
+/// decrypt to the same (empty) plaintext, and the
+/// "wrong key → different output" contract cannot be tested.
+/// Constraining the sentinel file to ≥ 16 bytes (one AES block) also
+/// makes the birthday-style probability of a coincidental
+/// byte-for-byte match between two unrelated keys vanishingly
+/// small (≈ 1 / 2^128).
 fn arb_root_children_with_file() -> impl Strategy<Value = BTreeMap<String, NodeSpec>> {
     (
         arb_root_children(),
         arb_segment(),
         arb_meta(),
-        prop::collection::vec(any::<u8>(), 0..=128),
+        prop::collection::vec(any::<u8>(), 16..=128),
     )
         .prop_map(|(mut root, sentinel_name, meta, content)| {
             // Force a uniquely-named File at the root so every
             // generated tree is guaranteed to materialise at least
-            // one encrypted entry.
+            // one encrypted entry with real ciphertext.
             let key = format!("__file_{sentinel_name}");
             root.insert(key, NodeSpec::File { meta, content });
             root
@@ -1310,11 +1315,16 @@ proptest! {
         // Snapshot the input file contents up-front so the
         // mismatch check has the original values to compare
         // against (the input tree is consumed by build_and_save).
+        // Empty files are excluded: their ciphertext is zero bytes,
+        // so any key — including the wrong one — "decrypts" them to
+        // the same empty plaintext, and the wrong-key contract is
+        // vacuous for that case. The generator already guarantees
+        // at least one non-empty file in `arb_root_children_with_file`,
+        // so the resulting map is non-empty by construction.
         let originals: BTreeMap<String, Vec<u8>> = files
             .iter()
-            .filter_map(|p| {
-                lookup_file_content(&input.root, p).map(|c| (p.clone(), c))
-            })
+            .filter_map(|p| lookup_file_content(&input.root, p).map(|c| (p.clone(), c)))
+            .filter(|(_, c)| !c.is_empty())
             .collect();
 
         match archive_io::load(&archive, Some(wrong)) {
