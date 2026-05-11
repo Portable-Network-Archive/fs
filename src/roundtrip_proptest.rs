@@ -29,22 +29,31 @@
 //!   simply skipped — the property is about what *did* get materialised,
 //!   not about every triple succeeding.
 //!
-//! Properties layered here (Phase 3 onwards):
+//! Properties are layered as one test per SPEC so failure messages
+//! identify the broken invariant directly (Phase 4):
 //!
 //! * **Plaintext block (cases = 64)**
-//!   * `plain_save_load_roundtrip_preserves_tree` — every observable
-//!     field survives `save → load`, and a second cycle is a fixed
-//!     point. Special-typed entries are asserted absent post-load.
-//!     Hardlinked siblings observe the same metadata.
+//!   * `plain_generator_specs_survive_load` — generated `NodeSpec`
+//!     fields (content, perm, owner, xattrs, size) survive `save → load`.
+//!   * `plain_save_is_idempotent_under_reload` — second `save → load`
+//!     is a fixed point at the snapshot level.
+//!   * `plain_loaded_directories_have_posix_nlink` — `nlink = 2 +
+//!     #subdirs` for every loaded directory, including the root.
+//!   * `plain_save_strips_special_entries` — Special-typed entries
+//!     are dropped on save (the inverse property pinning the PNA
+//!     format limitation).
+//!   * `plain_hardlinks_are_observationally_equivalent` — every
+//!     hardlink destination observes the same inode as its source.
 //!   * `plain_save_is_byte_identical_when_replayed` — for plaintext
-//!     archives, save is a deterministic function of the tree.
-//!     Catches non-determinism the AST-equality check cannot see.
+//!     archives, save is a deterministic function of the tree;
+//!     catches drift the AST-equality cannot see.
 //!
 //! * **Encrypted block (cases = 8, Argon2id-bound)**
-//!   * `encrypted_save_load_roundtrip_preserves_tree` — the AST-level
-//!     idempotence the plaintext byte-id property gives, decomposed
-//!     for the encrypted case where every save uses a fresh IV
-//!     (bytes drift but the tree shape stays identical).
+//!   * `encrypted_generator_specs_survive_load`
+//!   * `encrypted_save_is_idempotent_under_reload`
+//!   * `encrypted_loaded_directories_have_posix_nlink`
+//!   * `encrypted_save_strips_special_entries`
+//!   * `encrypted_hardlinks_are_observationally_equivalent`
 //!   * `encrypted_archive_rejects_wrong_password` — wrong-key load
 //!     either errors out (the ideal) or returns content that does
 //!     not match the input. pna 0.33's AES-CTR has no AEAD/MAC, so
@@ -602,51 +611,78 @@ enum Observed {
 }
 
 // ── Properties ─────────────────────────────────────────────────────
+//
+// One property per invariant. Failure messages name the SPEC that
+// broke; a single combined property would print the same outer test
+// name for every kind of regression, which made the previous
+// versions of this test painful to triage.
+//
+// Several helpers cache the result of `build_and_save` plus one
+// reload so each property doesn't replay the costly part of the
+// pipeline four times over.
 
-/// Full round-trip + idempotence assertion. Shared between the
-/// plaintext and encrypted property blocks so both populations get
-/// exactly the same verification (snapshot equality, generated-spec
-/// fidelity, Special-inverse, hardlink equivalence, directory nlink).
-/// The only difference between the two callers is the input
-/// distribution and the case budget.
-fn assert_roundtrip_preserves(input: &TestInput, archive: &Path) -> Result<(), TestCaseError> {
+/// Common preamble: build the spec into a fresh archive, save, load
+/// once. Returns (placed hardlinks, post-load snapshot, raw archive
+/// bytes).
+fn build_save_load(
+    input: &TestInput,
+    archive: &Path,
+) -> (
+    Vec<(String, String)>,
+    BTreeMap<String, ObservedNode>,
+    Vec<u8>,
+) {
     let placed_links = build_and_save(archive, input).unwrap();
-    let after_first_load = archive_io::load(archive, input.password.clone()).unwrap();
-    let snap_first = snapshot(&after_first_load);
+    let tree = archive_io::load(archive, input.password.clone()).unwrap();
+    let snap = snapshot(&tree);
+    let bytes = std::fs::read(archive).unwrap();
+    (placed_links, snap, bytes)
+}
 
+/// SPEC: `load(save(T))` returns a tree whose snapshot matches the
+/// generator's specs at every observable field (path, kind, content,
+/// perm, owner, xattrs, file size).
+fn assert_generator_specs_survive(
+    input: &TestInput,
+    snap: &BTreeMap<String, ObservedNode>,
+    placed_links: &[(String, String)],
+) -> Result<(), TestCaseError> {
+    let mut extra_links_per_source: BTreeMap<String, usize> = BTreeMap::new();
+    for (src, _dst) in placed_links {
+        *extra_links_per_source.entry(src.clone()).or_insert(0) += 1;
+    }
+    check_root(snap, &input.root, &extra_links_per_source)
+}
+
+/// SPEC: a second `save → load` after the first is a fixed point.
+///
+/// **Precondition**: `snap_first` MUST be the snapshot produced by the
+/// most recent `build_save_load` call on the same `archive` (i.e. the
+/// snapshot of the *first* load). Passing an unrelated `BTreeMap`
+/// here makes the resulting equality diff meaningless.
+fn assert_save_is_idempotent(
+    input: &TestInput,
+    archive: &Path,
+    snap_first: &BTreeMap<String, ObservedNode>,
+) -> Result<(), TestCaseError> {
     let mut tree = archive_io::load(archive, input.password.clone()).unwrap();
     archive_io::save(&mut tree).unwrap();
     let after_second_load = archive_io::load(archive, input.password.clone()).unwrap();
     let snap_second = snapshot(&after_second_load);
+    prop_assert_eq!(snap_first, &snap_second, "second round-trip drifted");
+    Ok(())
+}
 
-    prop_assert_eq!(&snap_first, &snap_second, "second round-trip drifted");
-
-    let mut extra_links_per_source: BTreeMap<String, usize> = BTreeMap::new();
-    for (src, _dst) in &placed_links {
-        *extra_links_per_source.entry(src.clone()).or_insert(0) += 1;
-    }
-    check_root(&snap_first, &input.root, &extra_links_per_source)?;
-    check_special_absences(&snap_first, &input.root)?;
-
-    for (src, dst) in &placed_links {
-        let src_obs = snap_first
-            .get(src)
-            .ok_or_else(|| TestCaseError::fail(format!("hardlink source missing: {src}")))?;
-        let dst_obs = snap_first
-            .get(dst)
-            .ok_or_else(|| TestCaseError::fail(format!("hardlink dest missing: {dst}")))?;
-        prop_assert_eq!(
-            src_obs,
-            dst_obs,
-            "hardlink content/metadata mismatch between {} and {}",
-            src,
-            dst
-        );
-    }
-
-    for (path, observed) in &snap_first {
+/// SPEC: every loaded directory's `nlink` equals `2 + #subdirs`
+/// (POSIX: self + per-`..` from each child directory). Applies to
+/// the root inode too, which `collect_dfs` skips and which a unit
+/// test would otherwise have to special-case.
+fn assert_directory_nlink_posix(
+    snap: &BTreeMap<String, ObservedNode>,
+) -> Result<(), TestCaseError> {
+    for (path, observed) in snap {
         if matches!(observed.kind, Observed::Directory) {
-            let subdir_count = count_immediate_subdirs(&snap_first, path);
+            let subdir_count = count_immediate_subdirs(snap, path);
             prop_assert_eq!(
                 observed.nlink as usize,
                 2 + subdir_count,
@@ -660,30 +696,103 @@ fn assert_roundtrip_preserves(input: &TestInput, archive: &Path) -> Result<(), T
     Ok(())
 }
 
+/// SPEC: every hardlink destination observes the same node — byte
+/// equal — as its source.
+fn assert_hardlinks_equivalent(
+    snap: &BTreeMap<String, ObservedNode>,
+    placed_links: &[(String, String)],
+) -> Result<(), TestCaseError> {
+    for (src, dst) in placed_links {
+        let src_obs = snap
+            .get(src)
+            .ok_or_else(|| TestCaseError::fail(format!("hardlink source missing: {src}")))?;
+        let dst_obs = snap
+            .get(dst)
+            .ok_or_else(|| TestCaseError::fail(format!("hardlink dest missing: {dst}")))?;
+        prop_assert_eq!(
+            src_obs,
+            dst_obs,
+            "hardlink content/metadata mismatch between {} and {}",
+            src,
+            dst
+        );
+    }
+    Ok(())
+}
+
 proptest! {
     // Plaintext properties: 64 cases keeps `cargo test` under a few
     // seconds locally. The scheduled CI job runs at
     // `PROPTEST_CASES=10000` for the broad sweep.
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// SPEC: For plaintext archives, `load(save(T)) ≅ T` over the full
-    /// observable shape (paths, kinds, content, perm, owner, xattrs,
-    /// nlink, size). A second `save → load` cycle is a fixed point.
-    /// Special-typed entries disappear (PNA has no on-disk DataKind).
-    /// Hardlinked siblings observe the same metadata; their inode's
-    /// `nlink` reflects every successful placement.
+    /// SPEC: For plaintext archives, every generated `NodeSpec` is
+    /// observable at the expected path after `save → load`, with
+    /// matching content, permission bits, owner, xattrs, and size.
+    /// Failures here flag a regression in *what* the format
+    /// preserves.
     #[test]
-    fn plain_save_load_roundtrip_preserves_tree(input in arb_test_input_plain()) {
+    fn plain_generator_specs_survive_load(input in arb_test_input_plain()) {
         let dir = tempfile::TempDir::new().unwrap();
-        let archive = dir.path().join("rt.pna");
-        assert_roundtrip_preserves(&input, &archive)?;
+        let archive = dir.path().join("specs.pna");
+        let (placed, snap, _bytes) = build_save_load(&input, &archive);
+        assert_generator_specs_survive(&input, &snap, &placed)?;
+    }
+
+    /// SPEC: For plaintext archives, a second `save → load` after the
+    /// first must reach the same snapshot. Failures here flag
+    /// non-deterministic state changes in the save path that the
+    /// byte-id property cannot see (e.g. timestamp drift, secondary
+    /// allocations leaking into metadata).
+    #[test]
+    fn plain_save_is_idempotent_under_reload(input in arb_test_input_plain()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("idem.pna");
+        let (_placed, snap_first, _bytes) = build_save_load(&input, &archive);
+        assert_save_is_idempotent(&input, &archive, &snap_first)?;
+    }
+
+    /// SPEC: For plaintext archives, every loaded directory satisfies
+    /// the POSIX `nlink = 2 + #subdirs` invariant — including the
+    /// root, which `collect_dfs` does not emit. A regression to
+    /// `nlink: 1` (the original load-path bug) would show up here.
+    #[test]
+    fn plain_loaded_directories_have_posix_nlink(input in arb_test_input_plain()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("nlink.pna");
+        let (_placed, snap, _bytes) = build_save_load(&input, &archive);
+        assert_directory_nlink_posix(&snap)?;
+    }
+
+    /// SPEC: For plaintext archives, Special-typed spec entries
+    /// (block / char / fifo / socket) are absent from the post-load
+    /// snapshot. PNA has no DataKind for them yet, so `save()` drops
+    /// them deliberately; this is the inverse property pinning that
+    /// drop is complete.
+    #[test]
+    fn plain_save_strips_special_entries(input in arb_test_input_plain()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("special.pna");
+        let (_placed, snap, _bytes) = build_save_load(&input, &archive);
+        check_special_absences(&snap, &input.root)?;
+    }
+
+    /// SPEC: For plaintext archives, every hardlink destination
+    /// observes a byte-identical `ObservedNode` to its source — the
+    /// shared inode is materialised the same way at every path that
+    /// references it.
+    #[test]
+    fn plain_hardlinks_are_observationally_equivalent(input in arb_test_input_plain()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("hardlink.pna");
+        let (placed, snap, _bytes) = build_save_load(&input, &archive);
+        assert_hardlinks_equivalent(&snap, &placed)?;
     }
 
     /// SPEC: For plaintext archives, save is a deterministic function
     /// of the tree. Saving, loading, and saving again yields
-    /// byte-identical archives — there is no source of nondeterminism
-    /// in the plaintext serialiser. Catches drift the snapshot
-    /// equality cannot see (e.g. ordering of chunks inside an entry).
+    /// byte-identical archives. Catches drift the snapshot equality
+    /// cannot see (e.g. ordering of chunks inside an entry).
     #[test]
     fn plain_save_is_byte_identical_when_replayed(input in arb_test_input_plain()) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -723,19 +832,63 @@ proptest! {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(8))]
 
-    /// SPEC: `load(save(T)) ≅ T` continues to hold when the archive
-    /// is encrypted, modulo the cipher state. The full observable
-    /// shape (paths, kinds, content, perm, owner, xattrs, nlink,
-    /// size) round-trips just as in the plaintext case — only the
-    /// archive bytes themselves are non-deterministic across saves.
-    /// This is the AST-level decomposition of the byte-id property
-    /// the plaintext block enforces; it's the strongest invariant
-    /// that survives the IV randomisation encryption introduces.
+    /// SPEC: For encrypted archives, generated `NodeSpec` fields
+    /// survive `save → load` exactly as in the plaintext case —
+    /// only the on-disk bytes differ (fresh IV per save).
     #[test]
-    fn encrypted_save_load_roundtrip_preserves_tree(input in arb_test_input_encrypted()) {
+    fn encrypted_generator_specs_survive_load(input in arb_test_input_encrypted()) {
         let dir = tempfile::TempDir::new().unwrap();
-        let archive = dir.path().join("rt-enc.pna");
-        assert_roundtrip_preserves(&input, &archive)?;
+        let archive = dir.path().join("specs-enc.pna");
+        let (placed, snap, _bytes) = build_save_load(&input, &archive);
+        assert_generator_specs_survive(&input, &snap, &placed)?;
+    }
+
+    /// SPEC: For encrypted archives, a second `save → load` is a
+    /// fixed point at the snapshot level — encryption changes the
+    /// bytes but not the AST.
+    #[test]
+    fn encrypted_save_is_idempotent_under_reload(input in arb_test_input_encrypted()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("idem-enc.pna");
+        let (_placed, snap_first, _bytes) = build_save_load(&input, &archive);
+        assert_save_is_idempotent(&input, &archive, &snap_first)?;
+    }
+
+    /// SPEC: For encrypted archives, the directory `nlink` invariant
+    /// holds the same way it does for plaintext.
+    #[test]
+    fn encrypted_loaded_directories_have_posix_nlink(input in arb_test_input_encrypted()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("nlink-enc.pna");
+        let (_placed, snap, _bytes) = build_save_load(&input, &archive);
+        assert_directory_nlink_posix(&snap)?;
+    }
+
+    /// SPEC: For encrypted archives, hardlinked siblings observe the
+    /// same inode at every reference path. The encrypted save path
+    /// still emits a HardLink entry for the secondary references;
+    /// this property pins that they re-resolve to the same content
+    /// after a decrypt cycle.
+    #[test]
+    fn encrypted_hardlinks_are_observationally_equivalent(input in arb_test_input_encrypted()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("hardlink-enc.pna");
+        let (placed, snap, _bytes) = build_save_load(&input, &archive);
+        assert_hardlinks_equivalent(&snap, &placed)?;
+    }
+
+    /// SPEC: For encrypted archives, Special-typed spec entries are
+    /// still absent from the post-load snapshot. PNA has no on-disk
+    /// kind for special files regardless of cipher state, so the save
+    /// path drops them in both modes. A regression that started
+    /// persisting Special only on the encrypted path would otherwise
+    /// pass plain coverage and slip through.
+    #[test]
+    fn encrypted_save_strips_special_entries(input in arb_test_input_encrypted()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("special-enc.pna");
+        let (_placed, snap, _bytes) = build_save_load(&input, &archive);
+        check_special_absences(&snap, &input.root)?;
     }
 
     /// SPEC: An encrypted archive cannot be read back with a
