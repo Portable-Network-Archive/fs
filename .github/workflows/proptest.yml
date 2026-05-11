@@ -23,8 +23,10 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Default in-tree cap is 64 (fast enough for `cargo test` locally).
-      # Here we burn through ~10 000 cases to push past the easy seeds
-      # the standard CI run already covers.
+      # Widen here to push past the easy seeds the per-push CI run
+      # already covers. Encrypted properties use Argon2id, so going
+      # much higher than this on the runner pushes total wall time
+      # past the hour mark — bump deliberately.
       PROPTEST_CASES: 10000
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -44,9 +46,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-proptest-rust-${{ steps.install_rust.outputs.version }}
       - name: Run extended proptest sweep
+        # Defer the filter and runtime knobs to scripts/tests/proptest_sweep.sh
+        # so a developer running the same sweep locally hits exactly
+        # the same set of properties. Otherwise it is easy for the
+        # two paths to drift — Phase 4 renamed properties and the
+        # workflow's hardcoded filter silently picked nothing up.
         run: |
-          cargo test --locked --release save_load_roundtrip_preserves_tree \
-            -- --nocapture
+          chmod +x scripts/tests/proptest_sweep.sh
+          ./scripts/tests/proptest_sweep.sh -- --nocapture
       - name: Upload proptest regressions on failure
         # On failure, proptest appends the shrunk seed for any new
         # counter-example to `proptest-regressions/`. Hoist the file out
