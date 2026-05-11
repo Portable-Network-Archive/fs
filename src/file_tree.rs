@@ -234,8 +234,13 @@ pub(crate) struct FsNode {
     /// PNA's wire type (`pna::ExtendedAttribute::name() -> &str`); on the
     /// FUSE side `getxattr`/`listxattr` accept arbitrary `OsStr` but every
     /// xattr we currently materialise comes from archive load, which is
-    /// already `String`.
-    pub xattrs: HashMap<String, Vec<u8>>,
+    /// already `String`. The map is ordered (`BTreeMap`) so the save path
+    /// serialises attributes in a deterministic order — `HashMap`'s
+    /// run-to-run iteration order would otherwise make two saves of the
+    /// same tree produce byte-different archives, which the round-trip
+    /// property test (`plain_save_is_byte_identical_when_replayed`)
+    /// caught.
+    pub xattrs: BTreeMap<String, Vec<u8>>,
     /// Live count of file descriptors held by clients for this inode.
     /// `(attr.nlink, open_count)` drives the inode lifecycle:
     ///
@@ -271,7 +276,7 @@ impl FsNode {
         FsNode {
             name,
             parent: None,
-            xattrs: HashMap::new(),
+            xattrs: BTreeMap::new(),
             open_count: AtomicU32::new(0),
             content,
             attr: FileAttr {
