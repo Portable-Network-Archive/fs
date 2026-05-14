@@ -1,3 +1,5 @@
+#![doc = include_str!("../README.md")]
+
 use crate::command::Command;
 use clap::Parser;
 use std::io;
