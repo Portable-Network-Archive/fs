@@ -96,7 +96,7 @@ jobs:
           # `user_allow_other` is set in /etc/fuse.conf. The runner is
           # ephemeral, so toggling it here is safe.
           echo user_allow_other | sudo tee -a /etc/fuse.conf
-      - uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         with:
           path: target
           key: ${{ runner.os }}-pjdfstest-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'scripts/tests/test_pjdfstest.sh') }}
