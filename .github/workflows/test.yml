@@ -66,7 +66,7 @@ jobs:
         # committed back. Per-matrix entry name keeps the 8 parallel
         # runs from clobbering each other.
         if: failure()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2
         with:
           name: proptest-regressions-${{ matrix.os }}-${{ matrix.rust }}
           path: proptest-regressions/
@@ -160,7 +160,7 @@ jobs:
           ./scripts/tests/test_fsx.sh
       - name: Upload fsx artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v4.6.2
         with:
           name: fsx-artifacts
           path: ${{ github.workspace }}/fsx-artifacts
