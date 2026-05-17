@@ -1352,21 +1352,49 @@ fn assert_hardlinks_equivalent(
 }
 
 /// SPEC: a hardlink created mid-mutation still observes the same
-/// node as its source after `save → load` — *where both ends
-/// survived*. Unlike `assert_hardlinks_equivalent`, a missing end is
-/// tolerated: a later `FsOp` in the same sequence may have renamed or
-/// unlinked either path, which is legitimate and not a round-trip
-/// bug. Only the surviving pairs are asserted equal.
+/// node as its source after `save → load` — *for the pairs whose
+/// link relationship still holds*.
+///
+/// A hardlink binds an **inode**, not a path. After the link is
+/// created, a *later* `FsOp` in the same sequence can legitimately
+/// rebind either recorded path to a *different* inode — a clobbering
+/// `Rename` (plain / EXCHANGE) onto the path, an `UnlinkFile`
+/// followed by a recreate at the same name, etc. When that happens
+/// the two recorded paths no longer name the same inode, and their
+/// post-reload `ObservedNode`s legitimately differ; that is correct
+/// POSIX behaviour, not a round-trip bug.
+///
+/// So the check resolves both recorded paths *in the reloaded tree*
+/// and only asserts observable equality when they still resolve to
+/// the **same inode** (the link survived intact). A missing path, or
+/// two paths that now resolve to different inodes, is skipped — it
+/// means a later op moved/replaced an endpoint, which this property
+/// does not pin. (`resolve_path` returns the post-reload inode; PNA
+/// re-numbers inodes on load, so identity is compared *within* the
+/// reloaded tree, never against the pre-save numbering.)
 fn assert_mutation_hardlinks_equivalent(
+    tree: &FileTree,
     snap: &BTreeMap<String, ObservedNode>,
     placed_links: &[(String, String)],
 ) -> Result<(), TestCaseError> {
     for (src, dst) in placed_links {
+        let (Some(src_ino), Some(dst_ino)) = (
+            tree.resolve_path(Path::new(src)),
+            tree.resolve_path(Path::new(dst)),
+        ) else {
+            continue;
+        };
+        // A later op rebound one endpoint to a different inode: the
+        // link no longer relates these two paths. Legitimate; skip.
+        if src_ino != dst_ino {
+            continue;
+        }
         if let (Some(src_obs), Some(dst_obs)) = (snap.get(src), snap.get(dst)) {
             prop_assert_eq!(
                 src_obs,
                 dst_obs,
-                "post-mutation hardlink content/metadata mismatch between {} and {}",
+                "post-mutation hardlink content/metadata mismatch between {} and {} \
+                 (both still resolve to the same inode after save→load)",
                 src,
                 dst
             );
@@ -1530,7 +1558,7 @@ proptest! {
         assert_directory_nlink_posix(&snap_first)?;
         assert_no_orphan_inodes(&after_mutated_save)?;
         assert_file_size_matches_content(&snap_first)?;
-        assert_mutation_hardlinks_equivalent(&snap_first, &exp.placed_links)?;
+        assert_mutation_hardlinks_equivalent(&after_mutated_save, &snap_first, &exp.placed_links)?;
         assert_fallocate_round_trips(&snap_first, &expected_falloc)?;
 
         // Idempotence under the mutated state: a second cycle from
