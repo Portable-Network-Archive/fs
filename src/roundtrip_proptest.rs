@@ -249,6 +249,17 @@ enum FsOp {
         dest_name: String,
         mode: RenameMode,
     },
+    /// Hardlink some existing non-directory entry under a new name in
+    /// a (possibly different) directory. `source` indexes the live
+    /// non-root inventory; `dest_dir` indexes the live directory
+    /// inventory. Directory sources (EPERM), symlink/special sources
+    /// (the FS API only hardlinks regular-file inodes meaningfully),
+    /// and name collisions (EEXIST) are silently skipped.
+    Link {
+        source: proptest::sample::Index,
+        dest_dir: proptest::sample::Index,
+        dest_name: String,
+    },
 }
 
 /// Which flavour of `rename(2)` an `FsOp::Rename` issues. Splitting
@@ -294,6 +305,16 @@ fn arb_fs_op() -> impl Strategy<Value = FsOp> {
                 dest_name,
                 mode,
             }),
+        2 => (
+            any::<proptest::sample::Index>(),
+            any::<proptest::sample::Index>(),
+            arb_segment(),
+        )
+            .prop_map(|(source, dest_dir, dest_name)| FsOp::Link {
+                source,
+                dest_dir,
+                dest_name,
+            }),
     ]
 }
 
@@ -305,10 +326,24 @@ fn arb_rename_mode() -> impl Strategy<Value = RenameMode> {
     ]
 }
 
-/// Apply `ops` to `tree`, silently skipping invalid ones. Returns
-/// nothing — the assertion lives in the property that calls this,
-/// after a save + reload.
-fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) {
+/// What `apply_ops` materialised, for the post-reload assertions the
+/// generic invariants (nlink, size==content, idempotence) do not pin.
+#[derive(Debug, Default)]
+struct Expectations {
+    /// `(source_path, dest_path)` for every hardlink an `FsOp::Link`
+    /// actually created. Recorded at creation time; either path may
+    /// be renamed / unlinked by a *later* op, so the assertion only
+    /// checks pairs whose both ends still resolve after reload.
+    placed_links: Vec<(String, String)>,
+}
+
+/// Apply `ops` to `tree`, silently skipping invalid ones. Returns the
+/// hardlinks created so the calling property can assert their
+/// round-trip; the generic invariants (directory nlink,
+/// size==content, idempotence) are still checked by the property
+/// regardless.
+fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
+    let mut exp = Expectations::default();
     for op in ops {
         let files = collect_file_paths(tree);
         let any_paths = collect_all_paths(tree);
@@ -471,8 +506,53 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) {
                     flags,
                 );
             }
+            FsOp::Link {
+                source,
+                dest_dir,
+                dest_name,
+            } => {
+                // Source is restricted to regular files: directory
+                // sources are EPERM, and the FS API deliberately does
+                // not support hardlink-to-symlink (issue #432), so
+                // those are simply never proposed here rather than
+                // generated-then-skipped.
+                if files.is_empty() {
+                    continue;
+                }
+                let dirs = collect_dir_paths(tree);
+                let source_path = &files[source.index(files.len())];
+                let Some(source_ino) = tree.resolve_path(Path::new(source_path)) else {
+                    continue;
+                };
+                let dest_dir_path = &dirs[dest_dir.index(dirs.len())];
+                let dest_path = if dest_dir_path.is_empty() {
+                    dest_name.clone()
+                } else {
+                    format!("{dest_dir_path}/{dest_name}")
+                };
+                if dest_path == *source_path {
+                    continue;
+                }
+                let dest_parent_ino = if dest_dir_path.is_empty() {
+                    ROOT_INODE
+                } else {
+                    match tree.resolve_path(Path::new(dest_dir_path)) {
+                        Some(i) => i,
+                        None => continue,
+                    }
+                };
+                // EEXIST on collision is one of the silently-skipped
+                // cases; only record links that actually materialise.
+                if tree
+                    .create_hardlink(dest_parent_ino, OsStr::new(dest_name), source_ino)
+                    .is_ok()
+                {
+                    exp.placed_links.push((source_path.clone(), dest_path));
+                }
+            }
         }
     }
+    exp
 }
 
 /// Snapshot of every File path visible in `tree`, DFS-ordered. All
@@ -1186,6 +1266,30 @@ fn assert_hardlinks_equivalent(
     Ok(())
 }
 
+/// SPEC: a hardlink created mid-mutation still observes the same
+/// node as its source after `save → load` — *where both ends
+/// survived*. Unlike `assert_hardlinks_equivalent`, a missing end is
+/// tolerated: a later `FsOp` in the same sequence may have renamed or
+/// unlinked either path, which is legitimate and not a round-trip
+/// bug. Only the surviving pairs are asserted equal.
+fn assert_mutation_hardlinks_equivalent(
+    snap: &BTreeMap<String, ObservedNode>,
+    placed_links: &[(String, String)],
+) -> Result<(), TestCaseError> {
+    for (src, dst) in placed_links {
+        if let (Some(src_obs), Some(dst_obs)) = (snap.get(src), snap.get(dst)) {
+            prop_assert_eq!(
+                src_obs,
+                dst_obs,
+                "post-mutation hardlink content/metadata mismatch between {} and {}",
+                src,
+                dst
+            );
+        }
+    }
+    Ok(())
+}
+
 proptest! {
     // Plaintext properties: 64 cases keeps `cargo test` under a few
     // seconds locally. The scheduled CI job runs at
@@ -1276,7 +1380,7 @@ proptest! {
 
         build_and_save(&archive, &input).unwrap();
         let mut tree = archive_io::load(&archive, None).unwrap();
-        apply_ops(&mut tree, &ops);
+        let exp = apply_ops(&mut tree, &ops);
         archive_io::save(&mut tree).unwrap();
 
         let after_mutated_save = archive_io::load(&archive, None).unwrap();
@@ -1284,6 +1388,7 @@ proptest! {
         assert_directory_nlink_posix(&snap_first)?;
         assert_no_orphan_inodes(&after_mutated_save)?;
         assert_file_size_matches_content(&snap_first)?;
+        assert_mutation_hardlinks_equivalent(&snap_first, &exp.placed_links)?;
 
         // Idempotence under the mutated state: a second cycle from
         // here must reach the same snapshot. If a mutation produced
