@@ -1,11 +1,13 @@
 use crate::archive_io;
-use crate::file_tree::{FileTree, FsContent, NodeKind, Owner};
+use crate::file_tree::{FileTree, FsContent, NodeKind, Owner, ROOT_INODE};
 use fuser::{
     BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
     OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
+    WriteFlags,
 };
 use log::info;
+use std::collections::HashSet;
 use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -69,7 +71,38 @@ impl PnaFS {
         }
         Ok(())
     }
+
+    /// Walk the directory tree from the root and total the byte size and
+    /// inode count of every reachable node. A hard-linked inode reachable
+    /// through multiple directory entries is counted once (the visited
+    /// set), matching how a real filesystem reports usage. Orphans
+    /// (`nlink == 0`, only reachable through an open fd) are excluded
+    /// because they are not part of the persisted archive.
+    fn usage(tree: &FileTree) -> (u64, u64) {
+        let mut visited = HashSet::new();
+        let mut stack = vec![ROOT_INODE];
+        let mut bytes = 0u64;
+        while let Some(ino) = stack.pop() {
+            if !visited.insert(ino) {
+                continue;
+            }
+            if let Some(node) = tree.get(ino) {
+                bytes = bytes.saturating_add(node.attr.size);
+            }
+            if let Some(children) = tree.children(ino) {
+                for (_, child) in children {
+                    stack.push(child.attr.ino.0);
+                }
+            }
+        }
+        (bytes, visited.len() as u64)
+    }
 }
+
+/// Block size reported by `statfs`. Matches `FileAttr::blksize` so
+/// per-file `st_blocks` and the filesystem-wide block accounting use the
+/// same unit.
+const STATFS_BSIZE: u32 = 512;
 
 impl Filesystem for PnaFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
@@ -800,6 +833,20 @@ impl Filesystem for PnaFS {
         }
     }
 
+    fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
+        info!("[Implemented] statfs()");
+        let tree = self.tree.read().unwrap();
+        let (bytes, files) = Self::usage(&tree);
+        let bsize = u64::from(STATFS_BSIZE);
+        let blocks = bytes.div_ceil(bsize);
+        // The archive is a fully-materialised in-memory tree with no notion
+        // of free space: every reported block is in use, so bfree/bavail are
+        // zero and total blocks == used blocks. ffree is likewise zero. This
+        // is identical for read-only and --write mounts (a --write mount has
+        // no separate capacity; it just flushes the same tree back).
+        reply.statfs(blocks, 0, 0, files, 0, STATFS_BSIZE, 255, STATFS_BSIZE);
+    }
+
     fn destroy(&mut self) {
         info!("[Implemented] destroy()");
         if self.write_strategy.is_some() {
@@ -809,5 +856,93 @@ impl Filesystem for PnaFS {
                 log::error!("Failed to save archive on destroy: {e}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pna::{Archive, Metadata, WriteOptions};
+    use std::io::Write as IoWrite;
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    fn create_plain_archive(dir: &TempDir, filename: &str, files: &[(&str, &[u8])]) -> PathBuf {
+        let path = dir.path().join(filename);
+        let mut archive = Archive::write_header(std::fs::File::create(&path).unwrap()).unwrap();
+        for (name, data) in files {
+            let entry_name = pna::EntryName::from_lossy(name);
+            let data = *data;
+            archive
+                .write_file(
+                    entry_name,
+                    Metadata::new(),
+                    WriteOptions::builder().build(),
+                    |w| {
+                        w.write_all(data)?;
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        archive.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn usage_of_empty_archive_is_just_root() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "empty.pna", &[]);
+        let tree = archive_io::load(&path, None).unwrap();
+        let (bytes, files) = PnaFS::usage(&tree);
+        // Only the root directory node exists.
+        assert_eq!(files, 1);
+        assert_eq!(bytes, tree.get(ROOT_INODE).unwrap().attr.size);
+    }
+
+    #[test]
+    fn usage_tracks_node_count_and_total_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(
+            &dir,
+            "data.pna",
+            &[("a.txt", b"hello"), ("sub/b.bin", &[0u8; 4096])],
+        );
+        let tree = archive_io::load(&path, None).unwrap();
+        let (bytes, files) = PnaFS::usage(&tree);
+
+        // root + "sub" dir + a.txt + b.bin == 4 reachable inodes.
+        assert_eq!(files, 4);
+
+        // Total bytes is the sum of every reachable node's reported size,
+        // so it must be at least the two file payloads (5 + 4096).
+        let payload = 5 + 4096;
+        assert!(
+            bytes >= payload,
+            "usage bytes {bytes} should cover the {payload}-byte payload"
+        );
+
+        // Block count reported by statfs rounds the byte total up to the
+        // 512-byte block size; it must be non-zero for a non-empty tree.
+        let blocks = bytes.div_ceil(u64::from(STATFS_BSIZE));
+        assert!(blocks > 0);
+    }
+
+    #[test]
+    fn usage_grows_when_more_data_is_present() {
+        let dir = TempDir::new().unwrap();
+        let small = create_plain_archive(&dir, "small.pna", &[("f", b"x")]);
+        let large = create_plain_archive(&dir, "large.pna", &[("f", &[0u8; 65536])]);
+
+        let (small_bytes, small_files) = PnaFS::usage(&archive_io::load(&small, None).unwrap());
+        let (large_bytes, large_files) = PnaFS::usage(&archive_io::load(&large, None).unwrap());
+
+        // Same node layout (root + one file) but a much larger payload, so
+        // reported usage must grow with the tree contents.
+        assert_eq!(small_files, large_files);
+        assert!(
+            large_bytes > small_bytes,
+            "larger payload ({large_bytes}) should report more usage than smaller ({small_bytes})"
+        );
     }
 }
