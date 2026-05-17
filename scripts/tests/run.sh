@@ -7,6 +7,7 @@ set -eu
 SCRIPT_DIR="$(dirname "$0")"
 
 "$SCRIPT_DIR/test_mount.sh"
+"$SCRIPT_DIR/test_mount_readonly.sh"
 "$SCRIPT_DIR/test_mount_write.sh"
 "$SCRIPT_DIR/test_mount_write_encrypted.sh"
 "$SCRIPT_DIR/test_mount_write_strategy.sh"
