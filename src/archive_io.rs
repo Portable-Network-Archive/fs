@@ -290,9 +290,13 @@ fn add_normal_entry(
         DataKind::SymbolicLink => {
             let mut buf = Vec::new();
             entry.reader(&opts)?.read_to_end(&mut buf)?;
-            FsContent::Symlink(std::ffi::OsString::from(
-                String::from_utf8_lossy(&buf).into_owned(),
-            ))
+            let target = std::ffi::OsString::from(String::from_utf8_lossy(&buf).into_owned());
+            // POSIX: lstat on a symlink reports st_size == byte length of
+            // the target string. The default attr.size of 0 (set above) is
+            // wrong for symlinks; mirror the in-memory `create_symlink`
+            // path, which sets size from the target length.
+            attr.size = target.len() as u64;
+            FsContent::Symlink(target)
         }
         DataKind::File => {
             // Always decode: fSIZ is only a hint and must not be trusted for
@@ -435,7 +439,13 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
                     } else {
                         primary_path.insert(*ino, archive_path_str.clone());
                         let target_path = std::path::PathBuf::from(target);
-                        let reference = EntryReference::from_lossy(target_path);
+                        // Preserve an absolute target's leading `/`:
+                        // `from_lossy` strips the root (libpna documents
+                        // `from_lossy("/foo") == "foo"`), which silently
+                        // rewrites `/etc/x` to `etc/x` and breaks readlink
+                        // byte-accuracy. The lossy, root-preserving variant
+                        // keeps the same infallible/lossy contract.
+                        let reference = EntryReference::from_path_lossy_preserve_root(&target_path);
                         let builder = EntryBuilder::new_symlink(entry_name, reference)?;
                         finalize_primary_entry(&mut archive, builder, node)?;
                     }
@@ -527,7 +537,12 @@ fn write_hardlink_entry<W: IoWrite>(
     mtime: SystemTime,
     crtime: SystemTime,
 ) -> io::Result<()> {
-    let reference = EntryReference::from_lossy(std::path::PathBuf::from(primary_path));
+    // A hardlink's reference is an in-archive entry path, which never
+    // carries a leading root, so the root-stripping vs root-preserving
+    // distinction is a no-op here. Use the same root-preserving
+    // constructor as the symlink path for one consistent contract.
+    let reference =
+        EntryReference::from_path_lossy_preserve_root(&std::path::PathBuf::from(primary_path));
     let mut builder = EntryBuilder::new_hard_link(entry_name, reference)?;
     builder.modified(system_time_to_pna(mtime));
     builder.created(system_time_to_pna(crtime));
@@ -1466,43 +1481,33 @@ mod tests {
         assert_eq!(bytes, b"shared bytes");
     }
 
-    /// Pins symlink-target behaviour through save → load for four edge
+    /// Symlink targets must round-trip through save → load byte-for-byte
+    /// and the link node must stay reachable by name, for four edge
     /// shapes: absolute path, parent-escape (`../../`), a self-referential
     /// loop (link points at its own name), and a dangling target (no such
     /// entry in the archive). Deterministic, no random seeds.
     ///
-    /// FINDING 1 (pinned, not a test bug): an **absolute** target loses
-    /// its leading `/` across a save/load cycle. `archive_io::save`
-    /// serialises symlink targets via `pna::EntryReference::from_lossy`,
-    /// which strips the root (libpna documents `from_lossy("/foo") ==
-    /// "foo"`). So a symlink created as `/etc/hostname` reloads as
-    /// `etc/hostname`, i.e. readlink is NOT byte-accurate for absolute
-    /// targets — a real data fidelity bug. libpna offers a root-preserving
-    /// alternative (`EntryReference::from_path_preserve_root`); switching
-    /// `save` to it is the likely fix, reported separately.
+    /// Regression guard for two fixed bugs:
+    /// - #465: `archive_io::save` used `EntryReference::from_lossy`, which
+    ///   strips the root, so an absolute target like `/etc/hostname`
+    ///   reloaded as `etc/hostname`. Fixed by serialising symlink (and
+    ///   hardlink) references with `from_path_lossy_preserve_root`.
+    /// - #466: the load `DataKind::SymbolicLink` arm never set
+    ///   `attr.size`, so reloaded symlinks reported `st_size == 0`
+    ///   instead of the target byte length. Fixed by setting
+    ///   `attr.size = target.len()` in that arm.
     ///
-    /// FINDING 2 (pinned, not a test bug): after save→load, a symlink's
-    /// `attr.size` is `0`, not the target byte length. The load path
-    /// (`add_normal_entry`, `DataKind::SymbolicLink`) builds the symlink
-    /// content but never sets `attr.size` (only the `DataKind::File` arm
-    /// does `attr.size = buf.len()`), leaving the `size: 0` default.
-    /// POSIX `lstat` on a symlink should report `st_size == strlen(target)`;
-    /// pnafs reports 0 for any reloaded symlink. The fix is a one-line
-    /// `attr.size = buf.len()` in the SymbolicLink arm, reported separately.
-    ///
-    /// This test deliberately asserts the *current* (degraded) behaviour
-    /// so both bugs are locked down and a future fix surfaces here as an
-    /// expected change.
+    /// If either regresses, the absolute-target or `attr.size` assertion
+    /// below fails.
     #[test]
     fn symlink_edge_targets_round_trip_through_save_and_load() {
-        // (link name, target as created, target expected back after save→load).
-        // Relative shapes round-trip verbatim; the absolute one is degraded
-        // by libpna's root-stripping (see FINDING above).
-        let cases: &[(&str, &str, &str)] = &[
-            ("abs", "/etc/hostname", "etc/hostname"),
-            ("escape", "../../outside/secret", "../../outside/secret"),
-            ("selfloop", "selfloop", "selfloop"),
-            ("dangling", "no/such/path/here", "no/such/path/here"),
+        // Each target must survive save→load verbatim, including the
+        // leading `/` of the absolute one (#465).
+        let cases: &[(&str, &str)] = &[
+            ("abs", "/etc/hostname"),
+            ("escape", "../../outside/secret"),
+            ("selfloop", "selfloop"),
+            ("dangling", "no/such/path/here"),
         ];
 
         let dir = TempDir::new().unwrap();
@@ -1510,22 +1515,20 @@ mod tests {
 
         // Build a tree with one symlink per edge shape, then persist it.
         let mut tree = load(&path, None).unwrap();
-        for (name, created, _) in cases {
+        for (name, target) in cases {
             let node = tree
                 .create_symlink(
                     ROOT_INODE,
                     std::ffi::OsStr::new(name),
-                    std::path::Path::new(created),
+                    std::path::Path::new(target),
                     Owner::new(0, 0),
                 )
                 .unwrap();
-            // In-memory (pre-save) the target is stored verbatim, including
-            // the leading slash — the degradation happens only on save.
             match &node.content {
                 FsContent::Symlink(t) => {
                     assert_eq!(
                         t,
-                        std::ffi::OsStr::new(created),
+                        std::ffi::OsStr::new(target),
                         "{name:?} verbatim in-memory"
                     )
                 }
@@ -1535,11 +1538,11 @@ mod tests {
         assert!(tree.is_dirty());
         save(&tree).unwrap();
 
-        // Reload from disk and assert readlink byte-accuracy + lookup for
-        // every shape, including the dangling one (load must not resolve
-        // or reject an unresolvable target).
+        // Reload and assert readlink byte-accuracy + lookup for every
+        // shape, including the dangling one (load must not resolve or
+        // reject an unresolvable target).
         let reloaded = load(&path, None).unwrap();
-        for (name, _, expected) in cases {
+        for (name, target) in cases {
             let node = reloaded
                 .lookup_child(ROOT_INODE, std::ffi::OsStr::new(name))
                 .unwrap_or_else(|| panic!("symlink {name:?} missing after round-trip"));
@@ -1551,28 +1554,26 @@ mod tests {
             match &node.content {
                 FsContent::Symlink(t) => assert_eq!(
                     t,
-                    std::ffi::OsStr::new(expected),
-                    "{name:?} target after save→load"
+                    std::ffi::OsStr::new(target),
+                    "{name:?} target must round-trip verbatim (#465)"
                 ),
                 _ => panic!(
                     "{name:?} expected symlink content, got kind {:?}",
                     node.attr.kind
                 ),
             }
-            // FINDING 2 pinned: reloaded symlinks report attr.size == 0
-            // (the load path never sets it). POSIX would expect the target
-            // length here; this asserts the current bug, not desired POSIX.
+            // #466: lstat on a symlink reports st_size == target length.
             assert_eq!(
-                node.attr.size, 0,
-                "{name:?} reloaded symlink attr.size is currently 0 (FINDING 2)"
+                node.attr.size,
+                target.len() as u64,
+                "{name:?} reloaded symlink attr.size must equal target length (#466)"
             );
         }
 
-        // A second save → load is idempotent: the post-save target shape
-        // does not drift further.
+        // A second save → load is idempotent: targets do not drift.
         save(&reloaded).unwrap();
         let twice = load(&path, None).unwrap();
-        for (name, _, expected) in cases {
+        for (name, target) in cases {
             let node = twice
                 .lookup_child(ROOT_INODE, std::ffi::OsStr::new(name))
                 .unwrap();
@@ -1580,12 +1581,17 @@ mod tests {
                 FsContent::Symlink(t) => {
                     assert_eq!(
                         t,
-                        std::ffi::OsStr::new(expected),
+                        std::ffi::OsStr::new(target),
                         "{name:?} drifted on second reload"
                     )
                 }
                 _ => panic!("{name:?} expected symlink, got kind {:?}", node.attr.kind),
             }
+            assert_eq!(
+                node.attr.size,
+                target.len() as u64,
+                "{name:?} attr.size drifted on second reload (#466)"
+            );
         }
     }
 }
