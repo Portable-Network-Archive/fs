@@ -61,21 +61,6 @@ Mount archive:
 $ pnafs mount archive.pna /mnt/pnafs/
 ```
 
-#### Special files are not persisted
-
-Special files — named pipes (fifo), sockets, and device nodes — are
-supported only in memory while a writable archive is mounted. The PNA
-format has no on-disk representation for them, so they are dropped
-(with a warning) when the archive is saved. Any such node you
-create while mounted will disappear from the archive once it is written
-back; this is a data-loss risk, so avoid relying on special files inside
-a PNA-FS mount.
-
-```bash
-$ mkfifo /mnt/pnafs/pipe   # exists during the mount
-$ # ...after unmount and reload, /mnt/pnafs/pipe is gone
-```
-
 ### Testing
 
 ```bash
