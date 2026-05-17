@@ -3027,12 +3027,12 @@ mod tests {
         a.finalize().unwrap();
 
         let mut tree = crate::archive_io::load(&archive, None).unwrap();
-        let (_, node) = tree
-            .children(ROOT_INODE)
-            .unwrap()
-            .find(|(n, _)| n.to_str() == Some("doomed.txt"))
-            .unwrap();
-        let ino = node.attr.ino.0;
+        let ino = tree
+            .lookup_child(ROOT_INODE, OsStr::new("doomed.txt"))
+            .expect("doomed.txt must exist after load")
+            .attr
+            .ino
+            .0;
 
         // Open a handle, then unlink the only directory entry.
         tree.bump_open(ino).unwrap();
