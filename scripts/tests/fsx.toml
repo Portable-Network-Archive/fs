@@ -15,6 +15,9 @@ flen = 1048576
 # round-trips through FUSE.
 nomsyncafterwrite = true
 
+# min must stay >= 1: a 0-length posix_fallocate makes glibc return
+# EINVAL on every filesystem, and fsx-rs has no len==0 skip for it (it
+# does for read/punch_hole), so it aborts the whole run. See #448.
 [opsize]
 max = 65536
 min = 1
