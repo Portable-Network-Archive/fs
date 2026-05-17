@@ -92,3 +92,67 @@ fn mount_archive(
     mount2(fs, mount_point, &config)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::WriteStrategy;
+    use crate::cli::{Cli, SubCommand};
+    use clap::Parser;
+
+    fn parse_mount(args: &[&str]) -> Result<super::MountOptions, clap::Error> {
+        let argv = ["pnafs", "mount"]
+            .iter()
+            .copied()
+            .chain(args.iter().copied())
+            .chain(["archive.pna", "mnt"]);
+        let cli = Cli::try_parse_from(argv)?;
+        match cli.subcommand {
+            SubCommand::Mount(m) => Ok(m.mount_options),
+            _ => unreachable!("mount subcommand requested"),
+        }
+    }
+
+    #[test]
+    fn default_is_read_only() {
+        let opts = parse_mount(&[]).unwrap();
+        assert!(!opts.write);
+        assert!(opts.write_strategy == WriteStrategy::Lazy);
+    }
+
+    #[test]
+    fn write_enables_default_lazy_strategy() {
+        let opts = parse_mount(&["--write"]).unwrap();
+        assert!(opts.write);
+        assert!(opts.write_strategy == WriteStrategy::Lazy);
+    }
+
+    #[test]
+    fn write_strategy_immediate_with_write() {
+        let opts = parse_mount(&["--write", "--write-strategy", "immediate"]).unwrap();
+        assert!(opts.write);
+        assert!(opts.write_strategy == WriteStrategy::Immediate);
+    }
+
+    #[test]
+    fn write_strategy_immediate_requires_write() {
+        let err = match parse_mount(&["--write-strategy", "immediate"]) {
+            Err(e) => e,
+            Ok(_) => panic!("--write-strategy without --write should be a parse error"),
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    fn allow_root_parses() {
+        let opts = parse_mount(&["--allow-root"]).unwrap();
+        assert!(opts.allow_root);
+        assert!(!opts.allow_other);
+    }
+
+    #[test]
+    fn allow_other_parses() {
+        let opts = parse_mount(&["--allow-other"]).unwrap();
+        assert!(opts.allow_other);
+        assert!(!opts.allow_root);
+    }
+}
