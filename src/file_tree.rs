@@ -2538,6 +2538,92 @@ mod tests {
         assert_eq!(bytes_a, b"BBB");
     }
 
+    #[test]
+    fn rename_whiteout_is_rejected() {
+        // RENAME_WHITEOUT needs an overlay backend pnafs does not
+        // provide, so the flag is refused before touching the tree.
+        // (The code returns ENOTSUP — the man page lets a filesystem
+        // signal "unsupported" for whiteout; assert the actual contract.)
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+            .unwrap();
+        let mut flags = fuser::RenameFlags::empty();
+        flags.insert(fuser::RenameFlags::RENAME_WHITEOUT);
+        assert_errno(
+            tree.rename(
+                ROOT_INODE,
+                OsStr::new("a.txt"),
+                ROOT_INODE,
+                OsStr::new("b.txt"),
+                flags,
+            )
+            .unwrap_err(),
+            fuser::Errno::ENOTSUP,
+        );
+        // Source untouched, no phantom destination created.
+        assert!(tree.lookup_child(ROOT_INODE, OsStr::new("a.txt")).is_some());
+        assert!(tree.lookup_child(ROOT_INODE, OsStr::new("b.txt")).is_none());
+    }
+
+    #[test]
+    fn rename_same_path_is_noop_ok() {
+        // POSIX rename(2): if oldpath and newpath resolve to the same
+        // entry, rename returns success and changes nothing.
+        let mut tree = make_tree();
+        let ino = tree
+            .create_file(ROOT_INODE, OsStr::new("same.txt"), 0o644, Owner::new(0, 0))
+            .unwrap()
+            .attr
+            .ino
+            .0;
+        tree.write_file(ino, 0, b"unchanged").unwrap();
+        tree.rename(
+            ROOT_INODE,
+            OsStr::new("same.txt"),
+            ROOT_INODE,
+            OsStr::new("same.txt"),
+            fuser::RenameFlags::empty(),
+        )
+        .unwrap();
+        let still = tree
+            .lookup_child(ROOT_INODE, OsStr::new("same.txt"))
+            .expect("entry must still exist after self-rename");
+        assert_eq!(still.attr.ino.0, ino, "inode identity preserved");
+        assert_eq!(read_file_data(&tree, ino), b"unchanged");
+    }
+
+    #[test]
+    fn rename_exchange_with_absent_side_returns_enoent() {
+        // RENAME_EXCHANGE requires BOTH endpoints to exist; if the
+        // destination is missing the swap fails with ENOENT and the
+        // existing source entry is left intact.
+        let mut tree = make_tree();
+        tree.create_file(ROOT_INODE, OsStr::new("present.txt"), 0o644, Owner::new(0, 0))
+            .unwrap();
+        let mut flags = fuser::RenameFlags::empty();
+        flags.insert(fuser::RenameFlags::RENAME_EXCHANGE);
+        assert_errno(
+            tree.rename(
+                ROOT_INODE,
+                OsStr::new("present.txt"),
+                ROOT_INODE,
+                OsStr::new("absent.txt"),
+                flags,
+            )
+            .unwrap_err(),
+            fuser::Errno::ENOENT,
+        );
+        assert!(
+            tree.lookup_child(ROOT_INODE, OsStr::new("present.txt"))
+                .is_some(),
+            "source must survive a failed EXCHANGE"
+        );
+        assert!(
+            tree.lookup_child(ROOT_INODE, OsStr::new("absent.txt"))
+                .is_none()
+        );
+    }
+
     // ── setxattr / removexattr ────────────────────────────────────
 
     #[test]
