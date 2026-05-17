@@ -22,7 +22,7 @@ cleanup() {
   if [ -n "${MOUNT_PID:-}" ]; then
     kill "$MOUNT_PID" 2>/dev/null || true
   fi
-  if mount | grep -q "$MOUNTPOINT"; then
+  if mount | grep -qF " on $MOUNTPOINT "; then
     fusermount -u "$MOUNTPOINT" 2>/dev/null || umount "$MOUNTPOINT" 2>/dev/null || true
   fi
   rm -rf "$WORKDIR"
@@ -43,10 +43,10 @@ mount_ro() {
   "$PNAFS_BIN" mount "$ARCHIVE" "$MOUNTPOINT" &
   MOUNT_PID=$!
   for _ in $(seq 1 20); do
-    if mount | grep -q "$MOUNTPOINT"; then break; fi
+    if mount | grep -qF " on $MOUNTPOINT "; then break; fi
     sleep 0.5
   done
-  mount | grep -q "$MOUNTPOINT" || fail "mount did not succeed" "pnafs mount (read-only)"
+  mount | grep -qF " on $MOUNTPOINT " || fail "mount did not succeed" "pnafs mount (read-only)"
 }
 
 unmount_wait() {
