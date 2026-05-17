@@ -412,8 +412,11 @@ struct Expectations {
 fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
     let mut exp = Expectations::default();
     for op in ops {
-        let files = collect_file_paths(tree);
-        let any_paths = collect_all_paths(tree);
+        // One DFS traversal per op (still recomputed every iteration
+        // so it reflects the tree state left by prior ops); the three
+        // path inventories are derived from that single walk instead
+        // of re-traversing the tree once per helper / per arm.
+        let (files, dirs, any_paths) = collect_inventories(tree);
         match op {
             FsOp::WriteOver { target, content } => {
                 if files.is_empty() {
@@ -458,7 +461,6 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                 let _ = tree.unlink(parent_ino, &leaf);
             }
             FsOp::Mkdir { parent, name } => {
-                let dirs = collect_dir_paths(tree);
                 if dirs.is_empty() {
                     continue;
                 }
@@ -474,7 +476,6 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                 let _ = tree.make_dir(parent_ino, OsStr::new(name), 0o755, 0, Owner::new(0, 0));
             }
             FsOp::Rmdir { target } => {
-                let dirs = collect_dir_paths(tree);
                 // Skip the root: rmdir on `/` is meaningless and the
                 // generator picking it would just contribute to the
                 // empty-op rate.
@@ -541,7 +542,6 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                 if nonroot.is_empty() {
                     continue;
                 }
-                let dirs = collect_dir_paths(tree);
                 let src_path = nonroot[source.index(nonroot.len())];
                 let Some((old_parent, old_leaf)) = split_parent_leaf(tree, src_path) else {
                     continue;
@@ -586,7 +586,6 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                 if files.is_empty() {
                     continue;
                 }
-                let dirs = collect_dir_paths(tree);
                 let source_path = &files[source.index(files.len())];
                 let Some(source_ino) = tree.resolve_path(Path::new(source_path)) else {
                     continue;
@@ -642,39 +641,36 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
     exp
 }
 
-/// Snapshot of every File path visible in `tree`, DFS-ordered. All
-/// `collect_*_paths` helpers return POSIX-relative paths with no
-/// leading `/`; the archive root is the empty string, and a file
-/// `f.txt` directly under root is just `"f.txt"`. Callers that need
-/// to split parent / leaf must therefore special-case the empty
-/// parent as `ROOT_INODE`.
-fn collect_file_paths(tree: &FileTree) -> Vec<String> {
-    tree.collect_dfs()
-        .into_iter()
-        .filter_map(|(_ino, node, path)| matches!(node.content, FsContent::File(_)).then_some(path))
-        .collect()
-}
-
-/// Snapshot of every Directory path visible in `tree`, DFS-ordered.
-/// Includes the root, represented as the empty string.
-fn collect_dir_paths(tree: &FileTree) -> Vec<String> {
-    let mut paths: Vec<String> = vec![String::new()];
-    paths.extend(
-        tree.collect_dfs()
-            .into_iter()
-            .filter_map(|(_ino, node, path)| {
-                matches!(node.content, FsContent::Directory(_)).then_some(path)
-            }),
-    );
-    paths
-}
-
-/// Snapshot of every observable path (files + dirs + symlinks +
-/// specials + the root, represented as the empty string).
-fn collect_all_paths(tree: &FileTree) -> Vec<String> {
-    let mut paths: Vec<String> = vec![String::new()];
-    paths.extend(tree.collect_dfs().into_iter().map(|(_, _, p)| p));
-    paths
+/// Derive the three path inventories an op may need from a **single**
+/// `collect_dfs()` traversal, returned as `(files, dirs, all)`:
+///
+/// * `files` — every File path, DFS-ordered, no root entry.
+/// * `dirs`  — the root (empty string) followed by every Directory
+///   path, DFS-ordered.
+/// * `all`   — the root (empty string) followed by every observable
+///   path (files + dirs + symlinks + specials), DFS-ordered.
+///
+/// All paths are POSIX-relative with no leading `/`; the archive root
+/// is the empty string, and a file `f.txt` directly under root is
+/// just `"f.txt"`. Callers that split parent / leaf must therefore
+/// special-case the empty parent as `ROOT_INODE`. Each list is
+/// byte-for-byte what the former per-kind helpers produced — this is
+/// purely a de-duplication of the redundant per-op / per-helper DFS
+/// walks, not a change to ordering or contents.
+fn collect_inventories(tree: &FileTree) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let dfs = tree.collect_dfs();
+    let mut files = Vec::new();
+    let mut dirs = vec![String::new()];
+    let mut all = vec![String::new()];
+    for (_ino, node, path) in dfs {
+        match node.content {
+            FsContent::File(_) => files.push(path.clone()),
+            FsContent::Directory(_) => dirs.push(path.clone()),
+            _ => {}
+        }
+        all.push(path);
+    }
+    (files, dirs, all)
 }
 
 /// Split a POSIX-relative path (no leading `/`, root = `""`) into its
