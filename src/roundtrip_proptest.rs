@@ -1118,7 +1118,7 @@ fn build_and_save(archive_path: &Path, input: &TestInput) -> io::Result<Vec<(Str
         build_child(&mut tree, ROOT_INODE, name, spec)?;
     }
     let placed = apply_hardlinks(&mut tree, &input.root, &input.hardlinks);
-    archive_io::save(&mut tree)?;
+    archive_io::save(&tree)?;
     Ok(placed)
 }
 
@@ -1200,17 +1200,19 @@ enum Observed {
 // reload so each property doesn't replay the costly part of the
 // pipeline four times over.
 
-/// Common preamble: build the spec into a fresh archive, save, load
-/// once. Returns (placed hardlinks, post-load snapshot, raw archive
-/// bytes).
-fn build_save_load(
-    input: &TestInput,
-    archive: &Path,
-) -> (
+/// `(placed hardlinks, post-load snapshot, raw archive bytes)` — the
+/// cached result of one `build_and_save` + reload that the per-SPEC
+/// properties share.
+type BuildSaveLoad = (
     Vec<(String, String)>,
     BTreeMap<String, ObservedNode>,
     Vec<u8>,
-) {
+);
+
+/// Common preamble: build the spec into a fresh archive, save, load
+/// once. Returns (placed hardlinks, post-load snapshot, raw archive
+/// bytes).
+fn build_save_load(input: &TestInput, archive: &Path) -> BuildSaveLoad {
     let placed_links = build_and_save(archive, input).unwrap();
     let tree = archive_io::load(archive, input.password.clone()).unwrap();
     let snap = snapshot(&tree);
@@ -1244,8 +1246,8 @@ fn assert_save_is_idempotent(
     archive: &Path,
     snap_first: &BTreeMap<String, ObservedNode>,
 ) -> Result<(), TestCaseError> {
-    let mut tree = archive_io::load(archive, input.password.clone()).unwrap();
-    archive_io::save(&mut tree).unwrap();
+    let tree = archive_io::load(archive, input.password.clone()).unwrap();
+    archive_io::save(&tree).unwrap();
     let after_second_load = archive_io::load(archive, input.password.clone()).unwrap();
     let snap_second = snapshot(&after_second_load);
     prop_assert_eq!(snap_first, &snap_second, "second round-trip drifted");
@@ -1521,7 +1523,7 @@ proptest! {
             }
         }
 
-        archive_io::save(&mut tree).unwrap();
+        archive_io::save(&tree).unwrap();
 
         let after_mutated_save = archive_io::load(&archive, None).unwrap();
         let snap_first = snapshot(&after_mutated_save);
@@ -1550,8 +1552,8 @@ proptest! {
         build_and_save(&archive, &input).unwrap();
         let bytes_first = std::fs::read(&archive).unwrap();
 
-        let mut tree = archive_io::load(&archive, None).unwrap();
-        archive_io::save(&mut tree).unwrap();
+        let tree = archive_io::load(&archive, None).unwrap();
+        archive_io::save(&tree).unwrap();
         let bytes_second = std::fs::read(&archive).unwrap();
 
         prop_assert_eq!(

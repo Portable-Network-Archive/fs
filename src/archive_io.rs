@@ -864,7 +864,7 @@ mod tests {
         let mut tree = tree;
         // Touch the file to flip Clean -> Dirty so save will rewrite it.
         tree.write_file(ino, 0, b"x").unwrap();
-        save(&mut tree).unwrap();
+        save(&tree).unwrap();
         let reloaded = load(&path, None).unwrap();
         let (_, node) = reloaded
             .children(ROOT_INODE)
@@ -895,7 +895,7 @@ mod tests {
         let ino = node.attr.ino.0;
         // Touch the file to flip Clean -> Dirty so save will rewrite it.
         tree.write_file(ino, 0, b"x").unwrap();
-        save(&mut tree).unwrap();
+        save(&tree).unwrap();
 
         // Reload **without** the password — if save re-encrypted, this
         // would now require one and decoding `b"plaintext-bytes"` would
@@ -940,11 +940,11 @@ mod tests {
         // output if iteration ever became insertion-order-dependent.
         tree.setxattr(ino, "user.zz", b"late", 0).unwrap();
         tree.setxattr(ino, "user.aa", b"early", 0).unwrap();
-        save(&mut tree).unwrap();
+        save(&tree).unwrap();
         let bytes_first = std::fs::read(&path).unwrap();
 
-        let mut tree2 = load(&path, None).unwrap();
-        save(&mut tree2).unwrap();
+        let tree2 = load(&path, None).unwrap();
+        save(&tree2).unwrap();
         let bytes_second = std::fs::read(&path).unwrap();
 
         assert_eq!(
