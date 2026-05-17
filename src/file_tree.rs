@@ -3000,6 +3000,81 @@ mod tests {
         assert!(tree.get(dst_ino).is_none());
     }
 
+    /// End-to-end regression for the unlink-while-open (orphan) lifecycle.
+    ///
+    /// Walks the full contract documented on `FsNode::open_count`:
+    /// create + write, open a handle, unlink the path, the path lookup
+    /// then fails (the FUSE `lookup` maps this `None` to `ENOENT`), the
+    /// still-open handle keeps reading the pre-unlink content, the final
+    /// release frees the orphan, and a save/reload no longer carries the
+    /// deleted file. Deterministic and seed-free: a fixed name and fixed
+    /// bytes, no `fsstress`, no randomness.
+    #[test]
+    fn unlink_while_open_orphan_lifecycle_round_trips_through_save() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("orphan.pna");
+
+        // Build an archive holding a single file with known content so
+        // the load path produces a real (non-test) FileTree to mutate.
+        let mut a = pna::Archive::write_header(std::fs::File::create(&archive).unwrap()).unwrap();
+        let mut b = pna::EntryBuilder::new_file(
+            pna::EntryName::from_lossy("doomed.txt"),
+            pna::WriteOptions::builder().build(),
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut b, b"orphan-payload").unwrap();
+        a.add_entry(b.build().unwrap()).unwrap();
+        a.finalize().unwrap();
+
+        let mut tree = crate::archive_io::load(&archive, None).unwrap();
+        let (_, node) = tree
+            .children(ROOT_INODE)
+            .unwrap()
+            .find(|(n, _)| n.to_str() == Some("doomed.txt"))
+            .unwrap();
+        let ino = node.attr.ino.0;
+
+        // Open a handle, then unlink the only directory entry.
+        tree.bump_open(ino).unwrap();
+        tree.unlink(ROOT_INODE, OsStr::new("doomed.txt")).unwrap();
+
+        // Path lookup now fails — FUSE `lookup` turns this into ENOENT.
+        assert!(
+            tree.lookup_child(ROOT_INODE, OsStr::new("doomed.txt"))
+                .is_none(),
+            "unlinked path must no longer resolve"
+        );
+
+        // The held fd keeps the inode alive as an orphan and still reads
+        // the content written before the unlink.
+        let orphan = tree.get(ino).expect("orphan inode must survive unlink");
+        assert_eq!(orphan.attr.nlink, 0);
+        assert_eq!(orphan.open_count.load(Ordering::Relaxed), 1);
+        match &orphan.content {
+            FsContent::File(fd) => assert_eq!(fd.data(), b"orphan-payload"),
+            _ => panic!("expected file content on orphan"),
+        }
+
+        // Closing the last fd frees the orphan inode.
+        let was_last = tree.release_open(ino);
+        assert!(was_last, "release of the only fd on an orphan is the last");
+        tree.try_free_orphan(ino);
+        assert!(
+            tree.get(ino).is_none(),
+            "orphan must be freed after the final release"
+        );
+
+        // Save and reload: the deleted file must be absent from the archive.
+        crate::archive_io::save(&tree).unwrap();
+        let reloaded = crate::archive_io::load(&archive, None).unwrap();
+        assert!(
+            reloaded
+                .lookup_child(ROOT_INODE, OsStr::new("doomed.txt"))
+                .is_none(),
+            "deleted file must not reappear after save/reload"
+        );
+    }
+
     #[test]
     fn unlink_keeps_inode_when_other_links_exist() {
         let (mut tree, ino) = make_tree_with_file(b"shared");
