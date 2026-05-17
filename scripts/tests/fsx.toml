@@ -17,7 +17,7 @@ nomsyncafterwrite = true
 
 [opsize]
 max = 65536
-min = 0
+min = 1
 align = 1
 
 [weights]
