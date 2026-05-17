@@ -108,7 +108,10 @@ mod tests {
         let cli = Cli::try_parse_from(argv)?;
         match cli.subcommand {
             SubCommand::Mount(m) => Ok(m.mount_options),
-            _ => unreachable!("mount subcommand requested"),
+            _ => unreachable!(
+                "argv is hard-coded with the \"mount\" subcommand, so clap cannot \
+                 parse any other variant here"
+            ),
         }
     }
 
