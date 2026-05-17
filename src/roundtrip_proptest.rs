@@ -235,6 +235,35 @@ enum FsOp {
         target_any: proptest::sample::Index,
         name: String,
     },
+    /// Rename some existing entry into a (possibly different)
+    /// directory under a new name. `source` indexes the live
+    /// non-root inventory; `dest_dir` indexes the live directory
+    /// inventory (root included). `mode` selects plain rename,
+    /// `RENAME_NOREPLACE`, or `RENAME_EXCHANGE`. Same-parent and
+    /// cross-parent moves both arise naturally (the generator does
+    /// not constrain `dest_dir` to differ from the source's parent),
+    /// as does a destination that already exists.
+    Rename {
+        source: proptest::sample::Index,
+        dest_dir: proptest::sample::Index,
+        dest_name: String,
+        mode: RenameMode,
+    },
+}
+
+/// Which flavour of `rename(2)` an `FsOp::Rename` issues. Splitting
+/// this out (rather than generating raw `fuser::RenameFlags`) keeps
+/// the shrinker working on a small closed set and documents intent.
+#[derive(Debug, Clone, Copy)]
+enum RenameMode {
+    /// Plain rename: clobbers the destination if it exists.
+    Plain,
+    /// `RENAME_NOREPLACE`: `EEXIST` (skipped) if the destination
+    /// exists.
+    NoReplace,
+    /// `RENAME_EXCHANGE`: atomically swap two existing entries;
+    /// `ENOENT` (skipped) if the destination does not exist.
+    Exchange,
 }
 
 fn arb_fs_op() -> impl Strategy<Value = FsOp> {
@@ -253,6 +282,26 @@ fn arb_fs_op() -> impl Strategy<Value = FsOp> {
             .prop_map(|(target_any, name, value)| FsOp::SetXattr { target_any, name, value }),
         1 => (any::<proptest::sample::Index>(), arb_xattr_name())
             .prop_map(|(target_any, name)| FsOp::RemoveXattr { target_any, name }),
+        3 => (
+            any::<proptest::sample::Index>(),
+            any::<proptest::sample::Index>(),
+            arb_segment(),
+            arb_rename_mode(),
+        )
+            .prop_map(|(source, dest_dir, dest_name, mode)| FsOp::Rename {
+                source,
+                dest_dir,
+                dest_name,
+                mode,
+            }),
+    ]
+}
+
+fn arb_rename_mode() -> impl Strategy<Value = RenameMode> {
+    prop_oneof![
+        3 => Just(RenameMode::Plain),
+        1 => Just(RenameMode::NoReplace),
+        1 => Just(RenameMode::Exchange),
     ]
 }
 
@@ -376,6 +425,52 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) {
                     let _ = tree.removexattr(ino, name);
                 }
             }
+            FsOp::Rename {
+                source,
+                dest_dir,
+                dest_name,
+                mode,
+            } => {
+                // Source is any non-root entry; dest parent is any
+                // live directory (root included). `dest_dir` is not
+                // constrained to differ from the source's parent, so
+                // both same-parent and cross-parent moves arise.
+                let nonroot: Vec<&String> = any_paths.iter().filter(|p| !p.is_empty()).collect();
+                if nonroot.is_empty() {
+                    continue;
+                }
+                let dirs = collect_dir_paths(tree);
+                let src_path = nonroot[source.index(nonroot.len())];
+                let Some((old_parent, old_leaf)) = split_parent_leaf(tree, src_path) else {
+                    continue;
+                };
+                let dest_dir_path = &dirs[dest_dir.index(dirs.len())];
+                let new_parent = if dest_dir_path.is_empty() {
+                    ROOT_INODE
+                } else {
+                    match tree.resolve_path(Path::new(dest_dir_path)) {
+                        Some(i) => i,
+                        None => continue,
+                    }
+                };
+                let flags = match mode {
+                    RenameMode::Plain => fuser::RenameFlags::empty(),
+                    RenameMode::NoReplace => fuser::RenameFlags::RENAME_NOREPLACE,
+                    RenameMode::Exchange => fuser::RenameFlags::RENAME_EXCHANGE,
+                };
+                // Every rejected case (ENOENT, EEXIST under
+                // NOREPLACE, ENOENT under EXCHANGE, EINVAL for a dir
+                // into its own descendant, ENOTEMPTY clobbering a
+                // populated dir) is a silently-skipped op, matching
+                // the rest of the state machine.
+                let _ = tree.rename(
+                    old_parent,
+                    &old_leaf,
+                    new_parent,
+                    OsStr::new(dest_name),
+                    flags,
+                );
+            }
         }
     }
 }
@@ -413,6 +508,22 @@ fn collect_all_paths(tree: &FileTree) -> Vec<String> {
     let mut paths: Vec<String> = vec![String::new()];
     paths.extend(tree.collect_dfs().into_iter().map(|(_, _, p)| p));
     paths
+}
+
+/// Split a POSIX-relative path (no leading `/`, root = `""`) into its
+/// `(parent_inode, leaf_name)`, resolving the parent against `tree`.
+/// Returns `None` if the path is the root, has no file name, or the
+/// parent does not resolve — every one of which an `FsOp` arm treats
+/// as "skip this op", matching the existing inline style in
+/// `UnlinkFile` / `Rmdir`.
+fn split_parent_leaf(tree: &FileTree, path: &str) -> Option<(Inode, std::ffi::OsString)> {
+    let path_buf = Path::new(path);
+    let leaf = path_buf.file_name()?.to_owned();
+    let parent_ino = match path_buf.parent() {
+        Some(p) if !p.as_os_str().is_empty() => tree.resolve_path(p)?,
+        _ => ROOT_INODE,
+    };
+    Some((parent_ino, leaf))
 }
 
 // ── Generators ─────────────────────────────────────────────────────
