@@ -2650,7 +2650,7 @@ mod tests {
             .unwrap();
         let ino = node.attr.ino.0;
         tree.setxattr(ino, "user.color", b"green", 0).unwrap();
-        crate::archive_io::save(&mut tree).unwrap();
+        crate::archive_io::save(&tree).unwrap();
 
         let reloaded = crate::archive_io::load(&archive, None).unwrap();
         let (_, n) = reloaded
@@ -2682,13 +2682,8 @@ mod tests {
     #[test]
     fn get_uid_preserves_archive_id_when_name_does_not_resolve() {
         // gname empty + numeric id that is unlikely to exist in /etc/group.
-        let permission = pna::Permission::new(
-            0xfeed_face as u64,
-            String::new(),
-            0u64,
-            String::new(),
-            0o644,
-        );
+        let permission =
+            pna::Permission::new(0xfeed_faceu64, String::new(), 0u64, String::new(), 0o644);
         let uid = get_uid(Some(&permission));
         // Archive uid must round-trip even though there's no local user.
         assert_eq!(uid, 0xfeed_face);
@@ -2696,13 +2691,8 @@ mod tests {
 
     #[test]
     fn get_gid_preserves_archive_id_when_name_does_not_resolve() {
-        let permission = pna::Permission::new(
-            0u64,
-            String::new(),
-            0xdead_beef as u64,
-            String::new(),
-            0o644,
-        );
+        let permission =
+            pna::Permission::new(0u64, String::new(), 0xdead_beefu64, String::new(), 0o644);
         let gid = get_gid(Some(&permission));
         assert_eq!(gid, 0xdead_beef);
     }
