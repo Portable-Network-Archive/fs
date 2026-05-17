@@ -468,11 +468,14 @@ struct Expectations {
     /// be renamed / unlinked by a *later* op, so the assertion only
     /// checks pairs whose both ends still resolve after reload.
     placed_links: Vec<(String, String)>,
-    /// Paths an `FsOp::Fallocate` touched, deduplicated. The expected
-    /// post-reload bytes are read from the *final* in-memory tree
-    /// (after every op) by the caller, so a later op overwriting the
-    /// same file simply changes the expectation rather than racing.
-    fallocated: std::collections::BTreeSet<String>,
+    /// Paths whose File content an op mutated in a way the generic
+    /// `size == content` invariant alone does not pin to exact bytes:
+    /// `FsOp::Fallocate` (grow / zero / punch) and the destination of
+    /// `FsOp::CopyFileRange`. Deduplicated. The expected post-reload
+    /// bytes are read from the *final* in-memory tree (after every op)
+    /// by the caller, so a later op overwriting the same file simply
+    /// changes the expectation rather than racing.
+    content_mutated: std::collections::BTreeSet<String>,
 }
 
 /// Apply `ops` to `tree`, silently skipping invalid ones. Returns the
@@ -703,7 +706,7 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                     // generated `mode` is already restricted to the
                     // three supported flavours.
                     if tree.fallocate(ino, *offset, *length, mode.flag()).is_ok() {
-                        exp.fallocated.insert(path);
+                        exp.content_mutated.insert(path);
                     }
                 }
             }
@@ -747,7 +750,7 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                 } else {
                     tree.resolve_path(Path::new(path))
                 } {
-                    let _ = tree.set_attr_full(ino, perm.map(u32::from), *uid, *gid);
+                    let _ = tree.set_attr_full(ino, (*perm).map(u32::from), *uid, *gid);
                 }
             }
             FsOp::CopyFileRange {
@@ -760,19 +763,27 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                 if files.is_empty() {
                     continue;
                 }
-                let src_path = &files[src.index(files.len())];
-                let dst_path = &files[dst.index(files.len())];
+                let src_path = files[src.index(files.len())].clone();
+                let dst_path = files[dst.index(files.len())].clone();
                 let (Some(src_ino), Some(dst_ino)) = (
-                    tree.resolve_path(Path::new(src_path)),
-                    tree.resolve_path(Path::new(dst_path)),
+                    tree.resolve_path(Path::new(&src_path)),
+                    tree.resolve_path(Path::new(&dst_path)),
                 ) else {
                     continue;
                 };
                 // Non-file endpoints (EISDIR/EINVAL) or a copy that
-                // moves nothing (Ok(0)) leave the tree unchanged; the
-                // generic post-reload invariants still cover whatever
-                // bytes did land.
-                let _ = tree.copy_file_range(src_ino, *src_offset, dst_ino, *dst_offset, *len);
+                // moves nothing (Ok(0)) leave the destination
+                // unchanged. When bytes actually land, record the
+                // destination so its content round-trips byte-exact
+                // through save→load — copy_file_range mutates dst
+                // file content exactly like Fallocate does, so it
+                // belongs in the same expectation set.
+                if let Ok(copied) =
+                    tree.copy_file_range(src_ino, *src_offset, dst_ino, *dst_offset, *len)
+                    && copied > 0
+                {
+                    exp.content_mutated.insert(dst_path);
+                }
             }
         }
     }
@@ -1541,15 +1552,16 @@ fn assert_mutation_hardlinks_equivalent(
     Ok(())
 }
 
-/// SPEC: every file an `FsOp::Fallocate` touched round-trips its size
-/// and exact bytes through `save → load`. `expected` holds the final
-/// in-memory contents (after the whole op sequence) keyed by path; a
-/// path absent from the reloaded snapshot is tolerated (a later op
-/// renamed or unlinked it). Sparse/hole structure is intentionally
-/// *not* asserted — only the observable read-back bytes and size, per
-/// issue #433's note that on-disk sparseness need not survive
-/// identically.
-fn assert_fallocate_round_trips(
+/// SPEC: every file whose content a mutation op rewrote
+/// (`FsOp::Fallocate`, or the destination of `FsOp::CopyFileRange`)
+/// round-trips its size and exact bytes through `save → load`.
+/// `expected` holds the final in-memory contents (after the whole op
+/// sequence) keyed by path; a path absent from the reloaded snapshot
+/// is tolerated (a later op renamed or unlinked it). Sparse/hole
+/// structure is intentionally *not* asserted — only the observable
+/// read-back bytes and size, per issue #433's note that on-disk
+/// sparseness need not survive identically.
+fn assert_content_mutations_round_trip(
     snap: &BTreeMap<String, ObservedNode>,
     expected: &BTreeMap<String, Vec<u8>>,
 ) -> Result<(), TestCaseError> {
@@ -1559,19 +1571,19 @@ fn assert_fallocate_round_trips(
         };
         let Observed::File { content } = &obs.kind else {
             return Err(TestCaseError::fail(format!(
-                "fallocate'd path {path} reloaded as a non-file"
+                "content-mutated path {path} reloaded as a non-file"
             )));
         };
         prop_assert_eq!(
             content,
             want,
-            "fallocate'd file {} bytes diverged across save→load",
+            "content-mutated file {} bytes diverged across save→load",
             path
         );
         prop_assert_eq!(
             obs.size,
             want.len() as u64,
-            "fallocate'd file {} attr.size {} mismatches content.len {}",
+            "content-mutated file {} attr.size {} mismatches content.len {}",
             path,
             obs.size,
             want.len()
@@ -1672,20 +1684,21 @@ proptest! {
         let mut tree = archive_io::load(&archive, None).unwrap();
         let exp = apply_ops(&mut tree, &ops);
 
-        // Expected post-reload bytes for every fallocate'd file,
-        // read from the FINAL in-memory tree (after every op) so a
-        // later op that overwrote / truncated the same file simply
-        // updates the expectation. A path may have been renamed
-        // away or unlinked by a later op; only those still present
-        // in-memory carry an expectation, and the assertion further
-        // tolerates a path missing post-reload (a later rename).
-        let mut expected_falloc: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for path in &exp.fallocated {
+        // Expected post-reload bytes for every content-mutated file
+        // (Fallocate target / CopyFileRange destination), read from
+        // the FINAL in-memory tree (after every op) so a later op
+        // that overwrote / truncated the same file simply updates the
+        // expectation. A path may have been renamed away or unlinked
+        // by a later op; only those still present in-memory carry an
+        // expectation, and the assertion further tolerates a path
+        // missing post-reload (a later rename).
+        let mut expected_content: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for path in &exp.content_mutated {
             if let Some(ino) = tree.resolve_path(Path::new(path))
                 && let Some(node) = tree.get(ino)
                 && let FsContent::File(fc) = &node.content
             {
-                expected_falloc.insert(path.clone(), fc.data().to_vec());
+                expected_content.insert(path.clone(), fc.data().to_vec());
             }
         }
 
@@ -1697,7 +1710,7 @@ proptest! {
         assert_no_orphan_inodes(&after_mutated_save)?;
         assert_file_size_matches_content(&snap_first)?;
         assert_mutation_hardlinks_equivalent(&after_mutated_save, &snap_first, &exp.placed_links)?;
-        assert_fallocate_round_trips(&snap_first, &expected_falloc)?;
+        assert_content_mutations_round_trip(&snap_first, &expected_content)?;
 
         // Idempotence under the mutated state: a second cycle from
         // here must reach the same snapshot. If a mutation produced
@@ -1912,16 +1925,17 @@ proptest! {
         let mut tree = archive_io::load(&archive, input.password.clone()).unwrap();
         let exp = apply_ops(&mut tree, &ops);
 
-        // Expected post-reload bytes for every fallocate'd file, read
-        // from the FINAL in-memory tree (after every op); see the
+        // Expected post-reload bytes for every content-mutated file
+        // (Fallocate target / CopyFileRange destination), read from
+        // the FINAL in-memory tree (after every op); see the
         // plaintext property for the rationale.
-        let mut expected_falloc: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for path in &exp.fallocated {
+        let mut expected_content: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for path in &exp.content_mutated {
             if let Some(ino) = tree.resolve_path(Path::new(path))
                 && let Some(node) = tree.get(ino)
                 && let FsContent::File(fc) = &node.content
             {
-                expected_falloc.insert(path.clone(), fc.data().to_vec());
+                expected_content.insert(path.clone(), fc.data().to_vec());
             }
         }
 
@@ -1934,7 +1948,7 @@ proptest! {
         assert_no_orphan_inodes(&after_mutated_save)?;
         assert_file_size_matches_content(&snap_first)?;
         assert_mutation_hardlinks_equivalent(&after_mutated_save, &snap_first, &exp.placed_links)?;
-        assert_fallocate_round_trips(&snap_first, &expected_falloc)?;
+        assert_content_mutations_round_trip(&snap_first, &expected_content)?;
 
         // Idempotence under the mutated, re-encrypted state: a second
         // decrypt → re-encrypt → decrypt cycle must reach the same
