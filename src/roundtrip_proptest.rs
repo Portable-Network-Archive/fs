@@ -1886,6 +1886,63 @@ proptest! {
             }
         }
     }
+
+    /// SPEC: the mutation-sequence invariants hold on the **encrypted**
+    /// path too. The plaintext `plain_mutation_sequence_survives_save_load`
+    /// only exercises `password.is_none()`; an arbitrary `Vec<FsOp>`
+    /// applied to a freshly-decrypted tree, then re-saved (re-encrypted
+    /// with a fresh IV) and reloaded with the same password, must still
+    /// satisfy every generic invariant — directory nlink, no orphans,
+    /// size==content, hardlink equivalence, fallocate round-trip — and
+    /// be idempotent under a second decrypt→mutate-free→re-encrypt
+    /// cycle. Idempotence here is the cipher / Clean-Dirty regression
+    /// guard: a node left `Dirty` by a mutation must re-encrypt on
+    /// save, and a `Clean` node must round-trip its existing ciphertext
+    /// unchanged; either accounted wrong would diverge the second
+    /// snapshot. Argon2id keeps this at the block's small case cap.
+    #[test]
+    fn encrypted_mutation_sequence_survives_save_load(
+        input in arb_test_input_encrypted(),
+        ops in prop::collection::vec(arb_fs_op(), 0..=24),
+    ) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("mut-enc.pna");
+
+        build_and_save(&archive, &input).unwrap();
+        let mut tree = archive_io::load(&archive, input.password.clone()).unwrap();
+        let exp = apply_ops(&mut tree, &ops);
+
+        // Expected post-reload bytes for every fallocate'd file, read
+        // from the FINAL in-memory tree (after every op); see the
+        // plaintext property for the rationale.
+        let mut expected_falloc: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for path in &exp.fallocated {
+            if let Some(ino) = tree.resolve_path(Path::new(path))
+                && let Some(node) = tree.get(ino)
+                && let FsContent::File(fc) = &node.content
+            {
+                expected_falloc.insert(path.clone(), fc.data().to_vec());
+            }
+        }
+
+        archive_io::save(&tree).unwrap();
+
+        let after_mutated_save =
+            archive_io::load(&archive, input.password.clone()).unwrap();
+        let snap_first = snapshot(&after_mutated_save);
+        assert_directory_nlink_posix(&snap_first)?;
+        assert_no_orphan_inodes(&after_mutated_save)?;
+        assert_file_size_matches_content(&snap_first)?;
+        assert_mutation_hardlinks_equivalent(&after_mutated_save, &snap_first, &exp.placed_links)?;
+        assert_fallocate_round_trips(&snap_first, &expected_falloc)?;
+
+        // Idempotence under the mutated, re-encrypted state: a second
+        // decrypt → re-encrypt → decrypt cycle must reach the same
+        // snapshot. `assert_save_is_idempotent` reloads with
+        // `input.password`, so this exercises the encrypted save/load
+        // path end to end.
+        assert_save_is_idempotent(&input, &archive, &snap_first)?;
+    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
