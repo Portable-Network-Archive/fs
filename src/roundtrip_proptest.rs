@@ -271,6 +271,41 @@ enum FsOp {
         length: u64,
         mode: FallocMode,
     },
+    /// Create a symlink under some existing directory parent. `parent`
+    /// indexes the live directory inventory (root included); a name
+    /// collision returns `EEXIST` and the op is silently skipped. The
+    /// target is an arbitrary path-shaped string (not required to
+    /// resolve — dangling symlinks round-trip too).
+    SymlinkCreate {
+        parent: proptest::sample::Index,
+        name: String,
+        target: String,
+    },
+    /// `chmod` / `chown` on some existing inode (POSIX `setattr`).
+    /// `target_any` indexes the live observable inventory (root
+    /// included). Each of `perm` / `uid` / `gid` is applied only when
+    /// `Some`, so the op covers chmod-only, chown-only, and combined
+    /// changes. uid / gid use the same synthetic high ranges as
+    /// `arb_meta` so the byte-identity / idempotence properties stay
+    /// host-independent.
+    SetAttr {
+        target_any: proptest::sample::Index,
+        perm: Option<u16>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    },
+    /// `copy_file_range(2)` from one existing File to another (or the
+    /// same one). `src` / `dst` index the live File inventory;
+    /// offsets / length stay small so copies land in or just past
+    /// EOF. Non-file endpoints or a length that copies nothing return
+    /// an errno / zero and the op is silently skipped.
+    CopyFileRange {
+        src: proptest::sample::Index,
+        dst: proptest::sample::Index,
+        src_offset: u64,
+        dst_offset: u64,
+        len: u64,
+    },
 }
 
 /// Which flavour of `rename(2)` an `FsOp::Rename` issues. Splitting
@@ -368,6 +403,42 @@ fn arb_fs_op() -> impl Strategy<Value = FsOp> {
                 offset,
                 length,
                 mode,
+            }),
+        2 => (
+            any::<proptest::sample::Index>(),
+            arb_segment(),
+            arb_symlink_target(),
+        )
+            .prop_map(|(parent, name, target)| FsOp::SymlinkCreate {
+                parent,
+                name,
+                target,
+            }),
+        2 => (
+            any::<proptest::sample::Index>(),
+            prop::option::of(prop::num::u16::ANY.prop_map(|m| m & 0o7777)),
+            prop::option::of(0xFEED_0000_u32..=0xFEED_FFFF_u32),
+            prop::option::of(0xDEAD_0000_u32..=0xDEAD_FFFF_u32),
+        )
+            .prop_map(|(target_any, perm, uid, gid)| FsOp::SetAttr {
+                target_any,
+                perm,
+                uid,
+                gid,
+            }),
+        2 => (
+            any::<proptest::sample::Index>(),
+            any::<proptest::sample::Index>(),
+            0u64..=8192,
+            0u64..=8192,
+            1u64..=8192,
+        )
+            .prop_map(|(src, dst, src_offset, dst_offset, len)| FsOp::CopyFileRange {
+                src,
+                dst,
+                src_offset,
+                dst_offset,
+                len,
             }),
     ]
 }
@@ -635,6 +706,73 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                         exp.fallocated.insert(path);
                     }
                 }
+            }
+            FsOp::SymlinkCreate {
+                parent,
+                name,
+                target,
+            } => {
+                // `dirs` always holds at least the root (""), so it
+                // is never empty. A name collision under the chosen
+                // parent makes `create_symlink` return EEXIST, which
+                // is one of the silently-skipped cases.
+                let parent_path = &dirs[parent.index(dirs.len())];
+                let parent_ino = if parent_path.is_empty() {
+                    ROOT_INODE
+                } else {
+                    match tree.resolve_path(Path::new(parent_path)) {
+                        Some(i) => i,
+                        None => continue,
+                    }
+                };
+                let _ = tree.create_symlink(
+                    parent_ino,
+                    OsStr::new(name),
+                    Path::new(target),
+                    Owner::new(0, 0),
+                );
+            }
+            FsOp::SetAttr {
+                target_any,
+                perm,
+                uid,
+                gid,
+            } => {
+                if any_paths.is_empty() {
+                    continue;
+                }
+                let path = &any_paths[target_any.index(any_paths.len())];
+                if let Some(ino) = if path.is_empty() {
+                    Some(ROOT_INODE)
+                } else {
+                    tree.resolve_path(Path::new(path))
+                } {
+                    let _ = tree.set_attr_full(ino, perm.map(u32::from), *uid, *gid);
+                }
+            }
+            FsOp::CopyFileRange {
+                src,
+                dst,
+                src_offset,
+                dst_offset,
+                len,
+            } => {
+                if files.is_empty() {
+                    continue;
+                }
+                let src_path = &files[src.index(files.len())];
+                let dst_path = &files[dst.index(files.len())];
+                let (Some(src_ino), Some(dst_ino)) = (
+                    tree.resolve_path(Path::new(src_path)),
+                    tree.resolve_path(Path::new(dst_path)),
+                ) else {
+                    continue;
+                };
+                // Non-file endpoints (EISDIR/EINVAL) or a copy that
+                // moves nothing (Ok(0)) leave the tree unchanged; the
+                // generic post-reload invariants still cover whatever
+                // bytes did land.
+                let _ = tree.copy_file_range(src_ino, *src_offset, dst_ino, *dst_offset, *len);
             }
         }
     }
