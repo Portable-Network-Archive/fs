@@ -3,9 +3,11 @@ use crate::file_tree::{
     make_dir_node,
 };
 use fuser::{FileAttr, FileType, INodeNo};
+#[allow(deprecated)]
+use pna::Permission;
 use pna::{
     Archive, DataKind, EntryBuilder, EntryName, EntryReference, ExtendedAttribute, HashAlgorithm,
-    NormalEntry, Permission, ReadEntry, ReadOptions, WriteOptions,
+    NormalEntry, ReadEntry, ReadOptions, WriteOptions, XattrName, XattrValue,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
@@ -271,10 +273,23 @@ fn add_normal_entry(
             DataKind::SymbolicLink => FileType::Symlink,
             // HardLink is handled above and never reaches this match.
             DataKind::HardLink => unreachable!("hardlinks are deferred to pass 2"),
+            // Reserved/Private data kinds belong to future PNA spec
+            // extensions or application-specific archives that pnafs
+            // does not know how to mount. Surfacing the error keeps
+            // load() honest rather than silently mistyping the entry.
+            DataKind::Reserved(_) | DataKind::Private(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "PNA archive entry uses an unsupported (reserved or private) data kind",
+                ));
+            }
         },
+        #[allow(deprecated)]
         perm: metadata.permission().map_or(0o775, |p| p.permissions()),
         nlink: 1,
+        #[allow(deprecated)]
         uid: get_uid(metadata.permission()),
+        #[allow(deprecated)]
         gid: get_gid(metadata.permission()),
         rdev: 0,
         blksize: 512,
@@ -286,6 +301,11 @@ fn add_normal_entry(
     let opts = ReadOptions::with_password(password);
 
     let content = match header.data_kind() {
+        // Reserved/Private kinds were rejected above; reaching this arm
+        // would mean the first match's invariant was broken.
+        DataKind::Reserved(_) | DataKind::Private(_) => {
+            unreachable!("reserved/private data kinds were rejected earlier")
+        }
         DataKind::Directory => FsContent::Directory(crate::file_tree::DirContent::new()),
         DataKind::SymbolicLink => {
             let mut buf = Vec::new();
@@ -600,15 +620,19 @@ fn finalize_primary_entry<W: IoWrite>(
 ) -> io::Result<()> {
     builder.modified(system_time_to_pna(node.attr.mtime));
     builder.created(system_time_to_pna(node.attr.crtime));
+    #[allow(deprecated)]
     builder.permission(Some(build_permission(node)));
     for (name, value) in &node.xattrs {
-        builder.add_xattr(ExtendedAttribute::new(name.clone(), value.clone()));
+        let xname = XattrName::try_from(name.as_str()).map_err(io::Error::other)?;
+        let xvalue = XattrValue::try_from(value.as_slice()).map_err(io::Error::other)?;
+        builder.add_xattr(ExtendedAttribute::new(xname, xvalue));
     }
     archive.add_entry(builder.build()?)?;
     Ok(())
 }
 
 #[cfg(unix)]
+#[allow(deprecated)]
 fn build_permission(node: &FsNode) -> Permission {
     let uname = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(node.attr.uid))
         .ok()
@@ -853,10 +877,13 @@ mod tests {
             WriteOptions::builder().build(),
         )
         .unwrap();
-        builder.add_xattr(ExtendedAttribute::new("user.tag".into(), b"red".to_vec()));
         builder.add_xattr(ExtendedAttribute::new(
-            "user.note".into(),
-            b"hello".to_vec(),
+            XattrName::try_from("user.tag").unwrap(),
+            XattrValue::try_from(b"red".as_slice()).unwrap(),
+        ));
+        builder.add_xattr(ExtendedAttribute::new(
+            XattrName::try_from("user.note").unwrap(),
+            XattrValue::try_from(b"hello".as_slice()).unwrap(),
         ));
         let entry = builder.build().unwrap();
         archive.add_entry(entry).unwrap();
