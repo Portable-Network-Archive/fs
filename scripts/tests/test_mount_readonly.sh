@@ -63,8 +63,7 @@ unmount_wait() {
   echo "original content" > seed.txt
   mkdir seeddir
   echo "nested" > seeddir/inner.txt
-  "$PNA_BIN" create "$ARCHIVE" --overwrite seed.txt seeddir 2>/dev/null ||
-    "$PNA_BIN" create --file "$ARCHIVE" --overwrite seed.txt seeddir
+  "$PNA_BIN" create --file "$ARCHIVE" --overwrite seed.txt seeddir
 )
 rm -rf "$WORKDIR/seed.txt" "$WORKDIR/seeddir"
 

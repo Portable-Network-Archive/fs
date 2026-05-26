@@ -140,7 +140,6 @@ create_seed_archive() {
   # name is just `seed.txt` (not absolute), matching the convention in the
   # other test scripts.
   (cd "$WORKDIR" && echo "seed" > seed.txt && \
-    "$PNA_BIN" create "$ARCHIVE" --overwrite seed.txt 2>/dev/null || \
     "$PNA_BIN" create --file "$ARCHIVE" --overwrite seed.txt)
   rm -f "$WORKDIR/seed.txt"
 }

@@ -22,7 +22,6 @@ trap cleanup EXIT
 
 # Create encrypted archive with one file (use relative path for predictable entry name)
 (cd "$WORKDIR" && echo "original" > seed.txt && \
-  "$PNA_BIN" create "$ARCHIVE" --overwrite --password "$PASSWORD" seed.txt 2>/dev/null || \
   "$PNA_BIN" create --file "$ARCHIVE" --overwrite --password "$PASSWORD" seed.txt)
 rm -f "$WORKDIR/seed.txt"
 

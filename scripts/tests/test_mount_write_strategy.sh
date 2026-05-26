@@ -22,7 +22,6 @@ trap cleanup EXIT
 # Create archive with a seed file using a relative path so the entry name
 # inside the archive is just "seed.txt" (not an absolute path).
 (cd "$WORKDIR" && echo "seed" > seed.txt && \
-  "$PNA_BIN" create "$ARCHIVE" --overwrite seed.txt 2>/dev/null || \
   "$PNA_BIN" create --file "$ARCHIVE" --overwrite seed.txt)
 rm -f "$WORKDIR/seed.txt"
 
