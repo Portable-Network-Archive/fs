@@ -32,7 +32,7 @@ cleanup() {
 }
 
 run() {
-  ( cd "$PROJECT_ROOT" && $PNA_BIN create "$ARCHIVE" -r src --overwrite $PNA_OPTIONS )
+  ( cd "$PROJECT_ROOT" && $PNA_BIN create --file "$ARCHIVE" -r src --overwrite $PNA_OPTIONS )
   $PNAFS_BIN mount "$ARCHIVE" "$MOUNTPOINT" $PNA_FS_OPTIONS &
   PID="$!"
   while [ ! -e "$MOUNTPOINT/src" ]; do
