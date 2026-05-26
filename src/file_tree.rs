@@ -1,6 +1,7 @@
 use fuser::{Errno, FileAttr, FileType, INodeNo, TimeOrNow};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
+#[allow(deprecated)]
 use pna::Permission;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
@@ -1450,6 +1451,7 @@ fn search_group(name: &str, id: u64) -> Option<Group> {
 /// would lose the saved owner across a save → load cycle. Only when
 /// no `Permission` is attached at all do we fall back to the caller's
 /// uid.
+#[allow(deprecated)]
 pub(crate) fn get_uid(permission: Option<&Permission>) -> u32 {
     #[cfg(unix)]
     {
@@ -1469,6 +1471,7 @@ pub(crate) fn get_uid(permission: Option<&Permission>) -> u32 {
 /// archive's numeric gid is authoritative when neither `gname` nor the
 /// numeric id resolves locally; the process gid only applies when no
 /// permission record is present.
+#[allow(deprecated)]
 pub(crate) fn get_gid(permission: Option<&Permission>) -> u32 {
     #[cfg(unix)]
     {
@@ -2232,8 +2235,8 @@ mod tests {
                 cipher: Some(c),
             }) => {
                 assert_eq!(data.as_slice(), b"world");
-                assert_eq!(c.encryption as u8, cipher_cfg.encryption as u8);
-                assert_eq!(c.cipher_mode as u8, cipher_cfg.cipher_mode as u8);
+                assert_eq!(c.encryption, cipher_cfg.encryption);
+                assert_eq!(c.cipher_mode, cipher_cfg.cipher_mode);
             }
             _ => panic!("expected Clean with cipher"),
         }
@@ -2771,6 +2774,7 @@ mod tests {
     /// This test pins that behaviour for a uid/gid that won't normally
     /// exist on a CI host.
     #[test]
+    #[allow(deprecated)]
     fn get_uid_preserves_archive_id_when_name_does_not_resolve() {
         // gname empty + numeric id that is unlikely to exist in /etc/group.
         let permission =
@@ -2781,6 +2785,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn get_gid_preserves_archive_id_when_name_does_not_resolve() {
         let permission =
             pna::Permission::new(0u64, String::new(), 0xdead_beefu64, String::new(), 0o644);
