@@ -1,4 +1,5 @@
 use crate::{
+    archive_lock::{ArchiveLock, LockMode},
     cli::PasswordArgs,
     command::{Command, ask_password},
     filesystem::{PnaFS, WriteStrategy},
@@ -64,7 +65,23 @@ fn mount_archive(
         None
     };
 
-    let fs = PnaFS::new(archive.into(), password, write_strategy)?;
+    let archive = archive.into();
+    // Mount-lifetime archive lock: shared for read-only mounts (they can
+    // coexist), exclusive for --write mounts. Taken before the archive
+    // is even read so a conflicting mount can never observe (or race)
+    // the load/save cycle. Released on drop at the end of this function
+    // — i.e. after mount2 returns on unmount — or by the kernel if the
+    // process dies.
+    let _lock = ArchiveLock::acquire(
+        &archive,
+        if write_strategy.is_some() {
+            LockMode::Exclusive
+        } else {
+            LockMode::Shared
+        },
+    )?;
+
+    let fs = PnaFS::new(archive, password, write_strategy)?;
     create_dir_all(&mount_point)?;
 
     let acl = if mount_options.allow_other {

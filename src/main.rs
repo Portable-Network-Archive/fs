@@ -5,6 +5,7 @@ use clap::Parser;
 use std::io;
 
 mod archive_io;
+mod archive_lock;
 mod cli;
 mod command;
 mod file_tree;
