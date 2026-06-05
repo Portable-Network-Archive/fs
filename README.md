@@ -98,3 +98,29 @@ a PNA-FS mount.
 $ mkfifo /mnt/pnafs/pipe   # exists during the mount
 $ # ...after unmount and reload, /mnt/pnafs/pipe is gone
 ```
+
+#### archive ... is already mounted by another pnafs instance
+
+pnafs takes a kernel `flock` on a sidecar file (`.{archive-name}.lock`,
+created next to the archive) for the lifetime of every mount: read-only
+mounts share the lock, a `--write` mount holds it exclusively. This
+error means another pnafs process has the archive mounted in a
+conflicting mode — unmount it first.
+
+The `.{archive-name}.lock` file is intentionally left in place after
+unmount (removing it would race against concurrent mounts); it is empty
+and safe to ignore. If the pnafs process dies the kernel releases the
+lock automatically, so there is no stale state to clean up.
+
+Note: on network filesystems (NFS in particular) `flock` semantics
+depend on the server and mount options, so the multi-mount guard is
+only as reliable as the underlying filesystem's `flock` support.
+
+A read-only mount that cannot take the lock for an environmental
+reason — the archive directory is not writable (read-only media, a
+shared/other-owned directory) so the sidecar cannot be created, or the
+filesystem has no `flock` support at all — still succeeds but proceeds
+without the cross-process guard (a warning is logged), rather than
+failing. An actual lock conflict is never bypassed this way. A
+`--write` mount always needs a writable directory — it rewrites the
+archive on save — so it keeps the strict lock requirement.
