@@ -37,7 +37,7 @@ pub(crate) fn cleanup_stale_tmp(archive_path: &Path) {
     let rd = match dir.read_dir() {
         Ok(rd) => rd,
         Err(e) => {
-            log::warn!("cleanup_stale_tmp: read_dir({:?}) failed: {e}", dir);
+            log::warn!("cleanup_stale_tmp: read_dir({dir:?}) failed: {e}");
             return;
         }
     };
@@ -285,7 +285,9 @@ fn add_normal_entry(
             }
         },
         #[allow(deprecated)]
-        perm: metadata.permission().map_or(0o775, |p| p.permissions()),
+        perm: metadata
+            .permission()
+            .map_or(0o775, pna::Permission::permissions),
         nlink: 1,
         #[allow(deprecated)]
         uid: get_uid(metadata.permission()),
@@ -533,10 +535,10 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
             match fs::File::open(parent_dir) {
                 Ok(dir_file) => {
                     if let Err(e) = dir_file.sync_all() {
-                        log::error!("save: parent-dir sync_all failed for {:?}: {e}", parent_dir);
+                        log::error!("save: parent-dir sync_all failed for {parent_dir:?}: {e}");
                     }
                 }
-                Err(e) => log::error!("save: cannot open parent dir {:?}: {e}", parent_dir),
+                Err(e) => log::error!("save: cannot open parent dir {parent_dir:?}: {e}"),
             }
         }
         Ok(())
@@ -645,9 +647,9 @@ fn build_permission(node: &FsNode) -> Permission {
         .map(|g| g.name)
         .unwrap_or_default();
     Permission::new(
-        node.attr.uid as u64,
+        u64::from(node.attr.uid),
         uname,
-        node.attr.gid as u64,
+        u64::from(node.attr.gid),
         gname,
         node.attr.perm,
     )
@@ -1557,7 +1559,7 @@ mod tests {
                         t,
                         std::ffi::OsStr::new(target),
                         "{name:?} verbatim in-memory"
-                    )
+                    );
                 }
                 _ => panic!("{name:?} should be a symlink in memory"),
             }
@@ -1610,7 +1612,7 @@ mod tests {
                         t,
                         std::ffi::OsStr::new(target),
                         "{name:?} drifted on second reload"
-                    )
+                    );
                 }
                 _ => panic!("{name:?} expected symlink, got kind {:?}", node.attr.kind),
             }

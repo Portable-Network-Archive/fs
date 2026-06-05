@@ -608,7 +608,7 @@ impl Filesystem for PnaFS {
         let result = match kind {
             // mknod(S_IFREG, ...) is `create()` without the returned fd.
             NodeKind::Regular => tree
-                .create_file(parent.0, name, perm as u32, owner)
+                .create_file(parent.0, name, u32::from(perm), owner)
                 .map(|n| n.attr),
             NodeKind::Special(sk) => tree
                 .create_special(parent.0, name, sk, perm, rdev, owner)
