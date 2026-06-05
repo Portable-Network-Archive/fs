@@ -12,7 +12,7 @@ use std::ffi::{CString, OsStr};
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, SystemTime};
 
 /// When to flush dirty data back to the archive.
@@ -48,6 +48,29 @@ impl PnaFS {
         } else {
             Ok(())
         }
+    }
+
+    /// Acquire the tree read lock, fail-stop on poisoning.
+    ///
+    /// All tree mutations happen under the write lock, so a panic in any
+    /// handler can leave the tree half-mutated. Once that happens the
+    /// only trustworthy state is the last successfully saved archive:
+    /// every subsequent operation fails with `EIO` instead of observing
+    /// (or persisting) a possibly-inconsistent tree.
+    fn read_tree(&self) -> Result<RwLockReadGuard<'_, FileTree>, Errno> {
+        self.tree.read().map_err(|_| {
+            log::error!("tree lock poisoned by an earlier panic; failing with EIO");
+            Errno::EIO
+        })
+    }
+
+    /// Acquire the tree write lock, fail-stop on poisoning.
+    /// See [`Self::read_tree`] for the rationale.
+    fn write_tree(&self) -> Result<RwLockWriteGuard<'_, FileTree>, Errno> {
+        self.tree.write().map_err(|_| {
+            log::error!("tree lock poisoned by an earlier panic; failing with EIO");
+            Errno::EIO
+        })
     }
 
     /// POSIX NAME_MAX on Linux. The kernel does not always enforce this before
@@ -111,7 +134,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         if let Some(node) = tree.lookup_child(parent.0, name) {
             let ttl = Duration::from_secs(1);
             reply.entry(&ttl, &node.attr, Generation(0));
@@ -123,7 +149,10 @@ impl Filesystem for PnaFS {
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         info!("[Implemented] getattr(ino: {ino:#x?}, fh: {fh:#x?})");
         let ttl = Duration::from_secs(1);
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         if let Some(node) = tree.get(ino.0) {
             reply.attr(&ttl, &node.attr);
         } else {
@@ -133,7 +162,10 @@ impl Filesystem for PnaFS {
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         info!("[Implemented] readlink(ino: {ino:#x?})");
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         if let Some(node) = tree.get(ino.0) {
             if let FsContent::Symlink(target) = &node.content {
                 reply.data(target.as_bytes());
@@ -152,7 +184,10 @@ impl Filesystem for PnaFS {
             return;
         }
         // bump_open is atomic so a read lock suffices on the FUSE hot path.
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         if let Err(e) = tree.bump_open(ino.0) {
             reply.error(e);
             return;
@@ -172,7 +207,10 @@ impl Filesystem for PnaFS {
         reply: ReplyData,
     ) {
         info!("[Implemented] read(ino: {ino:#x?}, offset: {offset}, size: {size})");
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         let node = match tree.get(ino.0) {
             Some(n) => n,
             None => {
@@ -223,7 +261,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.write_file(ino.0, offset, data) {
             Ok(written) => reply.written(written as u32),
             Err(e) => reply.error(e),
@@ -239,7 +280,10 @@ impl Filesystem for PnaFS {
         reply: ReplyEmpty,
     ) {
         info!("[Implemented] flush(ino: {ino:#x?}, fh: {fh:?}, lock_owner: {lock_owner:?})");
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         if tree.get(ino.0).is_some() {
             reply.ok();
         } else {
@@ -262,12 +306,18 @@ impl Filesystem for PnaFS {
         // write lock when this drop turns an orphan into a candidate for
         // freeing (or when the configured write strategy demands a save).
         let needs_free = {
-            let tree = self.tree.read().unwrap();
+            let tree = match self.read_tree() {
+                Ok(tree) => tree,
+                Err(e) => return reply.error(e),
+            };
             tree.release_open(ino.0)
         };
         let immediate = self.write_strategy == Some(WriteStrategy::Immediate);
         if needs_free || immediate {
-            let mut tree = self.tree.write().unwrap();
+            let mut tree = match self.write_tree() {
+                Ok(tree) => tree,
+                Err(e) => return reply.error(e),
+            };
             if needs_free {
                 tree.try_free_orphan(ino.0);
             }
@@ -290,7 +340,10 @@ impl Filesystem for PnaFS {
     ) {
         info!("[Implemented] fsync(ino: {_ino:#x?})");
         if self.write_strategy.is_some() {
-            let mut tree = self.tree.write().unwrap();
+            let mut tree = match self.write_tree() {
+                Ok(tree) => tree,
+                Err(e) => return reply.error(e),
+            };
             if let Err(e) = Self::save_if_dirty(&mut tree) {
                 log::error!("Failed to save on fsync: {e}");
                 reply.error(Errno::EIO);
@@ -317,7 +370,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.fallocate(ino.0, offset, length, mode) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -344,7 +400,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.copy_file_range(ino_in.0, offset_in, ino_out.0, offset_out, len) {
             Ok(written) => reply.written(written as u32),
             Err(e) => reply.error(e),
@@ -380,7 +439,10 @@ impl Filesystem for PnaFS {
         // (and only the owner — or root — may change gid). Without these
         // checks an --allow-other mount would let any user re-own files.
         if uid.is_some() || gid.is_some() || mode.is_some() {
-            let tree = self.tree.read().unwrap();
+            let tree = match self.read_tree() {
+                Ok(tree) => tree,
+                Err(e) => return reply.error(e),
+            };
             let node = match tree.get(ino.0) {
                 Some(n) => n,
                 None => {
@@ -404,7 +466,10 @@ impl Filesystem for PnaFS {
                 return;
             }
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         if let Some(new_size) = size
             && let Err(e) = tree.set_size(ino.0, new_size)
         {
@@ -449,7 +514,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         let existing = tree.lookup_child(parent.0, name).map(|n| n.attr.ino.0);
         let result_ino = if let Some(ino) = existing {
             if (flags & libc::O_EXCL) != 0 {
@@ -533,7 +601,10 @@ impl Filesystem for PnaFS {
         };
         let perm = (mode & !umask) as u16;
         let owner = Owner::new(req.uid(), req.gid());
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         let result = match kind {
             // mknod(S_IFREG, ...) is `create()` without the returned fd.
             NodeKind::Regular => tree
@@ -567,7 +638,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.make_dir(
             parent.0,
             name,
@@ -593,7 +667,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.unlink(parent.0, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -610,7 +687,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.rmdir(parent.0, name) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -636,7 +716,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.create_hardlink(newparent.0, newname, ino.0) {
             Ok(node) => {
                 let attr = node.attr;
@@ -663,7 +746,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.create_symlink(parent.0, name, link, Owner::new(req.uid(), req.gid())) {
             Ok(node) => {
                 let attr = node.attr;
@@ -698,7 +784,10 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.rename(parent.0, name, newparent.0, newname, flags) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -714,7 +803,10 @@ impl Filesystem for PnaFS {
         mut reply: ReplyDirectory,
     ) {
         info!("[Implemented] readdir(ino: {ino:#x?}, fh: {fh:?}, offset: {offset})");
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         let node = match tree.get(ino.0) {
             Some(n) => n,
             None => {
@@ -740,7 +832,10 @@ impl Filesystem for PnaFS {
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         info!("[Implemented] getxattr(ino: {ino:#x?}, name: {name:?}, size: {size})");
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         let Some(node) = tree.get(ino.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -782,7 +877,10 @@ impl Filesystem for PnaFS {
             reply.error(Errno::EINVAL);
             return;
         };
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.setxattr(ino.0, name_str, value, flags) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -802,7 +900,10 @@ impl Filesystem for PnaFS {
             reply.error(Errno::ENODATA);
             return;
         };
-        let mut tree = self.tree.write().unwrap();
+        let mut tree = match self.write_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         match tree.removexattr(ino.0, name_str) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
@@ -811,7 +912,10 @@ impl Filesystem for PnaFS {
 
     fn listxattr(&self, _req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
         info!("[Implemented] listxattr(ino: {ino:#x?}, size: {size})");
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         if let Some(node) = tree.get(ino.0) {
             let keys = node
                 .xattrs
@@ -835,7 +939,10 @@ impl Filesystem for PnaFS {
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
         info!("[Implemented] statfs()");
-        let tree = self.tree.read().unwrap();
+        let tree = match self.read_tree() {
+            Ok(tree) => tree,
+            Err(e) => return reply.error(e),
+        };
         let (bytes, files) = Self::usage(&tree);
         let bsize = u64::from(STATFS_BSIZE);
         let blocks = bytes.div_ceil(bsize);
@@ -850,7 +957,25 @@ impl Filesystem for PnaFS {
     fn destroy(&mut self) {
         info!("[Implemented] destroy()");
         if self.write_strategy.is_some() {
-            let tree = self.tree.get_mut().unwrap();
+            let tree = match self.tree.get_mut() {
+                Ok(tree) => tree,
+                Err(_poisoned) => {
+                    // A handler panicked while holding the lock; the tree
+                    // may be half-mutated. Overwriting the known-good
+                    // archive with it would be worse than losing the
+                    // unsaved delta, so keep the last consistent state.
+                    log::error!(
+                        "tree lock poisoned; NOT saving on unmount \
+                         (archive keeps its last consistent state)"
+                    );
+                    eprintln!(
+                        "pnafs: ERROR: an internal panic left the in-memory state \
+                         possibly inconsistent; any unsaved changes since the last \
+                         save were NOT persisted, to protect the on-disk archive"
+                    );
+                    return;
+                }
+            };
             if let Err(e) = Self::save_if_dirty(tree) {
                 eprintln!("pnafs: CRITICAL: failed to save archive on unmount: {e}");
                 log::error!("Failed to save archive on destroy: {e}");
@@ -943,6 +1068,91 @@ mod tests {
         assert!(
             large_bytes > small_bytes,
             "larger payload ({large_bytes}) should report more usage than smaller ({small_bytes})"
+        );
+    }
+
+    /// Poison the tree lock the same way a real failure would: a thread
+    /// panicking while holding the write guard.
+    fn poison_tree_lock(fs: &PnaFS) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = fs.tree.write().unwrap();
+            panic!("poison the tree lock");
+        }));
+        assert!(result.is_err());
+        assert!(fs.tree.is_poisoned());
+    }
+
+    #[test]
+    fn poisoned_lock_fails_with_eio_instead_of_panicking() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "a.pna", &[("f", b"x")]);
+        let fs = PnaFS::new(path, None, None).unwrap();
+        poison_tree_lock(&fs);
+        let read_err = fs.read_tree().map(|_| ()).unwrap_err();
+        assert_eq!(read_err.code(), Errno::EIO.code());
+        let write_err = fs.write_tree().map(|_| ()).unwrap_err();
+        assert_eq!(write_err.code(), Errno::EIO.code());
+    }
+
+    #[test]
+    fn healthy_lock_hands_out_guards() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "a.pna", &[("f", b"x")]);
+        let fs = PnaFS::new(path, None, None).unwrap();
+        assert!(fs.read_tree().is_ok());
+        assert!(fs.write_tree().is_ok());
+    }
+
+    #[test]
+    fn destroy_saves_dirty_tree() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "a.pna", &[("f", b"x")]);
+        let mut fs = PnaFS::new(path.clone(), None, Some(WriteStrategy::Lazy)).unwrap();
+        {
+            let mut tree = fs.tree.write().unwrap();
+            tree.create_file(
+                ROOT_INODE,
+                std::ffi::OsStr::new("created"),
+                0o644,
+                Owner::new(0, 0),
+            )
+            .unwrap();
+        }
+        fs.destroy();
+        let reloaded = archive_io::load(&path, None).unwrap();
+        assert!(
+            reloaded
+                .lookup_child(ROOT_INODE, std::ffi::OsStr::new("created"))
+                .is_some(),
+            "a clean destroy must persist dirty data"
+        );
+    }
+
+    #[test]
+    fn destroy_with_poisoned_lock_keeps_archive_bytes_intact() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "a.pna", &[("f", b"x")]);
+        let before = std::fs::read(&path).unwrap();
+        let mut fs = PnaFS::new(path.clone(), None, Some(WriteStrategy::Lazy)).unwrap();
+        // Dirty the tree so a save would normally rewrite the archive,
+        // then poison the lock: destroy must refuse to persist a
+        // possibly half-mutated tree over the known-good archive.
+        {
+            let mut tree = fs.tree.write().unwrap();
+            tree.create_file(
+                ROOT_INODE,
+                std::ffi::OsStr::new("doomed"),
+                0o644,
+                Owner::new(0, 0),
+            )
+            .unwrap();
+        }
+        poison_tree_lock(&fs);
+        fs.destroy();
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            before, after,
+            "poisoned destroy must not rewrite the archive"
         );
     }
 }
