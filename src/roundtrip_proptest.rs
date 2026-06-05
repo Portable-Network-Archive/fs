@@ -1114,7 +1114,7 @@ fn build_child(tree: &mut FileTree, parent: Inode, name: &str, spec: &NodeSpec) 
     match spec {
         NodeSpec::File { meta, content } => {
             let ino = tree
-                .create_file(parent, OsStr::new(name), meta.perm as u32, owner)
+                .create_file(parent, OsStr::new(name), u32::from(meta.perm), owner)
                 .map_err(|e| io::Error::other(format!("create_file: {e:?}")))?
                 .attr
                 .ino
@@ -1152,7 +1152,7 @@ fn build_child(tree: &mut FileTree, parent: Inode, name: &str, spec: &NodeSpec) 
         }
         NodeSpec::Dir { meta, children } => {
             let ino = tree
-                .make_dir(parent, OsStr::new(name), meta.perm as u32, 0, owner)
+                .make_dir(parent, OsStr::new(name), u32::from(meta.perm), 0, owner)
                 .map_err(|e| io::Error::other(format!("make_dir: {e:?}")))?
                 .attr
                 .ino

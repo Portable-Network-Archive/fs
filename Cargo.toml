@@ -45,6 +45,18 @@ macos-no-mount = ["fuser/macos-no-mount"]
 proptest = { version = "1", default-features = false, features = ["std"] }
 tempfile = "3"
 
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+uninlined_format_args = "warn"
+semicolon_if_nothing_returned = "warn"
+redundant_closure_for_method_calls = "warn"
+cast_lossless = "warn"
+
 # The profile that 'cargo dist' will build with
 [profile.dist]
 inherits = "release"

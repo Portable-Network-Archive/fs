@@ -2070,8 +2070,7 @@ mod tests {
         let err = tree.unlink(ROOT_INODE, OsStr::new("d")).unwrap_err();
         assert!(
             errno_eq(err, fuser::Errno::EPERM) || errno_eq(err, fuser::Errno::EISDIR),
-            "expected EPERM or EISDIR, got {:?}",
-            err
+            "expected EPERM or EISDIR, got {err:?}"
         );
     }
 
