@@ -1,0 +1,14 @@
+pre-release-commit-message = ":bookmark: Bump pnafs version to {{version}}"
+tag-message = ":bookmark: Release pnafs {{version}}"
+tag-name = "{{version}}"
+publish = false
+push = false
+tag = false
+
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "\\[Unreleased\\]", replace = "[{{version}}]", exactly = 2 },
+  { file = "CHANGELOG.md", search = "\\.\\.\\.HEAD", replace = "...{{version}}", exactly = 1 },
+  { file = "CHANGELOG.md", search = "ReleaseDate", replace = "{{date}}", min = 1 },
+  { file = "CHANGELOG.md", search = "<!-- next-header -->", replace = "<!-- next-header -->\n## [Unreleased] - ReleaseDate\n", exactly = 1 },
+  { file = "CHANGELOG.md", search = "<!-- next-url -->", replace = "<!-- next-url -->\n[Unreleased]: https://github.com/Portable-Network-Archive/fs/compare/{{version}}...HEAD", exactly = 1 },
+]

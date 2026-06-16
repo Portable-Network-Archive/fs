@@ -27,6 +27,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: main
 
       - name: Install Rust toolchain
         uses: ./.github/actions/setup-rust
@@ -35,6 +37,11 @@ jobs:
 
       - name: Install cargo-release
         run: cargo install --locked cargo-release --version 0.25.22
+
+      - name: Configure git author
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Get current version
         id: before_version
@@ -69,6 +76,16 @@ jobs:
           fi
           echo "value=$AFTER_VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: Update changelog
+        env:
+          CARGO_TERM_COLOR: always
+        run: cargo release replace --execute --no-confirm --allow-branch main
+
+      - name: Commit release prep
+        env:
+          CARGO_TERM_COLOR: always
+        run: cargo release commit --execute --no-confirm --allow-branch main
+
       - name: Set PR branch name
         id: branch
         run: echo "name=release/pnafs/${{ inputs.level }}-${{ steps.after_version.outputs.value }}" >> "$GITHUB_OUTPUT"
@@ -82,15 +99,13 @@ jobs:
           body: |
             Draft: release prep for `pnafs` (${{ inputs.level }}).
             - Version updated to `${{ steps.after_version.outputs.value }}`
-            - This PR only updates release version files (`Cargo.toml` / `Cargo.lock`)
+            - `CHANGELOG.md` updated for `${{ steps.after_version.outputs.value }}`
+            - This PR updates release prep files only (`Cargo.toml` / `Cargo.lock` / `CHANGELOG.md`)
             - Tag creation and publishing are not performed in this workflow
+            - GitHub Release notes are generated from `CHANGELOG.md` by the existing `Release` workflow
 
             Manual next steps:
-            1. Review and merge this PR.
+            1. Review the generated changelog entry and merge this PR.
             2. Create and push a SemVer tag without `v` prefix (example: `${{ steps.after_version.outputs.value }}`).
             3. Confirm existing `Release` and `Publish Rust crate` workflows complete successfully.
           draft: true
-          commit-message: ":bookmark: Bump pnafs version to ${{ steps.after_version.outputs.value }}"
-          add-paths: |
-            Cargo.toml
-            Cargo.lock
