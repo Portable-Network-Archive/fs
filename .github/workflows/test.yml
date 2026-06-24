@@ -37,7 +37,7 @@ jobs:
         if: startsWith(matrix.os, 'freebsd')
         run: |
           sudo pkg install -y pkgconf fusefs-libs3
-      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: target
           key: ${{ matrix.os }}-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock') }}
@@ -96,7 +96,7 @@ jobs:
           # `user_allow_other` is set in /etc/fuse.conf. The runner is
           # ephemeral, so toggling it here is safe.
           echo user_allow_other | sudo tee -a /etc/fuse.conf
-      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: target
           key: ${{ runner.os }}-pjdfstest-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'scripts/tests/test_pjdfstest.sh') }}
@@ -136,7 +136,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
-      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: target
           key: ${{ runner.os }}-fsx-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'scripts/tests/test_fsx.sh') }}
@@ -183,7 +183,7 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
-      - uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+      - uses: actions/cache@2c8a9bd7457de244a408f35966fab2fb45fda9c8 # v6.0.0
         with:
           path: target
           key: ${{ runner.os }}-fsstress-rust-${{ steps.install_rust.outputs.version }}-${{ hashFiles('**/Cargo.lock', 'scripts/tests/test_fsstress.sh') }}
