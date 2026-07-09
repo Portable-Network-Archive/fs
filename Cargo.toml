@@ -31,7 +31,7 @@ clap_complete = "4.6.5"
 fuser = "0.17.0"
 libc = "0.2.186"
 log = "0.4.32"
-pna = "0.34.0"
+pna = "0.35.0"
 rpassword = "7.5.4"
 simple_logger = { version = "5.2.0" , optional = true }
 
