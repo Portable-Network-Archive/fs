@@ -44,13 +44,13 @@ pub(crate) struct CipherConfig {
 impl CipherConfig {
     pub(crate) fn default_for_password() -> Self {
         Self {
-            encryption: pna::Encryption::Aes,
+            encryption: pna::Encryption::AES,
             cipher_mode: pna::CipherMode::CTR,
         }
     }
 
     pub(crate) fn from_entry_header(header: &pna::EntryHeader) -> Option<Self> {
-        if header.encryption() != pna::Encryption::No {
+        if header.encryption() != pna::Encryption::NO {
             Some(Self {
                 encryption: header.encryption(),
                 cipher_mode: header.cipher_mode(),
@@ -2726,7 +2726,7 @@ mod tests {
         std::fs::write(dir.path().join("seed.txt"), b"seed").unwrap();
         // Build an empty plaintext archive so load succeeds.
         let mut a = pna::Archive::write_header(std::fs::File::create(&archive).unwrap()).unwrap();
-        let mut b = pna::EntryBuilder::new_file(
+        let mut b = pna::FileEntryBuilder::new_with_options(
             pna::EntryName::from_lossy("doc.txt"),
             pna::WriteOptions::builder().build(),
         )
@@ -3102,7 +3102,7 @@ mod tests {
         // Build an archive holding a single file with known content so
         // the load path produces a real (non-test) FileTree to mutate.
         let mut a = pna::Archive::write_header(std::fs::File::create(&archive).unwrap()).unwrap();
-        let mut b = pna::EntryBuilder::new_file(
+        let mut b = pna::FileEntryBuilder::new_with_options(
             pna::EntryName::from_lossy("doomed.txt"),
             pna::WriteOptions::builder().build(),
         )
@@ -3676,7 +3676,7 @@ mod tests {
         let mut fd = FileData::Clean {
             data: vec![1, 2, 3],
             cipher: Some(CipherConfig {
-                encryption: pna::Encryption::Aes,
+                encryption: pna::Encryption::AES,
                 cipher_mode: pna::CipherMode::CTR,
             }),
         };
@@ -3685,7 +3685,7 @@ mod tests {
             cipher: Some(c), ..
         } = &fd
         {
-            assert!(matches!(c.encryption, pna::Encryption::Aes));
+            assert!(matches!(c.encryption, pna::Encryption::AES));
         } else {
             panic!("expected Dirty with cipher");
         }
@@ -3696,7 +3696,7 @@ mod tests {
         let mut fd = FileData::Dirty {
             data: vec![10, 20],
             cipher: Some(CipherConfig {
-                encryption: pna::Encryption::Aes,
+                encryption: pna::Encryption::AES,
                 cipher_mode: pna::CipherMode::CTR,
             }),
         };

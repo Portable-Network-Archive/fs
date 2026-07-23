@@ -6,8 +6,9 @@ use fuser::{FileAttr, FileType, INodeNo};
 #[allow(deprecated)]
 use pna::Permission;
 use pna::{
-    Archive, DataKind, EntryBuilder, EntryName, EntryReference, ExtendedAttribute, HashAlgorithm,
-    NormalEntry, ReadEntry, ReadOptions, WriteOptions, XattrName, XattrValue,
+    Archive, DataKind, EntryName, EntryReference, ExtendedAttribute, HardLinkEntryBuilder,
+    HashAlgorithm, Metadata, NormalEntry, OpaqueEntryBuilder, ReadEntry, ReadOptions, WriteOptions,
+    XattrName, XattrValue,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
@@ -115,7 +116,8 @@ pub(crate) fn load(archive_path: &Path, password: Option<String>) -> io::Result<
                 }
             }
             ReadEntry::Solid(solid) => {
-                for e in solid.entries(pw)? {
+                let solid_opts = ReadOptions::with_password(pw);
+                for e in solid.entries(&solid_opts)? {
                     if let Some(p) = add_normal_entry(&mut tree, e?, pw)? {
                         pending_hardlinks.push(p);
                     }
@@ -225,7 +227,7 @@ fn add_normal_entry(
     let metadata = entry.metadata();
     let entry_path = header.path().as_path().to_path_buf();
 
-    if header.data_kind() == DataKind::HardLink {
+    if header.data_kind() == DataKind::HARD_LINK {
         let opts = ReadOptions::with_password(password);
         let mut buf = Vec::new();
         entry.reader(&opts)?.read_to_end(&mut buf)?;
@@ -268,16 +270,16 @@ fn add_normal_entry(
             .created()
             .map_or(now, |d| SystemTime::UNIX_EPOCH + d),
         kind: match header.data_kind() {
-            DataKind::File => FileType::RegularFile,
-            DataKind::Directory => FileType::Directory,
-            DataKind::SymbolicLink => FileType::Symlink,
+            DataKind::FILE => FileType::RegularFile,
+            DataKind::DIRECTORY => FileType::Directory,
+            DataKind::SYMBOLIC_LINK => FileType::Symlink,
             // HardLink is handled above and never reaches this match.
-            DataKind::HardLink => unreachable!("hardlinks are deferred to pass 2"),
-            // Reserved/Private data kinds belong to future PNA spec
+            DataKind::HARD_LINK => unreachable!("hardlinks are deferred to pass 2"),
+            // Reserved/private data kinds belong to future PNA spec
             // extensions or application-specific archives that pnafs
             // does not know how to mount. Surfacing the error keeps
             // load() honest rather than silently mistyping the entry.
-            DataKind::Reserved(_) | DataKind::Private(_) => {
+            _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
                     "PNA archive entry uses an unsupported (reserved or private) data kind",
@@ -303,13 +305,8 @@ fn add_normal_entry(
     let opts = ReadOptions::with_password(password);
 
     let content = match header.data_kind() {
-        // Reserved/Private kinds were rejected above; reaching this arm
-        // would mean the first match's invariant was broken.
-        DataKind::Reserved(_) | DataKind::Private(_) => {
-            unreachable!("reserved/private data kinds were rejected earlier")
-        }
-        DataKind::Directory => FsContent::Directory(crate::file_tree::DirContent::new()),
-        DataKind::SymbolicLink => {
+        DataKind::DIRECTORY => FsContent::Directory(crate::file_tree::DirContent::new()),
+        DataKind::SYMBOLIC_LINK => {
             let mut buf = Vec::new();
             entry.reader(&opts)?.read_to_end(&mut buf)?;
             let target = std::ffi::OsString::from(String::from_utf8_lossy(&buf).into_owned());
@@ -320,7 +317,7 @@ fn add_normal_entry(
             attr.size = target.len() as u64;
             FsContent::Symlink(target)
         }
-        DataKind::File => {
+        DataKind::FILE => {
             // Always decode: fSIZ is only a hint and must not be trusted for
             // attr.size or any load-strategy decisions.  The only reliable
             // source of the true file size is the decoded data itself.
@@ -329,10 +326,13 @@ fn add_normal_entry(
             attr.size = buf.len() as u64;
             FsContent::File(FileData::Clean { data: buf, cipher })
         }
-        DataKind::HardLink => unreachable!("hardlinks are deferred to pass 2"),
+        DataKind::HARD_LINK => unreachable!("hardlinks are deferred to pass 2"),
+        // Reserved/private kinds were rejected above; reaching this arm
+        // would mean the first match's invariant was broken.
+        _ => unreachable!("reserved/private data kinds were rejected earlier"),
     };
 
-    let xattrs = entry
+    let xattrs = metadata
         .xattrs()
         .iter()
         .map(|x| (x.name().to_owned(), x.value().to_vec()))
@@ -445,7 +445,9 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
 
             match &node.content {
                 FsContent::Directory(_) => {
-                    finalize_primary_entry(&mut archive, EntryBuilder::new_dir(entry_name), node)?;
+                    #[allow(deprecated)]
+                    let builder = OpaqueEntryBuilder::new_dir(entry_name);
+                    finalize_primary_entry(&mut archive, builder, node)?;
                 }
                 FsContent::Symlink(target) => {
                     if let Some(original) = primary_path.get(ino) {
@@ -468,7 +470,8 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
                         // byte-accuracy. The lossy, root-preserving variant
                         // keeps the same infallible/lossy contract.
                         let reference = EntryReference::from_path_lossy_preserve_root(&target_path);
-                        let builder = EntryBuilder::new_symlink(entry_name, reference)?;
+                        #[allow(deprecated)]
+                        let builder = OpaqueEntryBuilder::new_symlink(entry_name, reference)?;
                         finalize_primary_entry(&mut archive, builder, node)?;
                     }
                 }
@@ -484,7 +487,8 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
                     } else {
                         primary_path.insert(*ino, archive_path_str.clone());
                         let write_opts = build_write_options(fc, tree.password())?;
-                        let mut builder = EntryBuilder::new_file(entry_name, write_opts)?;
+                        #[allow(deprecated)]
+                        let mut builder = OpaqueEntryBuilder::new_file(entry_name, write_opts)?;
                         builder.write_all(fc.data())?;
                         finalize_primary_entry(&mut archive, builder, node)?;
                     }
@@ -565,9 +569,12 @@ fn write_hardlink_entry<W: IoWrite>(
     // constructor as the symlink path for one consistent contract.
     let reference =
         EntryReference::from_path_lossy_preserve_root(&std::path::PathBuf::from(primary_path));
-    let mut builder = EntryBuilder::new_hard_link(entry_name, reference)?;
-    builder.modified(system_time_to_pna(mtime));
-    builder.created(system_time_to_pna(crtime));
+    let mut builder = HardLinkEntryBuilder::new(entry_name, reference)?;
+    builder.metadata(
+        Metadata::new()
+            .with_modified(system_time_to_pna(mtime))
+            .with_created(system_time_to_pna(crtime)),
+    );
     let entry = builder.build()?;
     archive.add_entry(entry)?;
     Ok(())
@@ -615,14 +622,21 @@ fn system_time_to_pna(t: SystemTime) -> Option<pna::Duration> {
 /// Stamp `node`'s mtime / crtime / permission / xattrs onto `builder`,
 /// build the entry, and append it to `archive`. Centralised so that all
 /// primary-entry paths (file, dir, symlink) round-trip the same metadata.
+///
+/// Deliberately uses `OpaqueEntryBuilder`'s deprecated per-field setters
+/// (`.modified()` / `.created()` / `.permission()` / `.add_xattr()`)
+/// instead of the consolidated `.metadata()` API: the latter's
+/// `fPRM`-to-owner-facet "rescue" logic masks the permission bits to
+/// `0o7777` and drops the `fPRM` chunk whenever no owner facet is set
+/// alongside it, which silently corrupts round-tripped permissions.
+#[allow(deprecated)]
 fn finalize_primary_entry<W: IoWrite>(
     archive: &mut Archive<W>,
-    mut builder: EntryBuilder,
+    mut builder: OpaqueEntryBuilder,
     node: &FsNode,
 ) -> io::Result<()> {
     builder.modified(system_time_to_pna(node.attr.mtime));
     builder.created(system_time_to_pna(node.attr.crtime));
-    #[allow(deprecated)]
     builder.permission(Some(build_permission(node)));
     for (name, value) in &node.xattrs {
         let xname = XattrName::try_from(name.as_str()).map_err(io::Error::other)?;
@@ -670,7 +684,7 @@ fn build_permission(node: &FsNode) -> Permission {
 mod tests {
     use super::*;
     use crate::file_tree::{Owner, ROOT_INODE};
-    use pna::{Archive, Metadata, WriteOptions};
+    use pna::{Archive, DirEntryBuilder, FileEntryBuilder, Metadata, WriteOptions};
     use std::io::Write as IoWrite;
     use std::path::PathBuf;
     use tempfile::TempDir;
@@ -799,7 +813,7 @@ mod tests {
                 pna::EntryName::from_lossy("secret.txt"),
                 Metadata::new(),
                 WriteOptions::builder()
-                    .encryption(Encryption::Aes)
+                    .encryption(Encryption::AES)
                     .cipher_mode(CipherMode::CTR)
                     .password(Some(b"testpass"))
                     .build(),
@@ -874,19 +888,21 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("xattrs.pna");
         let mut archive = Archive::write_header(std::fs::File::create(&path).unwrap()).unwrap();
-        let mut builder = pna::EntryBuilder::new_file(
+        let mut builder = pna::FileEntryBuilder::new_with_options(
             pna::EntryName::from_lossy("doc.txt"),
             WriteOptions::builder().build(),
         )
         .unwrap();
-        builder.add_xattr(ExtendedAttribute::new(
-            XattrName::try_from("user.tag").unwrap(),
-            XattrValue::try_from(b"red".as_slice()).unwrap(),
-        ));
-        builder.add_xattr(ExtendedAttribute::new(
-            XattrName::try_from("user.note").unwrap(),
-            XattrValue::try_from(b"hello".as_slice()).unwrap(),
-        ));
+        builder.metadata(Metadata::new().with_xattrs(vec![
+            ExtendedAttribute::new(
+                XattrName::try_from("user.tag").unwrap(),
+                XattrValue::try_from(b"red".as_slice()).unwrap(),
+            ),
+            ExtendedAttribute::new(
+                XattrName::try_from("user.note").unwrap(),
+                XattrValue::try_from(b"hello".as_slice()).unwrap(),
+            ),
+        ]));
         let entry = builder.build().unwrap();
         archive.add_entry(entry).unwrap();
         archive.finalize().unwrap();
@@ -1164,7 +1180,7 @@ mod tests {
             cipher: Some(c), ..
         }) = &node.content
         {
-            assert!(c.encryption != pna::Encryption::No);
+            assert!(c.encryption != pna::Encryption::NO);
         } else {
             panic!("expected Clean with cipher");
         }
@@ -1194,7 +1210,7 @@ mod tests {
                 pna::EntryName::from_lossy("s.txt"),
                 Metadata::new(),
                 WriteOptions::builder()
-                    .encryption(Encryption::Aes)
+                    .encryption(Encryption::AES)
                     .cipher_mode(CipherMode::CTR)
                     .password(Some(b"pwd"))
                     .build(),
@@ -1298,7 +1314,7 @@ mod tests {
                 pna::EntryName::from_lossy("data.txt"),
                 Metadata::new(),
                 WriteOptions::builder()
-                    .encryption(Encryption::Aes)
+                    .encryption(Encryption::AES)
                     .cipher_mode(CipherMode::CTR)
                     .password(Some(b"mypwd"))
                     .build(),
@@ -1342,15 +1358,15 @@ mod tests {
     }
 
     /// fSIZ is only a hint and must not be trusted, so even entries created
-    /// via EntryBuilder (which writes fSIZ) are fully decoded on load.
+    /// via FileEntryBuilder (which writes fSIZ) are fully decoded on load.
     #[test]
     fn load_entry_with_fsiz_is_still_loaded() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("fsiz.pna");
         let mut archive = Archive::write_header(std::fs::File::create(&path).unwrap()).unwrap();
 
-        // Use EntryBuilder which writes fSIZ chunk
-        let mut builder = EntryBuilder::new_file(
+        // Use FileEntryBuilder which writes fSIZ chunk
+        let mut builder = FileEntryBuilder::new_with_options(
             pna::EntryName::from_lossy("sized.txt"),
             WriteOptions::builder().build(),
         )
@@ -1449,7 +1465,7 @@ mod tests {
             )
             .unwrap();
         // Now write explicit directory entry for "mydir"
-        let dir_entry = EntryBuilder::new_dir(pna::EntryName::from_lossy("mydir"))
+        let dir_entry = DirEntryBuilder::new(pna::EntryName::from_lossy("mydir"))
             .build()
             .unwrap();
         archive.add_entry(dir_entry).unwrap();
