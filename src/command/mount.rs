@@ -5,7 +5,7 @@ use crate::{
     filesystem::{PnaFS, WriteStrategy},
 };
 use clap::{Args, ValueHint};
-use fuser::{Config, MountOption, SessionACL, mount2};
+use fuser::{Config, MountOption, SessionACL, mount};
 use std::fs::create_dir_all;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -70,7 +70,7 @@ fn mount_archive(
     // coexist), exclusive for --write mounts. Taken before the archive
     // is even read so a conflicting mount can never observe (or race)
     // the load/save cycle. Released on drop at the end of this function
-    // — i.e. after mount2 returns on unmount — or by the kernel if the
+    // — i.e. after mount returns on unmount — or by the kernel if the
     // process dies.
     let _lock = ArchiveLock::acquire(
         &archive,
@@ -106,7 +106,7 @@ fn mount_archive(
     }
     config.acl = acl;
 
-    mount2(fs, mount_point, &config)?;
+    mount(fs, mount_point, &config)?;
     Ok(())
 }
 
