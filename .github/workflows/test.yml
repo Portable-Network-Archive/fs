@@ -33,6 +33,9 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
+          # Workaround for actions/runner-images#14516: a stray
+          # non-setuid fusermount3 can shadow the real one.
+          sudo rm -f /usr/local/bin/fusermount3
       - name: Install dependencies
         if: startsWith(matrix.os, 'freebsd')
         run: |
@@ -90,6 +93,9 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev libacl1-dev acl
+          # Workaround for actions/runner-images#14516: a stray
+          # non-setuid fusermount3 can shadow the real one.
+          sudo rm -f /usr/local/bin/fusermount3
           # The harness mounts pnafs with --allow-other so pjdfstest's
           # seteuid()-to-nobody/tests/pjdfstest tests can reach the FS;
           # FUSE rejects --allow-other from non-root users unless
@@ -136,6 +142,9 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
+          # Workaround for actions/runner-images#14516: a stray
+          # non-setuid fusermount3 can shadow the real one.
+          sudo rm -f /usr/local/bin/fusermount3
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
@@ -183,6 +192,9 @@ jobs:
         run: |
           sudo apt update
           sudo apt install -y fuse3 libfuse3-dev
+          # Workaround for actions/runner-images#14516: a stray
+          # non-setuid fusermount3 can shadow the real one.
+          sudo rm -f /usr/local/bin/fusermount3
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: target
