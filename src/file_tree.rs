@@ -1,8 +1,7 @@
 use fuser::{Errno, FileAttr, FileType, INodeNo, TimeOrNow};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
-#[allow(deprecated)]
-use pna::Permission;
+use pna::Metadata;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -1443,46 +1442,80 @@ fn search_group(name: &str, id: u64) -> Option<Group> {
     Group::from_gid((id as u32).into()).ok().flatten()
 }
 
-/// Resolve the UID for a PNA permission entry. If the archive's
+/// Resolve the permission bits for a PNA metadata entry. Prefers the
+/// owner-facet mode (`fMOd`), falls back to legacy `fPRM` for archives
+/// written by pna < 0.38, and finally to `0o775` when no record is present.
+pub(crate) fn get_perm(metadata: &Metadata) -> u16 {
+    if let Some(mode) = metadata.permission_mode() {
+        return mode.get();
+    }
+    #[allow(deprecated)]
+    if let Some(p) = metadata.permission() {
+        return p.permissions();
+    }
+    0o775
+}
+
+/// Resolve the UID for a PNA metadata entry. If the archive's
 /// `uname` or numeric uid resolves to a local user we prefer that
 /// (handles uid remapping across systems where the same user has a
 /// different id). Otherwise the numeric uid from the archive is
 /// authoritative — silently substituting the running process's uid
 /// would lose the saved owner across a save → load cycle. Only when
-/// no `Permission` is attached at all do we fall back to the caller's
+/// no owner record is attached at all do we fall back to the caller's
 /// uid.
-#[allow(deprecated)]
-pub(crate) fn get_uid(permission: Option<&Permission>) -> u32 {
+///
+/// Owner facets (`fUId`/`fONm`) take precedence; legacy `fPRM` is
+/// honoured for archives written by pna < 0.38.
+pub(crate) fn get_uid(metadata: &Metadata) -> u32 {
     #[cfg(unix)]
     {
-        match permission {
-            Some(p) => search_owner(p.uname(), p.uid()).map_or(p.uid() as u32, |u| u.uid.as_raw()),
-            None => Uid::current().as_raw(),
+        if let Some(uid) = metadata.owner_uid() {
+            let name = metadata
+                .owner_user_name()
+                .map(pna::OwnerUserName::as_str)
+                .unwrap_or("");
+            return search_owner(name, uid.get()).map_or(uid.get() as u32, |u| u.uid.as_raw());
         }
+        #[allow(deprecated)]
+        if let Some(p) = metadata.permission() {
+            return search_owner(p.uname(), p.uid()).map_or(p.uid() as u32, |u| u.uid.as_raw());
+        }
+        Uid::current().as_raw()
     }
     #[cfg(not(unix))]
     {
-        let _ = permission;
+        let _ = metadata;
         0
     }
 }
 
-/// Resolve the GID for a PNA permission entry. Mirrors [`get_uid`]:
+/// Resolve the GID for a PNA metadata entry. Mirrors [`get_uid`]:
 /// archive's numeric gid is authoritative when neither `gname` nor the
 /// numeric id resolves locally; the process gid only applies when no
-/// permission record is present.
-#[allow(deprecated)]
-pub(crate) fn get_gid(permission: Option<&Permission>) -> u32 {
+/// owner record is present.
+///
+/// Owner facets (`fGId`/`fGNm`) take precedence; legacy `fPRM` is
+/// honoured for archives written by pna < 0.38.
+pub(crate) fn get_gid(metadata: &Metadata) -> u32 {
     #[cfg(unix)]
     {
-        match permission {
-            Some(p) => search_group(p.gname(), p.gid()).map_or(p.gid() as u32, |g| g.gid.as_raw()),
-            None => Gid::current().as_raw(),
+        if let Some(gid) = metadata.owner_gid() {
+            let name = metadata
+                .owner_group_name()
+                .map(pna::OwnerGroupName::as_str)
+                .unwrap_or("");
+            return search_group(name, gid.get()).map_or(gid.get() as u32, |g| g.gid.as_raw());
         }
+        #[allow(deprecated)]
+        if let Some(p) = metadata.permission() {
+            return search_group(p.gname(), p.gid()).map_or(p.gid() as u32, |g| g.gid.as_raw());
+        }
+        Gid::current().as_raw()
     }
     #[cfg(not(unix))]
     {
-        let _ = permission;
+        let _ = metadata;
         0
     }
 }
@@ -2773,34 +2806,51 @@ mod tests {
     /// This test pins that behaviour for a uid/gid that won't normally
     /// exist on a CI host.
     #[test]
-    #[allow(deprecated)]
     fn get_uid_preserves_archive_id_when_name_does_not_resolve() {
         // gname empty + numeric id that is unlikely to exist in /etc/group.
-        let permission =
-            pna::Permission::new(0xfeed_faceu64, String::new(), 0u64, String::new(), 0o644);
-        let uid = get_uid(Some(&permission));
+        let metadata = pna::Metadata::new()
+            .with_owner_uid(Some(pna::OwnerUid::from(0xfeed_faceu64)))
+            .with_owner_user_name(Some(pna::OwnerUserName::new("").unwrap()));
+        let uid = get_uid(&metadata);
         // Archive uid must round-trip even though there's no local user.
         assert_eq!(uid, 0xfeed_face);
     }
 
     #[test]
-    #[allow(deprecated)]
     fn get_gid_preserves_archive_id_when_name_does_not_resolve() {
-        let permission =
-            pna::Permission::new(0u64, String::new(), 0xdead_beefu64, String::new(), 0o644);
-        let gid = get_gid(Some(&permission));
+        let metadata = pna::Metadata::new()
+            .with_owner_gid(Some(pna::OwnerGid::from(0xdead_beefu64)))
+            .with_owner_group_name(Some(pna::OwnerGroupName::new("").unwrap()));
+        let gid = get_gid(&metadata);
         assert_eq!(gid, 0xdead_beef);
     }
 
-    /// Sanity check the unchanged path: `None` permission means there's
+    #[test]
+    #[allow(deprecated)]
+    fn get_uid_falls_back_to_legacy_fprm_when_no_facet() {
+        // Archives written by pna < 0.38 carry only fPRM.
+        let metadata = pna::Metadata::new().with_permission(Some(pna::Permission::new(
+            0xfeed_faceu64,
+            String::new(),
+            0u64,
+            String::new(),
+            0o644,
+        )));
+        assert_eq!(get_uid(&metadata), 0xfeed_face);
+        assert_eq!(get_perm(&metadata), 0o644);
+    }
+
+    /// Sanity check the unchanged path: empty metadata means there's
     /// no archive record to honour, so falling back to the caller's
     /// id is correct. (Observable here only as "the result is *some*
     /// integer" — the actual value depends on the test runner.)
     #[test]
     fn get_uid_falls_back_to_current_when_permission_absent() {
         // Should not panic; value is whatever the test process is.
-        let _ = get_uid(None);
-        let _ = get_gid(None);
+        let metadata = pna::Metadata::new();
+        let _ = get_uid(&metadata);
+        let _ = get_gid(&metadata);
+        assert_eq!(get_perm(&metadata), 0o775);
     }
 
     #[test]

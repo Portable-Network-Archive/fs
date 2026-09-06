@@ -84,7 +84,7 @@
 //! * `node.attr.mtime` / `crtime` must survive `save → load` unchanged
 //!   (PNA stores them and load reinstates them). If `save` ever started
 //!   stamping "now" into entries, byte-id would dissolve.
-//! * `nix::unistd::User::from_uid` is consulted by `build_permission`
+//! * `nix::unistd::User::from_uid` is consulted by `owner_facets`
 //!   to record a username alongside the numeric uid. Two calls within
 //!   the same process return the same result, so byte-id holds within
 //!   a single test run regardless of the host's `/etc/passwd`. To make
@@ -897,9 +897,9 @@ fn arb_meta() -> impl Strategy<Value = NodeMeta> {
     // uid / gid are restricted to a synthetic high range
     // (`0xFEED_0000..=0xFEED_FFFF` for uid, `0xDEAD_0000..=0xDEAD_FFFF`
     // for gid). Two reasons:
-    //   * `archive_io::build_permission` calls
+    //   * `archive_io::owner_facets` calls
     //     `nix::unistd::User::from_uid` to attach a username to the
-    //     `Permission` record. A uid that happens to map to a real
+    //     owner-facet record. A uid that happens to map to a real
     //     local user on the test host would record that user's name
     //     in the archive bytes, making the byte-identity property
     //     subtly host-dependent across runs (though stable within a

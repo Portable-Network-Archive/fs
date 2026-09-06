@@ -1,14 +1,12 @@
 use crate::file_tree::{
-    CipherConfig, DirContent, FileData, FileTree, FsContent, FsNode, ROOT_INODE, get_gid, get_uid,
-    make_dir_node,
+    CipherConfig, DirContent, FileData, FileTree, FsContent, FsNode, ROOT_INODE, get_gid, get_perm,
+    get_uid, make_dir_node,
 };
 use fuser::{FileAttr, FileType, INodeNo};
-#[allow(deprecated)]
-use pna::Permission;
 use pna::{
     Archive, DataKind, EntryName, EntryReference, ExtendedAttribute, HardLinkEntryBuilder,
-    HashAlgorithm, Metadata, NormalEntry, OpaqueEntryBuilder, ReadEntry, ReadOptions, WriteOptions,
-    XattrName, XattrValue,
+    HashAlgorithm, Metadata, NormalEntry, OpaqueEntryBuilder, OwnerGid, OwnerGroupName, OwnerUid,
+    OwnerUserName, PermissionMode, ReadEntry, ReadOptions, WriteOptions, XattrName, XattrValue,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
@@ -286,15 +284,10 @@ fn add_normal_entry(
                 ));
             }
         },
-        #[allow(deprecated)]
-        perm: metadata
-            .permission()
-            .map_or(0o775, pna::Permission::permissions),
+        perm: get_perm(metadata),
         nlink: 1,
-        #[allow(deprecated)]
-        uid: get_uid(metadata.permission()),
-        #[allow(deprecated)]
-        gid: get_gid(metadata.permission()),
+        uid: get_uid(metadata),
+        gid: get_gid(metadata),
         rdev: 0,
         blksize: 512,
         flags: 0,
@@ -619,37 +612,51 @@ fn system_time_to_pna(t: SystemTime) -> Option<pna::Duration> {
         .map(|d| pna::Duration::seconds(d.as_secs() as i64))
 }
 
-/// Stamp `node`'s mtime / crtime / permission / xattrs onto `builder`,
-/// build the entry, and append it to `archive`. Centralised so that all
-/// primary-entry paths (file, dir, symlink) round-trip the same metadata.
+/// Stamp `node`'s mtime / crtime / owner / permission / xattrs onto
+/// `builder` via the non-deprecated `Metadata` owner-facet API
+/// (`with_owner_uid` / `with_owner_gid` / `with_owner_user_name` /
+/// `with_owner_group_name` / `with_permission_mode`), build the entry,
+/// and append it to `archive`. Centralised so that all primary-entry
+/// paths (file, dir, symlink) round-trip the same metadata.
 ///
-/// Deliberately uses `OpaqueEntryBuilder`'s deprecated per-field setters
-/// (`.modified()` / `.created()` / `.permission()` / `.add_xattr()`)
-/// instead of the consolidated `.metadata()` API: the latter's
-/// `fPRM`-to-owner-facet "rescue" logic masks the permission bits to
-/// `0o7777` and drops the `fPRM` chunk whenever no owner facet is set
-/// alongside it, which silently corrupts round-tripped permissions.
-#[allow(deprecated)]
+/// pna 0.38 no longer writes the legacy `fPRM` chunk: a `Permission`
+/// set through the deprecated `builder.permission()` is converted to
+/// the five owner facets on write and `metadata.permission()` reads
+/// back as `None`. Writing the facets directly keeps save → load
+/// stable across pna versions and avoids the deprecated path entirely.
 fn finalize_primary_entry<W: IoWrite>(
     archive: &mut Archive<W>,
     mut builder: OpaqueEntryBuilder,
     node: &FsNode,
 ) -> io::Result<()> {
-    builder.modified(system_time_to_pna(node.attr.mtime));
-    builder.created(system_time_to_pna(node.attr.crtime));
-    builder.permission(Some(build_permission(node)));
+    let (uid, uname, gid, gname, perm) = owner_facets(node);
+    let mut xattrs = Vec::with_capacity(node.xattrs.len());
     for (name, value) in &node.xattrs {
         let xname = XattrName::try_from(name.as_str()).map_err(io::Error::other)?;
         let xvalue = XattrValue::try_from(value.as_slice()).map_err(io::Error::other)?;
-        builder.add_xattr(ExtendedAttribute::new(xname, xvalue));
+        xattrs.push(ExtendedAttribute::new(xname, xvalue));
     }
+    builder.metadata(
+        Metadata::new()
+            .with_modified(system_time_to_pna(node.attr.mtime))
+            .with_created(system_time_to_pna(node.attr.crtime))
+            .with_owner_uid(Some(OwnerUid::from(uid)))
+            .with_owner_gid(Some(OwnerGid::from(gid)))
+            .with_owner_user_name(OwnerUserName::new(uname).ok())
+            .with_owner_group_name(OwnerGroupName::new(gname).ok())
+            .with_permission_mode(Some(PermissionMode::from(perm)))
+            .with_xattrs(xattrs),
+    );
     archive.add_entry(builder.build()?)?;
     Ok(())
 }
 
+/// Resolve the owner facets for `node`: numeric ids and permission bits
+/// come straight from the inode, while user/group names are looked up
+/// from the local passwd/group databases (empty when unresolvable, so
+/// synthetic test ids stay host-independent).
 #[cfg(unix)]
-#[allow(deprecated)]
-fn build_permission(node: &FsNode) -> Permission {
+fn owner_facets(node: &FsNode) -> (u64, String, u64, String, u16) {
     let uname = nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(node.attr.uid))
         .ok()
         .flatten()
@@ -660,7 +667,7 @@ fn build_permission(node: &FsNode) -> Permission {
         .flatten()
         .map(|g| g.name)
         .unwrap_or_default();
-    Permission::new(
+    (
         u64::from(node.attr.uid),
         uname,
         u64::from(node.attr.gid),
@@ -670,8 +677,8 @@ fn build_permission(node: &FsNode) -> Permission {
 }
 
 #[cfg(not(unix))]
-fn build_permission(node: &FsNode) -> Permission {
-    Permission::new(
+fn owner_facets(node: &FsNode) -> (u64, String, u64, String, u16) {
+    (
         node.attr.uid as u64,
         String::new(),
         node.attr.gid as u64,
