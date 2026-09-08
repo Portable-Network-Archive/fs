@@ -1,0 +1,62 @@
+name: Update portable-network-archive
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update pinned release
+        run: bash scripts/update-pna-package.sh
+
+      - name: Detect changes
+        id: changes
+        run: |
+          if git diff --quiet -- nix/portable-network-archive.nix; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate updated development image
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          docker build --target dev -t pnafs-nix-dev .
+          docker run --rm pnafs-nix-dev sh -lc 'pna --version && rustc --version && cargo --version && pkg-config --version && fusermount3 --version'
+
+      - name: Open or update pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          branch=automation/update-portable-network-archive
+          version="$(sed -n 's/^[[:space:]]*version = "\(.*\)";/\1/p' nix/portable-network-archive.nix | head -n1)"
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git checkout -B "$branch"
+          git add nix/portable-network-archive.nix
+          git commit -m "build: update portable-network-archive to ${version}"
+          git push --force origin "$branch"
+
+          pr="$(gh pr list --head "$branch" --state open --json number --jq '.[0].number')"
+          body="Updates the pinned GitHub Release binary and SHA-256 hashes for x86_64-linux and aarch64-linux. The updated development image was built successfully before this PR was created."
+          if [ -z "$pr" ]; then
+            gh pr create \
+              --base main \
+              --head "$branch" \
+              --title "build: update portable-network-archive to ${version}" \
+              --body "$body"
+          else
+            gh pr edit "$pr" \
+              --title "build: update portable-network-archive to ${version}" \
+              --body "$body"
+          fi
