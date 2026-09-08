@@ -1,9 +1,19 @@
-FROM rust:slim as dev
+FROM nixos/nix:2.28.5 AS dev
 
-ENV CARGO_TARGET_DIR /tmp/target/
+ENV NIX_CONFIG="experimental-features = nix-command flakes"
+ENV CARGO_TARGET_DIR=/tmp/target/
+ENV PKG_CONFIG_PATH="/root/.nix-profile/lib/pkgconfig:/root/.nix-profile/share/pkgconfig"
+ENV PATH="/root/.cargo/bin:/root/.nix-profile/bin:${PATH}"
 
-RUN rustup component add clippy rustfmt
+WORKDIR /workspace
 
-RUN apt update && apt install -y libacl1-dev g++ cmake git fuse3 libfuse3-dev pkg-config
+COPY flake.nix ./
+COPY nix ./nix
+COPY scripts/update-pna-package.sh ./scripts/update-pna-package.sh
 
-RUN cargo install -f portable-network-archive --locked
+RUN nix profile install --no-write-lock-file .#dev-tools \
+    && rustc --version \
+    && cargo --version \
+    && pna --version \
+    && pkg-config --version \
+    && fusermount3 --version
