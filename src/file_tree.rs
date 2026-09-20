@@ -1442,16 +1442,16 @@ fn search_group(name: &str, id: u64) -> Option<Group> {
     Group::from_gid((id as u32).into()).ok().flatten()
 }
 
-/// Resolve the permission bits for a PNA metadata entry. Prefers the
-/// owner-facet mode (`fMOd`), falls back to legacy `fPRM` for archives
-/// written by pna < 0.38, and finally to `0o775` when no record is present.
+/// Resolve the permission bits for a PNA metadata entry from the
+/// owner-facet mode (`fMOd`), defaulting to `0o775` when absent.
+///
+/// pna >= 0.38 no longer writes the legacy `fPRM` chunk and pna 0.39
+/// removed the `Metadata::permission()` accessor entirely; the reader
+/// folds a legacy `fPRM` chunk into the owner facets on decode, so no
+/// explicit fallback is needed here.
 pub(crate) fn get_perm(metadata: &Metadata) -> u16 {
     if let Some(mode) = metadata.permission_mode() {
         return mode.get();
-    }
-    #[allow(deprecated)]
-    if let Some(p) = metadata.permission() {
-        return p.permissions();
     }
     0o775
 }
@@ -1465,8 +1465,8 @@ pub(crate) fn get_perm(metadata: &Metadata) -> u16 {
 /// no owner record is attached at all do we fall back to the caller's
 /// uid.
 ///
-/// Owner facets (`fUId`/`fONm`) take precedence; legacy `fPRM` is
-/// honoured for archives written by pna < 0.38.
+/// Reads only the owner facets (`fUId`/`fONm`); a legacy `fPRM`-only
+/// archive is already folded into those facets by the pna 0.39 reader.
 pub(crate) fn get_uid(metadata: &Metadata) -> u32 {
     #[cfg(unix)]
     {
@@ -1476,10 +1476,6 @@ pub(crate) fn get_uid(metadata: &Metadata) -> u32 {
                 .map(pna::OwnerUserName::as_str)
                 .unwrap_or("");
             return search_owner(name, uid.get()).map_or(uid.get() as u32, |u| u.uid.as_raw());
-        }
-        #[allow(deprecated)]
-        if let Some(p) = metadata.permission() {
-            return search_owner(p.uname(), p.uid()).map_or(p.uid() as u32, |u| u.uid.as_raw());
         }
         Uid::current().as_raw()
     }
@@ -1495,8 +1491,8 @@ pub(crate) fn get_uid(metadata: &Metadata) -> u32 {
 /// numeric id resolves locally; the process gid only applies when no
 /// owner record is present.
 ///
-/// Owner facets (`fGId`/`fGNm`) take precedence; legacy `fPRM` is
-/// honoured for archives written by pna < 0.38.
+/// Reads only the owner facets (`fGId`/`fGNm`); a legacy `fPRM`-only
+/// archive is already folded into those facets by the pna 0.39 reader.
 pub(crate) fn get_gid(metadata: &Metadata) -> u32 {
     #[cfg(unix)]
     {
@@ -1506,10 +1502,6 @@ pub(crate) fn get_gid(metadata: &Metadata) -> u32 {
                 .map(pna::OwnerGroupName::as_str)
                 .unwrap_or("");
             return search_group(name, gid.get()).map_or(gid.get() as u32, |g| g.gid.as_raw());
-        }
-        #[allow(deprecated)]
-        if let Some(p) = metadata.permission() {
-            return search_group(p.gname(), p.gid()).map_or(p.gid() as u32, |g| g.gid.as_raw());
         }
         Gid::current().as_raw()
     }
@@ -2823,21 +2815,6 @@ mod tests {
             .with_owner_group_name(Some(pna::OwnerGroupName::new("").unwrap()));
         let gid = get_gid(&metadata);
         assert_eq!(gid, 0xdead_beef);
-    }
-
-    #[test]
-    #[allow(deprecated)]
-    fn get_uid_falls_back_to_legacy_fprm_when_no_facet() {
-        // Archives written by pna < 0.38 carry only fPRM.
-        let metadata = pna::Metadata::new().with_permission(Some(pna::Permission::new(
-            0xfeed_faceu64,
-            String::new(),
-            0u64,
-            String::new(),
-            0o644,
-        )));
-        assert_eq!(get_uid(&metadata), 0xfeed_face);
-        assert_eq!(get_perm(&metadata), 0o644);
     }
 
     /// Sanity check the unchanged path: empty metadata means there's

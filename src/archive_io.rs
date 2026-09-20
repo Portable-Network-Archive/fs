@@ -613,17 +613,15 @@ fn system_time_to_pna(t: SystemTime) -> Option<pna::Duration> {
 }
 
 /// Stamp `node`'s mtime / crtime / owner / permission / xattrs onto
-/// `builder` via the non-deprecated `Metadata` owner-facet API
-/// (`with_owner_uid` / `with_owner_gid` / `with_owner_user_name` /
-/// `with_owner_group_name` / `with_permission_mode`), build the entry,
-/// and append it to `archive`. Centralised so that all primary-entry
-/// paths (file, dir, symlink) round-trip the same metadata.
+/// `builder` via the `Metadata` owner-facet API (`with_owner_uid` /
+/// `with_owner_gid` / `with_owner_user_name` / `with_owner_group_name` /
+/// `with_permission_mode`), build the entry, and append it to `archive`.
+/// Centralised so that all primary-entry paths (file, dir, symlink)
+/// round-trip the same metadata.
 ///
-/// pna 0.38 no longer writes the legacy `fPRM` chunk: a `Permission`
-/// set through the deprecated `builder.permission()` is converted to
-/// the five owner facets on write and `metadata.permission()` reads
-/// back as `None`. Writing the facets directly keeps save → load
-/// stable across pna versions and avoids the deprecated path entirely.
+/// pna 0.39 removed the legacy `fPRM` (`Permission`) API entirely;
+/// writing the owner facets directly keeps save → load stable and is
+/// the only supported path.
 fn finalize_primary_entry<W: IoWrite>(
     archive: &mut Archive<W>,
     mut builder: OpaqueEntryBuilder,
