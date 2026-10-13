@@ -4,9 +4,10 @@ use crate::file_tree::{
 };
 use fuser::{FileAttr, FileType, INodeNo};
 use pna::{
-    Archive, DataKind, EntryName, EntryReference, ExtendedAttribute, HardLinkEntryBuilder,
-    HashAlgorithm, Metadata, NormalEntry, OpaqueEntryBuilder, OwnerGid, OwnerGroupName, OwnerUid,
-    OwnerUserName, PermissionMode, ReadEntry, ReadOptions, WriteOptions, XattrName, XattrValue,
+    Archive, DataKind, DirEntryBuilder, EntryName, EntryReference, ExtendedAttribute,
+    FileEntryBuilder, HardLinkEntryBuilder, HashAlgorithm, Metadata, NormalEntry, OwnerGid,
+    OwnerGroupName, OwnerUid, OwnerUserName, PermissionMode, ReadEntry, ReadOptions,
+    SymlinkEntryBuilder, WriteOptions, XattrName, XattrValue,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
@@ -438,9 +439,9 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
 
             match &node.content {
                 FsContent::Directory(_) => {
-                    #[allow(deprecated)]
-                    let builder = OpaqueEntryBuilder::new_dir(entry_name);
-                    finalize_primary_entry(&mut archive, builder, node)?;
+                    let mut builder = DirEntryBuilder::new(entry_name);
+                    builder.metadata(build_primary_metadata(node)?);
+                    archive.add_entry(builder.build()?)?;
                 }
                 FsContent::Symlink(target) => {
                     if let Some(original) = primary_path.get(ino) {
@@ -463,9 +464,9 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
                         // byte-accuracy. The lossy, root-preserving variant
                         // keeps the same infallible/lossy contract.
                         let reference = EntryReference::from_path_lossy_preserve_root(&target_path);
-                        #[allow(deprecated)]
-                        let builder = OpaqueEntryBuilder::new_symlink(entry_name, reference)?;
-                        finalize_primary_entry(&mut archive, builder, node)?;
+                        let mut builder = SymlinkEntryBuilder::new(entry_name, reference)?;
+                        builder.metadata(build_primary_metadata(node)?);
+                        archive.add_entry(builder.build()?)?;
                     }
                 }
                 FsContent::File(fc) => {
@@ -480,10 +481,11 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
                     } else {
                         primary_path.insert(*ino, archive_path_str.clone());
                         let write_opts = build_write_options(fc, tree.password())?;
-                        #[allow(deprecated)]
-                        let mut builder = OpaqueEntryBuilder::new_file(entry_name, write_opts)?;
+                        let mut builder =
+                            FileEntryBuilder::new_with_options(entry_name, write_opts)?;
                         builder.write_all(fc.data())?;
-                        finalize_primary_entry(&mut archive, builder, node)?;
+                        builder.metadata(build_primary_metadata(node)?);
+                        archive.add_entry(builder.build()?)?;
                     }
                 }
                 FsContent::Special(sf) => {
@@ -612,21 +614,17 @@ fn system_time_to_pna(t: SystemTime) -> Option<pna::Duration> {
         .map(|d| pna::Duration::seconds(d.as_secs() as i64))
 }
 
-/// Stamp `node`'s mtime / crtime / owner / permission / xattrs onto
-/// `builder` via the `Metadata` owner-facet API (`with_owner_uid` /
+/// Build the `Metadata` for `node`'s mtime / crtime / owner / permission /
+/// xattrs via the `Metadata` owner-facet API (`with_owner_uid` /
 /// `with_owner_gid` / `with_owner_user_name` / `with_owner_group_name` /
-/// `with_permission_mode`), build the entry, and append it to `archive`.
+/// `with_permission_mode`).
 /// Centralised so that all primary-entry paths (file, dir, symlink)
 /// round-trip the same metadata.
 ///
 /// pna 0.39 removed the legacy `fPRM` (`Permission`) API entirely;
 /// writing the owner facets directly keeps save → load stable and is
 /// the only supported path.
-fn finalize_primary_entry<W: IoWrite>(
-    archive: &mut Archive<W>,
-    mut builder: OpaqueEntryBuilder,
-    node: &FsNode,
-) -> io::Result<()> {
+fn build_primary_metadata(node: &FsNode) -> io::Result<Metadata> {
     let (uid, uname, gid, gname, perm) = owner_facets(node);
     let mut xattrs = Vec::with_capacity(node.xattrs.len());
     for (name, value) in &node.xattrs {
@@ -634,19 +632,15 @@ fn finalize_primary_entry<W: IoWrite>(
         let xvalue = XattrValue::try_from(value.as_slice()).map_err(io::Error::other)?;
         xattrs.push(ExtendedAttribute::new(xname, xvalue));
     }
-    builder.metadata(
-        Metadata::new()
-            .with_modified(system_time_to_pna(node.attr.mtime))
-            .with_created(system_time_to_pna(node.attr.crtime))
-            .with_owner_uid(Some(OwnerUid::from(uid)))
-            .with_owner_gid(Some(OwnerGid::from(gid)))
-            .with_owner_user_name(OwnerUserName::new(uname).ok())
-            .with_owner_group_name(OwnerGroupName::new(gname).ok())
-            .with_permission_mode(Some(PermissionMode::from(perm)))
-            .with_xattrs(xattrs),
-    );
-    archive.add_entry(builder.build()?)?;
-    Ok(())
+    Ok(Metadata::new()
+        .with_modified(system_time_to_pna(node.attr.mtime))
+        .with_created(system_time_to_pna(node.attr.crtime))
+        .with_owner_uid(Some(OwnerUid::from(uid)))
+        .with_owner_gid(Some(OwnerGid::from(gid)))
+        .with_owner_user_name(OwnerUserName::new(uname).ok())
+        .with_owner_group_name(OwnerGroupName::new(gname).ok())
+        .with_permission_mode(Some(PermissionMode::from(perm)))
+        .with_xattrs(xattrs))
 }
 
 /// Resolve the owner facets for `node`: numeric ids and permission bits
