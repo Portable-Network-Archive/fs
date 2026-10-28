@@ -56,6 +56,8 @@
 //!     Asserts directory nlink invariant + save idempotence on the
 //!     mutated state. Covers transient-state bugs the static
 //!     round-trip properties miss.
+//!   * `plain_lazy_load_snapshot_matches_eager` — `load_lazy` +
+//!     materialize-all produces the identical snapshot to `load`.
 //!
 //! * **Encrypted block (cases = 8, Argon2id-bound)**
 //!   * `encrypted_generator_specs_survive_load`
@@ -69,6 +71,8 @@
 //!     `Err` is not always produced; the property asserts the
 //!     **observable** contract (no original bytes come back) rather
 //!     than the aspirational one (load fails outright).
+//!   * `encrypted_lazy_load_snapshot_matches_eager` — the lazy/eager
+//!     parity property over encrypted archives.
 //!
 //! All operations are issued directly against `FileTree` — the
 //! property test does **not** go through FUSE. That avoids needing
@@ -1369,6 +1373,25 @@ fn build_save_load(input: &TestInput, archive: &Path) -> BuildSaveLoad {
     (placed_links, snap, bytes)
 }
 
+/// Load `archive` lazily and materialize every reachable file, so the
+/// snapshot observes the same fields an eager load would produce.
+/// Used to pin lazy/eager parity over generated trees: any field the
+/// lazy path reconstructs differently (content, size, nlink, xattrs)
+/// shows up as a snapshot diff. Note the generated archives are built
+/// by `save()`, which never emits solid blocks — solid-block lazy
+/// parity is pinned by the hand-written tests in `archive_io` instead.
+fn snapshot_after_lazy_load(
+    archive: &Path,
+    password: Option<String>,
+) -> BTreeMap<String, ObservedNode> {
+    let mut tree = archive_io::load_lazy(archive, password).unwrap();
+    let inos: Vec<Inode> = tree.collect_dfs().iter().map(|(ino, _, _)| *ino).collect();
+    for ino in inos {
+        tree.materialize(ino).unwrap();
+    }
+    snapshot(&tree)
+}
+
 /// SPEC: `load(save(T))` returns a tree whose snapshot matches the
 /// generator's specs at every observable field (path, kind, content,
 /// perm, owner, xattrs, file size).
@@ -1611,6 +1634,21 @@ proptest! {
         assert_generator_specs_survive(&input, &snap, &placed)?;
     }
 
+    /// SPEC: For plaintext archives, `load_lazy` followed by
+    /// materializing every file yields the identical snapshot to the
+    /// eager `load` — same paths, contents, sizes, nlinks, owners, and
+    /// xattrs. This is the parity contract the read-only lazy mount
+    /// must hold over generated trees (which contain no solid blocks;
+    /// see `snapshot_after_lazy_load`), hardlinks included.
+    #[test]
+    fn plain_lazy_load_snapshot_matches_eager(input in arb_test_input_plain()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("lazy-specs.pna");
+        let (_placed, snap_eager, _bytes) = build_save_load(&input, &archive);
+        let snap_lazy = snapshot_after_lazy_load(&archive, input.password.clone());
+        prop_assert_eq!(snap_eager, snap_lazy);
+    }
+
     /// SPEC: For plaintext archives, a second `save → load` after the
     /// first must reach the same snapshot. Failures here flag
     /// non-deterministic state changes in the save path that the
@@ -1771,6 +1809,18 @@ proptest! {
         let archive = dir.path().join("specs-enc.pna");
         let (placed, snap, _bytes) = build_save_load(&input, &archive);
         assert_generator_specs_survive(&input, &snap, &placed)?;
+    }
+
+    /// SPEC: The lazy/eager snapshot parity property, over encrypted
+    /// archives — materialization must thread the password through
+    /// locator decoding for every generated file.
+    #[test]
+    fn encrypted_lazy_load_snapshot_matches_eager(input in arb_test_input_encrypted()) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let archive = dir.path().join("lazy-specs-enc.pna");
+        let (_placed, snap_eager, _bytes) = build_save_load(&input, &archive);
+        let snap_lazy = snapshot_after_lazy_load(&archive, input.password.clone());
+        prop_assert_eq!(snap_eager, snap_lazy);
     }
 
     /// SPEC: For encrypted archives, a second `save → load` is a
