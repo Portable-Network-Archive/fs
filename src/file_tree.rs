@@ -1,3 +1,4 @@
+use crate::entry_index::EntryLocator;
 use fuser::{Errno, FileAttr, FileType, INodeNo, TimeOrNow};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
@@ -73,10 +74,30 @@ pub(crate) enum FileData {
     },
     /// Newly created file; has never been written to the archive.
     New(Vec<u8>),
+    /// Data not decoded yet; it lives in the tree's archive image at
+    /// `locator` and is decoded on first use by
+    /// [`FileTree::materialize`], which replaces this variant with
+    /// [`FileData::Clean`].
+    ///
+    /// Only `archive_io::load_lazy` produces this variant, and only for
+    /// read-only mounts, so no save path can observe it: `archive_io::save`
+    /// rejects a tree that still contains lazy entries. Every operation
+    /// that needs the bytes materializes first, so the accessors below
+    /// treat this variant as unreachable.
+    Lazy {
+        locator: EntryLocator,
+        cipher: Option<CipherConfig>,
+    },
 }
 
 impl FileData {
     /// Clean -> Dirty. No-op when already Dirty or New.
+    ///
+    /// Callers must materialize a Lazy entry first (see
+    /// [`FileTree::materialize`]); a Lazy entry has no decoded data to
+    /// promote, so it is left untouched here and the subsequent
+    /// [`Self::data_mut`] call fails loudly instead of silently
+    /// discarding the on-disk body.
     pub(crate) fn promote_to_dirty(&mut self) {
         if let FileData::Clean { data, cipher } = self {
             let data = std::mem::take(data);
@@ -101,7 +122,7 @@ impl FileData {
                 };
                 *self = FileData::Clean { data, cipher };
             }
-            FileData::Clean { .. } => {}
+            FileData::Clean { .. } | FileData::Lazy { .. } => {}
         }
     }
 
@@ -109,6 +130,9 @@ impl FileData {
         match self {
             FileData::Clean { data, .. } | FileData::Dirty { data, .. } | FileData::New(data) => {
                 data
+            }
+            FileData::Lazy { .. } => {
+                unreachable!("lazy file data must be materialized before mutation")
             }
         }
     }
@@ -118,12 +142,17 @@ impl FileData {
             FileData::Clean { data, .. } | FileData::Dirty { data, .. } | FileData::New(data) => {
                 data
             }
+            FileData::Lazy { .. } => {
+                unreachable!("lazy file data must be materialized before access")
+            }
         }
     }
 
     pub(crate) fn cipher(&self) -> Option<&CipherConfig> {
         match self {
-            FileData::Clean { cipher, .. } | FileData::Dirty { cipher, .. } => cipher.as_ref(),
+            FileData::Clean { cipher, .. }
+            | FileData::Dirty { cipher, .. }
+            | FileData::Lazy { cipher, .. } => cipher.as_ref(),
             FileData::New(_) => None,
         }
     }
@@ -315,6 +344,14 @@ pub(crate) struct FileTree {
     password: Option<String>,
     archive_path: PathBuf,
     dirty: bool,
+    /// The archive image file bodies are decoded from on demand.
+    ///
+    /// Set only by `archive_io::load_lazy`: while any node holds
+    /// [`FileData::Lazy`] data, its body lives in this image at the
+    /// node's locator and [`Self::materialize`] decodes it from here.
+    /// Kept for the lifetime of the mount; `None` for eagerly loaded
+    /// and freshly created trees.
+    archive_bytes: Option<std::sync::Arc<[u8]>>,
 }
 
 // Static assertion: FileTree must be Send so it can live in RwLock<FileTree>.
@@ -333,7 +370,138 @@ impl FileTree {
             password,
             archive_path,
             dirty: false,
+            archive_bytes: None,
         }
+    }
+
+    /// Retains the archive image for on-demand decoding of lazy file
+    /// bodies. Called by `archive_io::load_lazy` before returning the
+    /// tree; see [`FileData::Lazy`].
+    pub(crate) fn set_archive_bytes(&mut self, bytes: std::sync::Arc<[u8]>) {
+        self.archive_bytes = Some(bytes);
+    }
+
+    /// Whether any node in the tree still holds an undecoded body.
+    pub(crate) fn has_lazy_entries(&self) -> bool {
+        self.inodes
+            .values()
+            .any(|n| matches!(n.content, FsContent::File(FileData::Lazy { .. })))
+    }
+
+    /// Whether `ino` names a file whose body has not been decoded yet.
+    pub(crate) fn is_lazy(&self, ino: Inode) -> bool {
+        matches!(
+            self.inodes.get(&ino).map(|n| &n.content),
+            Some(FsContent::File(FileData::Lazy { .. }))
+        )
+    }
+
+    /// Decodes the body of a lazy file into memory, replacing
+    /// [`FileData::Lazy`] with [`FileData::Clean`]. No-op for files
+    /// that are already materialized.
+    ///
+    /// Materializing one member of a solid block decodes the whole
+    /// block (solid members share one compressed stream), so every
+    /// still-lazy sibling from the same block is materialized by the
+    /// same call.
+    pub(crate) fn materialize(&mut self, ino: Inode) -> io::Result<()> {
+        let locator = match self.inodes.get(&ino).map(|n| &n.content) {
+            Some(FsContent::File(FileData::Lazy { locator, .. })) => locator.clone(),
+            Some(_) => return Ok(()),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("materialize: no such inode {ino}"),
+                ));
+            }
+        };
+        let image = self.archive_bytes.clone().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "materialize: tree holds lazy entries but no archive image",
+            )
+        })?;
+        let password = self.password.as_deref().map(str::as_bytes);
+        let members = crate::entry_index::decode_locator(&image, &locator, password)?;
+
+        // Decide which inodes the decoded members fill before mutating:
+        // the requested inode alone for a normal run, or — for a solid
+        // block — every still-lazy inode whose locator names a member
+        // of the block, so one decode warms all siblings.
+        //
+        // Fills are keyed by inode and inserted in member order, so a
+        // name that occurs twice in one block resolves last-wins —
+        // mirroring load, where the later member replaced the earlier
+        // one in the same inode (see add_normal_entry). A first-wins
+        // fill would resurrect the replaced body while attr.size
+        // already describes the later one.
+        let mut fills: HashMap<Inode, Vec<u8>> = HashMap::new();
+        match &locator {
+            EntryLocator::Normal { .. } => {
+                // decode_locator returns exactly one member for a
+                // normal run: the entry the locator points at.
+                let Some((_, body)) = members.into_iter().next() else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "materialize: normal run decoded to no entry",
+                    ));
+                };
+                fills.insert(ino, body);
+            }
+            EntryLocator::SolidMember { block_offset, .. } => {
+                // Index this block's lazy members once, keyed by member
+                // name, instead of rescanning every inode per member:
+                // the scan is O(inodes + members), not O(inodes ×
+                // members), which matters under the tree write lock on
+                // the large archives lazy loading targets.
+                let mut by_name: HashMap<&pna::EntryName, Vec<Inode>> = HashMap::new();
+                for (i, node) in self.inodes.iter() {
+                    if let FsContent::File(FileData::Lazy {
+                        locator:
+                            EntryLocator::SolidMember {
+                                block_offset: b,
+                                name: n,
+                            },
+                        ..
+                    }) = &node.content
+                        && b == block_offset
+                    {
+                        by_name.entry(n).or_default().push(*i);
+                    }
+                }
+                for (name, body) in members {
+                    if let Some(targets) = by_name.get(&name) {
+                        for target in targets {
+                            fills.insert(*target, body.clone());
+                        }
+                    }
+                }
+            }
+        }
+        if !fills.contains_key(&ino) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "materialize: decoded run does not contain the requested entry",
+            ));
+        }
+        for (target, body) in fills {
+            if let Some(node) = self.inodes.get_mut(&target)
+                && let FsContent::File(FileData::Lazy { cipher, .. }) = &node.content
+            {
+                let cipher = *cipher;
+                node.content = FsContent::File(FileData::Clean { data: body, cipher });
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::materialize`] with errors mapped to the `Errno` the
+    /// calling tree operation would have produced itself.
+    fn materialize_errno(&mut self, ino: Inode) -> Result<(), Errno> {
+        self.materialize(ino).map_err(|e| match e.kind() {
+            io::ErrorKind::NotFound => Errno::ENOENT,
+            _ => Errno::EIO,
+        })
     }
 
     pub(crate) fn archive_path(&self) -> &Path {
@@ -568,6 +736,7 @@ impl FileTree {
             return Ok(0);
         }
         let offset = usize::try_from(offset).map_err(|_| Errno::EFBIG)?;
+        self.materialize_errno(ino)?;
 
         let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
         let file_data = match &mut node.content {
@@ -627,6 +796,7 @@ impl FileTree {
         if punch && !keep_size {
             return Err(Errno::EINVAL);
         }
+        self.materialize_errno(ino)?;
 
         let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
         let file_data = match &mut node.content {
@@ -697,6 +867,7 @@ impl FileTree {
         if len == 0 {
             return Ok(0);
         }
+        self.materialize_errno(src_ino)?;
 
         let chunk: Vec<u8> = {
             let src_node = self.inodes.get(&src_ino).ok_or(Errno::ENOENT)?;
@@ -729,10 +900,13 @@ impl FileTree {
     }
 
     pub(crate) fn set_size(&mut self, ino: Inode, size: u64) -> Result<(), Errno> {
-        let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
-        if size == node.attr.size {
-            return Ok(());
+        match self.inodes.get(&ino) {
+            Some(node) if size == node.attr.size => return Ok(()),
+            Some(_) => {}
+            None => return Err(Errno::ENOENT),
         }
+        self.materialize_errno(ino)?;
+        let node = self.inodes.get_mut(&ino).ok_or(Errno::ENOENT)?;
         let file_data = match &mut node.content {
             FsContent::Directory(_) => return Err(Errno::EISDIR),
             FsContent::Symlink(_) | FsContent::Special(_) => return Err(Errno::EINVAL),

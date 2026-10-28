@@ -1,13 +1,14 @@
+use crate::entry_index::{ChunkRuns, EntryLocator};
 use crate::file_tree::{
     CipherConfig, DirContent, FileData, FileTree, FsContent, FsNode, ROOT_INODE, get_gid, get_perm,
     get_uid, make_dir_node,
 };
 use fuser::{FileAttr, FileType, INodeNo};
 use pna::{
-    Archive, DataKind, DirEntryBuilder, EntryName, EntryReference, ExtendedAttribute,
-    FileEntryBuilder, HardLinkEntryBuilder, HashAlgorithm, Metadata, NormalEntry, OwnerGid,
-    OwnerGroupName, OwnerUid, OwnerUserName, PermissionMode, ReadEntry, ReadOptions,
-    SymlinkEntryBuilder, WriteOptions, XattrName, XattrValue,
+    Archive, Chunk, ChunkType, DataKind, DirEntryBuilder, EntryName, EntryReference,
+    ExtendedAttribute, FileEntryBuilder, HardLinkEntryBuilder, HashAlgorithm, Metadata,
+    NormalEntry, OwnerGid, OwnerGroupName, OwnerUid, OwnerUserName, PermissionMode, ReadEntry,
+    ReadOptions, SolidEntry, SymlinkEntryBuilder, WriteOptions, XattrName, XattrValue,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write as IoWrite};
@@ -84,14 +85,36 @@ pub(crate) fn cleanup_stale_tmp(archive_path: &Path) {
 
 /// Load a PNA archive from `archive_path`, optionally decrypting with `password`.
 pub(crate) fn load(archive_path: &Path, password: Option<String>) -> io::Result<FileTree> {
+    load_impl(archive_path, password, false)
+}
+
+/// Like [`load`], but file bodies are not retained: each regular file
+/// becomes a [`FileData::Lazy`] node pointing at its chunk run in the
+/// archive image, and the image is kept in the tree for on-demand
+/// decoding by `FileTree::materialize`.
+///
+/// Used for read-only mounts, where no save can ever observe the
+/// undecoded state. Decoded sizes are still measured exactly at load
+/// time (by streaming each body to a sink — `fSIZ` remains an
+/// untrusted hint), so attributes and `statfs` are identical to the
+/// eager tree; what changes is retained memory, which drops from the
+/// sum of decoded bodies to the compressed archive image plus one
+/// locator per file. See <https://github.com/Portable-Network-Archive/fs/issues/451>.
+pub(crate) fn load_lazy(archive_path: &Path, password: Option<String>) -> io::Result<FileTree> {
+    load_impl(archive_path, password, true)
+}
+
+fn load_impl(
+    archive_path: &Path,
+    password: Option<String>,
+    lazy_bodies: bool,
+) -> io::Result<FileTree> {
     cleanup_stale_tmp(archive_path);
 
     let data = fs::read(archive_path)?;
 
     // Derive password bytes before moving `password` into the tree.
     let password_bytes: Option<Vec<u8>> = password.as_deref().map(|s| s.as_bytes().to_vec());
-
-    let mut archive = Archive::read_header_from_slice(&data)?;
 
     let mut tree = FileTree::new(archive_path.to_path_buf(), password);
 
@@ -105,20 +128,57 @@ pub(crate) fn load(archive_path: &Path, password: Option<String>) -> io::Result<
     // (or itself be another hardlink).
     let mut pending_hardlinks: Vec<PendingHardlink> = Vec::new();
 
-    for entry in archive.entries_slice() {
-        let entry = entry?;
-        match entry {
-            ReadEntry::Normal(e) => {
-                let owned: NormalEntry<Vec<u8>> = e.into();
-                if let Some(p) = add_normal_entry(&mut tree, owned, pw)? {
+    if lazy_bodies {
+        // Validate the header exactly as the eager path does, then walk
+        // chunk runs directly: the run's offset is known by construction
+        // because this loop is the iteration, so locators can never
+        // drift out of alignment with the entries they describe.
+        Archive::read_header_from_slice(&data)?;
+        let mut runs = ChunkRuns::new(&data)?;
+        while let Some((offset, chunks)) = runs.next_run()? {
+            if chunks[0].ty() == ChunkType::FHED {
+                let entry = NormalEntry::parse_chunks(chunks)?;
+                let locator = EntryLocator::Normal { offset };
+                if let Some(p) = add_normal_entry(&mut tree, entry, pw, Some(locator))? {
                     pending_hardlinks.push(p);
                 }
-            }
-            ReadEntry::Solid(solid) => {
+            } else {
+                let solid = SolidEntry::parse_chunks(chunks)?;
                 let solid_opts = ReadOptions::with_password(pw);
                 for e in solid.entries(&solid_opts)? {
-                    if let Some(p) = add_normal_entry(&mut tree, e?, pw)? {
+                    let e = e?;
+                    let locator = EntryLocator::SolidMember {
+                        block_offset: offset,
+                        name: e.header().path().clone(),
+                    };
+                    if let Some(p) = add_normal_entry(&mut tree, e, pw, Some(locator))? {
                         pending_hardlinks.push(p);
+                    }
+                }
+            }
+        }
+        // Retain the image only when something can still decode from
+        // it; a tree of directories and symlinks has no lazy bodies.
+        if tree.has_lazy_entries() {
+            tree.set_archive_bytes(std::sync::Arc::from(data));
+        }
+    } else {
+        let mut archive = Archive::read_header_from_slice(&data)?;
+        for entry in archive.entries_slice() {
+            let entry = entry?;
+            match entry {
+                ReadEntry::Normal(e) => {
+                    let owned: NormalEntry<Vec<u8>> = e.into();
+                    if let Some(p) = add_normal_entry(&mut tree, owned, pw, None)? {
+                        pending_hardlinks.push(p);
+                    }
+                }
+                ReadEntry::Solid(solid) => {
+                    let solid_opts = ReadOptions::with_password(pw);
+                    for e in solid.entries(&solid_opts)? {
+                        if let Some(p) = add_normal_entry(&mut tree, e?, pw, None)? {
+                            pending_hardlinks.push(p);
+                        }
                     }
                 }
             }
@@ -220,6 +280,7 @@ fn add_normal_entry(
     tree: &mut FileTree,
     entry: NormalEntry<Vec<u8>>,
     password: Option<&[u8]>,
+    locator: Option<EntryLocator>,
 ) -> io::Result<Option<PendingHardlink>> {
     let now = SystemTime::now();
     let header = entry.header();
@@ -315,10 +376,20 @@ fn add_normal_entry(
             // Always decode: fSIZ is only a hint and must not be trusted for
             // attr.size or any load-strategy decisions.  The only reliable
             // source of the true file size is the decoded data itself.
-            let mut buf = Vec::new();
-            entry.reader(&opts)?.read_to_end(&mut buf)?;
-            attr.size = buf.len() as u64;
-            FsContent::File(FileData::Clean { data: buf, cipher })
+            if let Some(locator) = locator {
+                // Lazy loading still decodes the body exactly once here —
+                // streaming it to a sink to measure the true size — but
+                // retains nothing: the node keeps only its locator, and
+                // the body is decoded again on first use.
+                let mut reader = entry.reader(&opts)?;
+                attr.size = io::copy(&mut reader, &mut io::sink())?;
+                FsContent::File(FileData::Lazy { locator, cipher })
+            } else {
+                let mut buf = Vec::new();
+                entry.reader(&opts)?.read_to_end(&mut buf)?;
+                attr.size = buf.len() as u64;
+                FsContent::File(FileData::Clean { data: buf, cipher })
+            }
         }
         DataKind::HARD_LINK => unreachable!("hardlinks are deferred to pass 2"),
         // Reserved/private kinds were rejected above; reaching this arm
@@ -398,6 +469,16 @@ pub(crate) fn save(tree: &FileTree) -> io::Result<()> {
     // Password guard via collect_dfs
     let nodes = tree.collect_dfs();
     for (_, node, _) in &nodes {
+        // Lazy entries have no decoded body to write. Read-only mounts
+        // (the only producers of lazy entries) never save, so reaching
+        // this means a caller error — fail explicitly instead of
+        // writing an empty body.
+        if matches!(&node.content, FsContent::File(FileData::Lazy { .. })) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cannot save a tree with unmaterialized lazy entries",
+            ));
+        }
         if let FsContent::File(
             FileData::Clean {
                 cipher: Some(_), ..
@@ -587,7 +668,7 @@ fn write_hardlink_entry<W: IoWrite>(
 fn build_write_options(fc: &FileData, password: Option<&str>) -> io::Result<WriteOptions> {
     let effective = fc.cipher().copied().or_else(|| match fc {
         FileData::New(_) => password.map(|_| CipherConfig::default_for_password()),
-        FileData::Clean { .. } | FileData::Dirty { .. } => None,
+        FileData::Clean { .. } | FileData::Dirty { .. } | FileData::Lazy { .. } => None,
     });
     match effective {
         Some(cfg) => {
@@ -1637,5 +1718,415 @@ mod tests {
                 "{name:?} attr.size drifted on second reload (#466)"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // load_lazy tests
+    // -----------------------------------------------------------------------
+
+    use pna::{Compression, Encryption, SolidEntryBuilder};
+
+    fn zstd_file(name: &str, data: &[u8]) -> NormalEntry {
+        let mut b = FileEntryBuilder::new_with_options(
+            name.into(),
+            WriteOptions::builder()
+                .compression(Compression::ZSTANDARD)
+                .build(),
+        )
+        .unwrap();
+        b.write_all(data).unwrap();
+        b.build().unwrap()
+    }
+
+    fn store_file(name: &str, data: &[u8]) -> NormalEntry {
+        let mut b = FileEntryBuilder::new_with_options(name.into(), WriteOptions::store()).unwrap();
+        b.write_all(data).unwrap();
+        b.build().unwrap()
+    }
+
+    /// Writes an archive from prebuilt entries (unlike
+    /// `create_plain_archive`, this allows solid and encrypted entries).
+    fn create_entries_archive(
+        dir: &TempDir,
+        filename: &str,
+        entries: Vec<NormalEntry>,
+        solid_members: Option<Vec<NormalEntry>>,
+    ) -> PathBuf {
+        let path = dir.path().join(filename);
+        let mut archive = Archive::write_header(std::fs::File::create(&path).unwrap()).unwrap();
+        if let Some(members) = solid_members {
+            let mut solid = SolidEntryBuilder::new(
+                WriteOptions::builder()
+                    .compression(Compression::ZSTANDARD)
+                    .build(),
+            )
+            .unwrap();
+            for m in members {
+                solid.add_entry(m).unwrap();
+            }
+            archive.add_entry(solid.build().unwrap()).unwrap();
+        }
+        for e in entries {
+            archive.add_entry(e).unwrap();
+        }
+        archive.finalize().unwrap();
+        path
+    }
+
+    fn child_node<'t>(tree: &'t FileTree, name: &str) -> &'t FsNode {
+        tree.lookup_child(ROOT_INODE, std::ffi::OsStr::new(name))
+            .unwrap_or_else(|| panic!("{name} not in tree"))
+    }
+
+    #[test]
+    fn load_lazy_defers_bodies_and_materializes_on_demand() {
+        let dir = TempDir::new().unwrap();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let path = create_entries_archive(
+            &dir,
+            "lazy.pna",
+            vec![store_file("small.txt", b"tiny"), zstd_file("big.bin", &big)],
+            None,
+        );
+        let mut tree = load_lazy(&path, None).unwrap();
+
+        // Both files are lazy, with exact sizes already known.
+        let small = child_node(&tree, "small.txt");
+        assert!(matches!(
+            small.content,
+            FsContent::File(FileData::Lazy { .. })
+        ));
+        assert_eq!(small.attr.size, 4);
+        let big_ino = child_node(&tree, "big.bin").attr.ino.0;
+        assert!(tree.is_lazy(big_ino));
+        assert_eq!(child_node(&tree, "big.bin").attr.size, big.len() as u64);
+
+        // Materializing one leaves the other untouched.
+        tree.materialize(big_ino).unwrap();
+        assert!(!tree.is_lazy(big_ino));
+        assert_eq!(read_node_data(&tree, big_ino), big);
+        assert!(tree.is_lazy(child_node(&tree, "small.txt").attr.ino.0));
+    }
+
+    #[test]
+    fn load_lazy_tree_matches_eager_tree() {
+        let dir = TempDir::new().unwrap();
+        let path = create_entries_archive(
+            &dir,
+            "both.pna",
+            vec![
+                store_file("a.txt", b"aaa"),
+                zstd_file("b.bin", &[7u8; 50_000]),
+            ],
+            Some(vec![
+                store_file("s1.txt", b"s1"),
+                store_file("s2.txt", b"s2s2"),
+            ]),
+        );
+        let eager = load(&path, None).unwrap();
+        let mut lazy = load_lazy(&path, None).unwrap();
+        for name in ["a.txt", "b.bin", "s1.txt", "s2.txt"] {
+            let e = child_node(&eager, name);
+            let l = child_node(&lazy, name);
+            assert_eq!(e.attr.size, l.attr.size, "{name} size");
+            assert_eq!(e.attr.kind, l.attr.kind, "{name} kind");
+            let ino = l.attr.ino.0;
+            lazy.materialize(ino).unwrap();
+            assert_eq!(
+                read_node_data(&lazy, ino),
+                read_node_data(&eager, e.attr.ino.0),
+                "{name} body"
+            );
+        }
+    }
+
+    #[test]
+    fn load_lazy_solid_block_materializes_siblings() {
+        let dir = TempDir::new().unwrap();
+        let path = create_entries_archive(
+            &dir,
+            "solid.pna",
+            vec![],
+            Some(vec![
+                store_file("m1.txt", b"one"),
+                store_file("m2.txt", b"two"),
+            ]),
+        );
+        let mut tree = load_lazy(&path, None).unwrap();
+        let ino1 = child_node(&tree, "m1.txt").attr.ino.0;
+        let ino2 = child_node(&tree, "m2.txt").attr.ino.0;
+        assert!(tree.is_lazy(ino1) && tree.is_lazy(ino2));
+        tree.materialize(ino1).unwrap();
+        assert!(!tree.is_lazy(ino1));
+        assert!(!tree.is_lazy(ino2), "solid sibling must be co-materialized");
+        assert_eq!(read_node_data(&tree, ino2), b"two");
+    }
+
+    #[test]
+    fn load_lazy_encrypted_roundtrip_and_wrong_password() {
+        let dir = TempDir::new().unwrap();
+        let enc = WriteOptions::builder()
+            .compression(Compression::ZSTANDARD)
+            .encryption(Encryption::AES)
+            .password(Some("secret"))
+            .try_build()
+            .unwrap();
+        let mut b = FileEntryBuilder::new_with_options("vault.bin".into(), enc).unwrap();
+        b.write_all(b"classified").unwrap();
+        let path = create_entries_archive(&dir, "enc.pna", vec![b.build().unwrap()], None);
+
+        let mut tree = load_lazy(&path, Some("secret".to_string())).unwrap();
+        let ino = child_node(&tree, "vault.bin").attr.ino.0;
+        assert!(tree.is_lazy(ino));
+        tree.materialize(ino).unwrap();
+        assert_eq!(read_node_data(&tree, ino), b"classified");
+
+        // Size measurement decodes at load, so a missing password fails
+        // the load exactly as the eager path does.
+        assert!(load_lazy(&path, None).is_err());
+        assert!(load(&path, None).is_err());
+    }
+
+    #[test]
+    fn load_lazy_write_after_materialize_preserves_untouched_bytes() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "w.pna", &[("f.txt", b"hello world")]);
+        let mut tree = load_lazy(&path, None).unwrap();
+        let ino = child_node(&tree, "f.txt").attr.ino.0;
+        tree.write_file(ino, 6, b"WORLD").unwrap();
+        assert_eq!(read_node_data(&tree, ino), b"hello WORLD");
+        // Resizing a lazy file materializes before truncating.
+        let path2 = create_plain_archive(&dir, "w2.pna", &[("g.txt", b"abcdef")]);
+        let mut tree2 = load_lazy(&path2, None).unwrap();
+        let ino2 = child_node(&tree2, "g.txt").attr.ino.0;
+        tree2.set_size(ino2, 3).unwrap();
+        assert_eq!(read_node_data(&tree2, ino2), b"abc");
+    }
+
+    /// One archive component for `create_parts_archive`, in write order.
+    enum ArchivePart {
+        Entry(NormalEntry),
+        Solid(WriteOptions, Vec<NormalEntry>),
+        Hardlink(&'static str, &'static str),
+    }
+
+    fn create_parts_archive(dir: &TempDir, filename: &str, parts: Vec<ArchivePart>) -> PathBuf {
+        let path = dir.path().join(filename);
+        let mut archive = Archive::write_header(std::fs::File::create(&path).unwrap()).unwrap();
+        for part in parts {
+            match part {
+                ArchivePart::Entry(e) => archive.add_entry(e).unwrap(),
+                ArchivePart::Solid(opts, members) => {
+                    let mut solid = SolidEntryBuilder::new(opts).unwrap();
+                    for m in members {
+                        solid.add_entry(m).unwrap();
+                    }
+                    archive.add_entry(solid.build().unwrap()).unwrap()
+                }
+                ArchivePart::Hardlink(name, target) => {
+                    let builder = HardLinkEntryBuilder::new(
+                        pna::EntryName::from_lossy(name),
+                        EntryReference::from_lossy(target),
+                    )
+                    .unwrap();
+                    archive.add_entry(builder.build().unwrap()).unwrap()
+                }
+            };
+        }
+        archive.finalize().unwrap();
+        path
+    }
+
+    #[test]
+    fn load_lazy_hardlink_to_solid_member_resolves_like_eager() {
+        // The source lives inside a solid block; the hardlink entry may
+        // precede or follow the block in the archive. Both orders must
+        // resolve to the source's inode, exactly as the eager load does.
+        let dir = TempDir::new().unwrap();
+        for (file, hardlink_first) in [("hl-first.pna", true), ("hl-last.pna", false)] {
+            let solid = ArchivePart::Solid(
+                WriteOptions::builder()
+                    .compression(Compression::ZSTANDARD)
+                    .build(),
+                vec![store_file("dir/real.bin", b"shared-body")],
+            );
+            let link = ArchivePart::Hardlink("link.txt", "dir/real.bin");
+            let tail = ArchivePart::Entry(store_file("after.txt", b"tail"));
+            let path = if hardlink_first {
+                create_parts_archive(&dir, file, vec![link, solid, tail])
+            } else {
+                create_parts_archive(&dir, file, vec![solid, link, tail])
+            };
+            for lazy in [false, true] {
+                let mut tree = if lazy {
+                    load_lazy(&path, None).unwrap()
+                } else {
+                    load(&path, None).unwrap()
+                };
+                let dir_ino = child_node(&tree, "dir").attr.ino.0;
+                let src = tree
+                    .lookup_child(dir_ino, std::ffi::OsStr::new("real.bin"))
+                    .unwrap();
+                let lnk = child_node(&tree, "link.txt");
+                assert_eq!(
+                    src.attr.ino.0, lnk.attr.ino.0,
+                    "{file} lazy={lazy}: hardlink must share the source inode"
+                );
+                assert_eq!(src.attr.nlink, 2, "{file} lazy={lazy}");
+                let ino = src.attr.ino.0;
+                tree.materialize(ino).unwrap();
+                assert_eq!(read_node_data(&tree, ino), b"shared-body");
+                let tail_ino = child_node(&tree, "after.txt").attr.ino.0;
+                tree.materialize(tail_ino).unwrap();
+                assert_eq!(read_node_data(&tree, tail_ino), b"tail");
+            }
+        }
+    }
+
+    #[test]
+    fn load_lazy_duplicate_names_in_one_solid_block_last_wins() {
+        // Incremental archives legitimately repeat a path; inside one
+        // solid block the later member replaces the earlier one in the
+        // same inode at load. Materializing must therefore yield the
+        // LAST member's body — a first-wins fill would resurrect the
+        // replaced body while attr.size already describes the later
+        // one (a size/body mismatch).
+        let dir = TempDir::new().unwrap();
+        let path = create_parts_archive(
+            &dir,
+            "dup-solid.pna",
+            vec![ArchivePart::Solid(
+                WriteOptions::builder()
+                    .compression(Compression::ZSTANDARD)
+                    .build(),
+                vec![
+                    store_file("dup.txt", b"first"),
+                    store_file("other.txt", b"sibling"),
+                    store_file("dup.txt", b"second-body"),
+                ],
+            )],
+        );
+        for lazy in [false, true] {
+            let mut tree = if lazy {
+                load_lazy(&path, None).unwrap()
+            } else {
+                load(&path, None).unwrap()
+            };
+            let ino = child_node(&tree, "dup.txt").attr.ino.0;
+            assert_eq!(
+                child_node(&tree, "dup.txt").attr.size,
+                11,
+                "lazy={lazy}: size must come from the later member"
+            );
+            tree.materialize(ino).unwrap();
+            assert_eq!(
+                read_node_data(&tree, ino),
+                b"second-body",
+                "lazy={lazy}: body must be the later member's"
+            );
+            let other = child_node(&tree, "other.txt").attr.ino.0;
+            tree.materialize(other).unwrap();
+            assert_eq!(read_node_data(&tree, other), b"sibling");
+        }
+    }
+
+    #[test]
+    fn load_lazy_solid_block_with_dir_and_symlink_members() {
+        // Only FILE members become lazy; directory and symlink members
+        // of a solid block must materialize eagerly, exactly as the
+        // eager loader builds them.
+        let dir = TempDir::new().unwrap();
+        let dir_entry = DirEntryBuilder::new(pna::EntryName::from_lossy("d"))
+            .build()
+            .unwrap();
+        let link_entry = SymlinkEntryBuilder::new(
+            pna::EntryName::from_lossy("d/link"),
+            EntryReference::from_lossy("f.txt"),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let path = create_parts_archive(
+            &dir,
+            "mixed-solid.pna",
+            vec![ArchivePart::Solid(
+                WriteOptions::builder()
+                    .compression(Compression::ZSTANDARD)
+                    .build(),
+                vec![dir_entry, link_entry, store_file("d/f.txt", b"content")],
+            )],
+        );
+        for lazy in [false, true] {
+            let mut tree = if lazy {
+                load_lazy(&path, None).unwrap()
+            } else {
+                load(&path, None).unwrap()
+            };
+            let d = child_node(&tree, "d");
+            assert!(
+                matches!(d.content, FsContent::Directory(_)),
+                "lazy={lazy}: dir member must be a directory"
+            );
+            let d_ino = d.attr.ino.0;
+            let link = tree
+                .lookup_child(d_ino, std::ffi::OsStr::new("link"))
+                .expect("link member missing");
+            match &link.content {
+                FsContent::Symlink(t) => {
+                    assert_eq!(t, std::ffi::OsStr::new("f.txt"), "lazy={lazy}");
+                }
+                _ => panic!("lazy={lazy}: link member must be a symlink"),
+            }
+            let f = tree
+                .lookup_child(d_ino, std::ffi::OsStr::new("f.txt"))
+                .expect("file member missing");
+            let f_ino = f.attr.ino.0;
+            assert_eq!(tree.is_lazy(f_ino), lazy, "file member laziness");
+            tree.materialize(f_ino).unwrap();
+            assert_eq!(read_node_data(&tree, f_ino), b"content");
+        }
+    }
+
+    #[test]
+    fn load_lazy_encrypted_solid_block() {
+        let dir = TempDir::new().unwrap();
+        let block_opts = WriteOptions::builder()
+            .compression(Compression::ZSTANDARD)
+            .encryption(Encryption::AES)
+            .password(Some("pw"))
+            .try_build()
+            .unwrap();
+        let path = create_parts_archive(
+            &dir,
+            "enc-solid.pna",
+            vec![ArchivePart::Solid(
+                block_opts,
+                vec![store_file("e1.txt", b"one"), store_file("e2.txt", b"two")],
+            )],
+        );
+        let mut tree = load_lazy(&path, Some("pw".to_string())).unwrap();
+        let ino1 = child_node(&tree, "e1.txt").attr.ino.0;
+        let ino2 = child_node(&tree, "e2.txt").attr.ino.0;
+        assert!(tree.is_lazy(ino1) && tree.is_lazy(ino2));
+        tree.materialize(ino1).unwrap();
+        assert!(
+            !tree.is_lazy(ino2),
+            "encrypted solid sibling must co-materialize"
+        );
+        assert_eq!(read_node_data(&tree, ino1), b"one");
+        assert_eq!(read_node_data(&tree, ino2), b"two");
+        // Without the password the load-time size measurement cannot
+        // decode the block, so the load fails — as the eager load does.
+        assert!(load_lazy(&path, None).is_err());
+        assert!(load(&path, None).is_err());
+    }
+
+    #[test]
+    fn save_rejects_unmaterialized_lazy_tree() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "s.pna", &[("f.txt", b"data")]);
+        let tree = load_lazy(&path, None).unwrap();
+        let err = save(&tree).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
     }
 }
