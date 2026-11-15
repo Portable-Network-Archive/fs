@@ -21,7 +21,7 @@
 //! archive image; `FileTree::materialize` decodes them on first use via
 //! this module.
 
-use pna::{Chunk, ChunkType, EntryName, NormalEntry, RawChunk, ReadOptions, SolidEntry};
+use pna::{Chunk, ChunkType, DataKind, NormalEntry, RawChunk, ReadOptions, SolidEntry};
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 /// Reads one chunk from an in-memory archive image.
@@ -66,8 +66,12 @@ pub(crate) enum EntryLocator {
     /// A standalone entry: the run at `offset` decodes to this file.
     Normal { offset: u64 },
     /// One member of a solid block: the run at `block_offset` decodes
-    /// to the whole block; `name` selects this file among its members.
-    SolidMember { block_offset: u64, name: EntryName },
+    /// to the whole block; `member_index` is the zero-based position
+    /// among all entries in that block, including non-file entries.
+    SolidMember {
+        block_offset: u64,
+        member_index: usize,
+    },
 }
 
 impl EntryLocator {
@@ -218,15 +222,14 @@ pub(crate) fn read_run(data: &[u8], offset: u64) -> io::Result<Vec<RawChunk>> {
 
 /// Decodes the chunk run a locator points at.
 ///
-/// Returns the decoded `(name, body)` pairs: exactly one for a normal
-/// entry, one per member for a solid block. Decoding a solid member
-/// therefore yields its siblings too — callers materializing one member
-/// should cache the rest (see `FileTree::materialize`).
+/// Returns decoded `(member_index, body)` pairs for regular files.
+/// A normal entry has index zero. Solid member indices count all entries,
+/// not just files, so duplicate paths cannot alias distinct members.
 pub(crate) fn decode_locator(
     data: &[u8],
     locator: &EntryLocator,
     password: Option<&[u8]>,
-) -> io::Result<Vec<(EntryName, Vec<u8>)>> {
+) -> io::Result<Vec<(usize, Vec<u8>)>> {
     let chunks = read_run(data, locator.run_offset())?;
     let opts = ReadOptions::with_password(password);
     match locator {
@@ -234,16 +237,19 @@ pub(crate) fn decode_locator(
             let entry = NormalEntry::parse_chunks(chunks)?;
             let mut body = Vec::new();
             entry.reader(&opts)?.read_to_end(&mut body)?;
-            Ok(vec![(entry.header().path().clone(), body)])
+            Ok(vec![(0, body)])
         }
         EntryLocator::SolidMember { .. } => {
             let solid = SolidEntry::parse_chunks(chunks)?;
             let mut out = Vec::new();
-            for entry in solid.entries(&opts)? {
+            for (member_index, entry) in solid.entries(&opts)?.enumerate() {
                 let entry = entry?;
+                if entry.header().data_kind() != DataKind::FILE {
+                    continue;
+                }
                 let mut body = Vec::new();
                 entry.reader(&opts)?.read_to_end(&mut body)?;
-                out.push((entry.header().path().clone(), body));
+                out.push((member_index, body));
             }
             Ok(out)
         }
@@ -352,13 +358,13 @@ mod tests {
             } else {
                 let solid = SolidEntry::parse_chunks(chunks)?;
                 let opts = ReadOptions::with_password(Some("pw"));
-                for entry in solid.entries(&opts)? {
+                for (member_index, entry) in solid.entries(&opts)?.enumerate() {
                     let entry = entry?;
                     locators.push((
                         entry.header().path().to_string(),
                         EntryLocator::SolidMember {
                             block_offset: offset,
-                            name: entry.header().path().clone(),
+                            member_index,
                         },
                     ));
                 }
@@ -371,10 +377,14 @@ mod tests {
         let mut got: Vec<(String, Vec<u8>)> = Vec::new();
         for (name, locator) in locators.iter().rev() {
             let members = decode_locator(&data, locator, Some(b"pw"))?;
+            let member_index = match locator {
+                EntryLocator::Normal { .. } => 0,
+                EntryLocator::SolidMember { member_index, .. } => *member_index,
+            };
             let body = members
-                .iter()
-                .find(|(n, _)| n.to_string() == *name)
-                .map(|(_, b)| b.clone())
+                .into_iter()
+                .find(|(index, _)| *index == member_index)
+                .map(|(_, body)| body)
                 .expect("locator decode must contain its own entry");
             got.push((name.clone(), body));
         }

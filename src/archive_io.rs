@@ -145,11 +145,11 @@ fn load_impl(
             } else {
                 let solid = SolidEntry::parse_chunks(chunks)?;
                 let solid_opts = ReadOptions::with_password(pw);
-                for e in solid.entries(&solid_opts)? {
+                for (member_index, e) in solid.entries(&solid_opts)?.enumerate() {
                     let e = e?;
                     let locator = EntryLocator::SolidMember {
                         block_offset: offset,
-                        name: e.header().path().clone(),
+                        member_index,
                     };
                     if let Some(p) = add_normal_entry(&mut tree, e, pw, Some(locator))? {
                         pending_hardlinks.push(p);

@@ -426,15 +426,11 @@ impl FileTree {
 
         // Decide which inodes the decoded members fill before mutating:
         // the requested inode alone for a normal run, or — for a solid
-        // block — every still-lazy inode whose locator names a member
+        // block — every still-lazy inode whose locator identifies a member
         // of the block, so one decode warms all siblings.
         //
-        // Fills are keyed by inode and inserted in member order, so a
-        // name that occurs twice in one block resolves last-wins —
-        // mirroring load, where the later member replaced the earlier
-        // one in the same inode (see add_normal_entry). A first-wins
-        // fill would resurrect the replaced body while attr.size
-        // already describes the later one.
+        // The locator recorded during load identifies the exact entry
+        // that survived namespace resolution, even when paths repeat.
         let mut fills: HashMap<Inode, Vec<u8>> = HashMap::new();
         match &locator {
             EntryLocator::Normal { .. } => {
@@ -449,28 +445,25 @@ impl FileTree {
                 fills.insert(ino, body);
             }
             EntryLocator::SolidMember { block_offset, .. } => {
-                // Index this block's lazy members once, keyed by member
-                // name, instead of rescanning every inode per member:
-                // the scan is O(inodes + members), not O(inodes ×
-                // members), which matters under the tree write lock on
-                // the large archives lazy loading targets.
-                let mut by_name: HashMap<&pna::EntryName, Vec<Inode>> = HashMap::new();
+                // Index this block's lazy inodes by physical member position,
+                // rather than path, which need not be unique.
+                let mut by_index: HashMap<usize, Vec<Inode>> = HashMap::new();
                 for (i, node) in self.inodes.iter() {
                     if let FsContent::File(FileData::Lazy {
                         locator:
                             EntryLocator::SolidMember {
                                 block_offset: b,
-                                name: n,
+                                member_index,
                             },
                         ..
                     }) = &node.content
                         && b == block_offset
                     {
-                        by_name.entry(n).or_default().push(*i);
+                        by_index.entry(*member_index).or_default().push(*i);
                     }
                 }
-                for (name, body) in members {
-                    if let Some(targets) = by_name.get(&name) {
+                for (member_index, body) in members {
+                    if let Some(targets) = by_index.get(&member_index) {
                         for target in targets {
                             fills.insert(*target, body.clone());
                         }
