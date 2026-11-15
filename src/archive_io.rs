@@ -2031,6 +2031,60 @@ mod tests {
     }
 
     #[test]
+    fn load_lazy_solid_hardlink_with_duplicate_name_preserves_file_body() {
+        let dir = TempDir::new().unwrap();
+        let link = HardLinkEntryBuilder::new(
+            EntryName::from_lossy("file.txt"),
+            EntryReference::from_lossy("target.txt"),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+        let path = create_parts_archive(
+            &dir,
+            "solid-hardlink-collision.pna",
+            vec![ArchivePart::Solid(
+                WriteOptions::builder()
+                    .compression(Compression::ZSTANDARD)
+                    .build(),
+                vec![
+                    store_file("target.txt", b"target body"),
+                    store_file("file.txt", b"hello"),
+                    link,
+                    store_file("sibling.txt", b"sibling"),
+                ],
+            )],
+        );
+
+        let eager = load(&path, None).unwrap();
+        // The deferred hardlink cannot replace an existing file.
+        let file = child_node(&eager, "file.txt");
+        assert_ne!(file.attr.ino, child_node(&eager, "target.txt").attr.ino);
+        assert_eq!(file.attr.nlink, 1);
+        assert_eq!(file.attr.size, 5);
+        assert_eq!(read_node_data(&eager, file.attr.ino.0), b"hello");
+
+        // Also exercise co-materialization when a sibling is read first.
+        for first in ["file.txt", "sibling.txt"] {
+            let mut lazy = load_lazy(&path, None).unwrap();
+            let ino = child_node(&lazy, first).attr.ino.0;
+            lazy.materialize(ino).unwrap();
+            for name in ["target.txt", "file.txt", "sibling.txt"] {
+                let expected = child_node(&eager, name);
+                let actual = child_node(&lazy, name);
+                assert!(!lazy.is_lazy(actual.attr.ino.0));
+                assert_eq!(actual.attr.size, expected.attr.size);
+                assert_eq!(actual.attr.nlink, expected.attr.nlink);
+                assert_eq!(
+                    read_node_data(&lazy, actual.attr.ino.0),
+                    read_node_data(&eager, expected.attr.ino.0),
+                    "{name}, first read: {first}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn load_lazy_solid_block_with_dir_and_symlink_members() {
         // Only FILE members become lazy; directory and symlink members
         // of a solid block must materialize eagerly, exactly as the
