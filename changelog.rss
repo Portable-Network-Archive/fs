@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8"?><rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel><title>pnafs Changelog</title><link>http://127.0.0.1:7979/fs/changelog</link><description>Changelog information for pnafs</description><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><atom:link href="http://127.0.0.1:7979/fs/changelog.rss" rel="self"/><item><title>0.0.10</title><link>http://127.0.0.1:7979/fs/changelog/0.0.10</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.10</guid><content:encoded><![CDATA[<h3>Changed</h3>
+<ul>
+<li>Migrated to fuser 0.17.0 and added macOS <code>macos-no-mount</code> CI coverage.</li>
+<li>Raised the Rust version requirement from 1.85 to 1.88.</li>
+<li>Enriched crate metadata for crates.io.</li>
+<li>Synced the README MSRV with <code>Cargo.toml</code>.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> through 0.33.0, <code>fuser</code> to 0.17.0, <code>bugreport</code> to 0.6.0, <code>simple_logger</code> to 5.2.0, <code>libc</code> to 0.2.186, <code>memmap2</code> to 0.9.10, <code>nix</code> to 0.31.3, <code>clap</code> to 4.6.1, <code>clap_complete</code> to 4.6.5, and release/CI actions.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.9</title><link>http://127.0.0.1:7979/fs/changelog/0.0.9</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.9</guid><content:encoded><![CDATA[<h3>Changed</h3>
+<ul>
+<li>Added the <code>release-prep</code> workflow using <code>cargo-release</code>.</li>
+<li>Migrated source compatibility for pna 0.29.x.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> through 0.29.3, <code>nix</code> to 0.31.1, <code>memmap2</code> to 0.9.9, <code>clap</code> to 4.5.58, <code>clap_complete</code> to 4.5.66, <code>log</code> to 0.4.29, and GitHub Actions dependencies.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.8</title><link>http://127.0.0.1:7979/fs/changelog/0.0.8</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.8</guid><content:encoded><![CDATA[<h3>Breaking</h3>
+<ul>
+<li>Raised the MSRV to 1.85 and migrated the crate to Rust 2024 edition.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Pinned GitHub Actions to commit hashes to reduce supply-chain risk.</li>
+<li>Introduced a single test entry point and renamed mount test scripts.</li>
+<li>Set up a development container.</li>
+<li>Removed the FreeBSD runner from CI.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Fixed the <code>setup-rust</code> action's rustc version detection.</li>
+<li>Fixed clippy warnings and test-script cleanup behavior.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> to 0.25.0, <code>rpassword</code> to 7.4.0, <code>nix</code> to 0.30.1, <code>clap</code> to 4.5.38, <code>clap_complete</code> to 4.5.50, and CI dependencies.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.7</title><link>http://127.0.0.1:7979/fs/changelog/0.0.7</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.7</guid><content:encoded><![CDATA[<h3>Added</h3>
+<ul>
+<li>Added the <code>bug-report</code> subcommand backed by the <code>bugreport</code> crate.</li>
+<li>Added MSRV CI coverage.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Raised the MSRV from 1.77 to 1.80.</li>
+<li>Updated CI scripts to call <code>cargo +{{ channel }}</code> explicitly.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Added <code>bugreport</code>.</li>
+<li>Updated <code>pna</code> to 0.24.0, <code>clap</code> to 4.5.35, <code>clap_complete</code> to 4.5.47, <code>log</code> to 0.4.27, and <code>libc</code> to 0.2.171.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.6</title><link>http://127.0.0.1:7979/fs/changelog/0.0.6</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.6</guid><content:encoded><![CDATA[<h3>Added</h3>
+<ul>
+<li>Added mount options for <code>--allow_root</code> and <code>allow_other</code>.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Avoided a CI panic on the FreeBSD nightly channel.</li>
+<li>Simplified internals with <code>impl Trait</code> syntax.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> through 0.23.0, <code>clap</code> to 4.5.31, <code>clap_complete</code> to 4.5.46, <code>log</code> to 0.4.26, and <code>libc</code> to 0.2.170.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.5</title><link>http://127.0.0.1:7979/fs/changelog/0.0.5</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.5</guid><content:encoded><![CDATA[<h3>Added</h3>
+<ul>
+<li>Added Linux arm CI and release coverage.</li>
+<li>Added <code>aarch64-unknown-linux-gnu</code> as a release binary target.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Declared <code>package.rust-version</code> as 1.77.</li>
+<li>Enabled merge queue (<code>merge_group</code>) CI triggers.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> through 0.21.1, <code>fuser</code> to 0.15.1, <code>clap-verbosity-flag</code> to 3.0.2, <code>cargo-dist</code> to 0.28.0, and other CLI/CI dependencies.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.4</title><link>http://127.0.0.1:7979/fs/changelog/0.0.4</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.4</guid><content:encoded><![CDATA[<h3>Changed</h3>
+<ul>
+<li>Migrated to pna 0.19.0.</li>
+<li>Migrated to fuser 0.15.0.</li>
+<li>Split pna and pnafs options in CI scripts.</li>
+<li>Added coverage for archives created without a directory pattern.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> to 0.19.0, <code>fuser</code> to 0.15.0, <code>cargo-dist</code> to 0.24.1, <code>memmap2</code> to 0.9.5, and related CLI/CI dependencies.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.3</title><link>http://127.0.0.1:7979/fs/changelog/0.0.3</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.3</guid><content:encoded><![CDATA[<h3>Changed</h3>
+<ul>
+<li>Added <code>memmap2</code> and moved archive loading toward slice-friendly APIs.</li>
+<li>Inlined the internal <code>State</code> type.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> to 0.18.0, <code>cargo-dist</code> to 0.22.1, and related CLI/CI dependencies.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.2</title><link>http://127.0.0.1:7979/fs/changelog/0.0.2</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.2</guid><content:encoded><![CDATA[<h3>Added</h3>
+<ul>
+<li>Added verbosity support to the command line.</li>
+<li>Added website generation through oranda and configured project homepage metadata.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Prepared code for Rust 2024 edition compatibility (renamed reserved <code>gen</code> identifiers, added <code>dep:</code> feature prefixes).</li>
+<li>Removed stored password state from <code>FileManager</code>.</li>
+<li>Simplified install documentation and logging startup error handling.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Added <code>clap-verbosity-flag</code>.</li>
+<li>Updated <code>pna</code> through 0.16.0, <code>cargo-dist</code> to 0.20.0, and related CLI/CI dependencies.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.1</title><link>http://127.0.0.1:7979/fs/changelog/0.0.1</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.1</guid><content:encoded><![CDATA[<h3>Added</h3>
+<ul>
+<li>Added xattr support for archive entries and xattr-preserving integration checks.</li>
+<li>Added publish workflow and crate metadata such as description.</li>
+<li>Added beta and nightly Rust channel CI coverage.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Migrated to pna 0.13.0.</li>
+<li>Re-enabled the temporarily disabled workflow and cleaned up duplicated CI steps.</li>
+</ul>
+<h3>Dependencies</h3>
+<ul>
+<li>Updated <code>pna</code> through 0.13.0, <code>nix</code> to 0.29.0, <code>simple_logger</code> to 5.0.0, <code>cargo-dist</code> to 0.17.0, and related CLI/CI dependencies.</li>
+</ul>
+]]></content:encoded></item><item><title>0.0.0</title><link>http://127.0.0.1:7979/fs/changelog/0.0.0</link><category domain="https://github.com/Portable-Network-Archive/fs">pnafs Changelog</category><guid>http://127.0.0.1:7979/fs/changelog/0.0.0</guid><content:encoded><![CDATA[<h3>Added</h3>
+<ul>
+<li>Initial <code>pnafs</code> FUSE archive filesystem implementation.</li>
+<li>Added lookup, read, permission, uid/gid, atime, raw-size, and encrypted archive mount support.</li>
+<li>Added shell completion generation through the <code>complete</code> subcommand.</li>
+<li>Added mount integration tests and GitHub release CI.</li>
+</ul>
+<h3>Changed</h3>
+<ul>
+<li>Renamed the crate from <code>pna-fs</code> to <code>pnafs</code>.</li>
+<li>Stabilized the completion subcommand naming.</li>
+</ul>
+<h3>Fixed</h3>
+<ul>
+<li>Removed <code>AllowRoot</code> by default.</li>
+<li>Fixed directory creation when child file entries appeared before parent directory entries.</li>
+<li>Avoided panics in early CLI and file-manager paths.</li>
+</ul>
+
+]]></content:encoded></item></channel></rss>
