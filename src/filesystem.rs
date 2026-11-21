@@ -35,7 +35,15 @@ impl PnaFS {
         password: Option<String>,
         write_strategy: Option<WriteStrategy>,
     ) -> io::Result<Self> {
-        let tree = archive_io::load(&archive, password)?;
+        // Read-only mounts load lazily: file bodies stay in the archive
+        // image and are decoded on first read (see
+        // `archive_io::load_lazy`). Write mounts may be saved back, so
+        // they keep the eager tree whose bodies are all in memory.
+        let tree = if write_strategy.is_none() {
+            archive_io::load_lazy(&archive, password)?
+        } else {
+            archive_io::load(&archive, password)?
+        };
         Ok(Self {
             tree: RwLock::new(tree),
             write_strategy,
@@ -207,6 +215,22 @@ impl Filesystem for PnaFS {
         reply: ReplyData,
     ) {
         info!("[Implemented] read(ino: {ino:#x?}, offset: {offset}, size: {size})");
+        // A lazy file's body is decoded under the write lock on first
+        // read, then served from memory like any other file.
+        let is_lazy = match self.read_tree() {
+            Ok(tree) => tree.is_lazy(ino.0),
+            Err(e) => return reply.error(e),
+        };
+        if is_lazy {
+            let mut tree = match self.write_tree() {
+                Ok(tree) => tree,
+                Err(e) => return reply.error(e),
+            };
+            if let Err(e) = tree.materialize(ino.0) {
+                log::warn!("read: materialize of ino {} failed: {e}", ino.0);
+                return reply.error(Errno::EIO);
+            }
+        }
         let tree = match self.read_tree() {
             Ok(tree) => tree,
             Err(e) => return reply.error(e),
@@ -1153,6 +1177,33 @@ mod tests {
         assert_eq!(
             before, after,
             "poisoned destroy must not rewrite the archive"
+        );
+    }
+
+    #[test]
+    fn read_only_mount_loads_lazily_write_mount_loads_eagerly() {
+        let dir = TempDir::new().unwrap();
+        let path = create_plain_archive(&dir, "sel.pna", &[("f.txt", b"content")]);
+
+        let ro = PnaFS::new(path.clone(), None, None).unwrap();
+        let ro_tree = ro.tree.read().unwrap();
+        let f = ro_tree
+            .lookup_child(ROOT_INODE, std::ffi::OsStr::new("f.txt"))
+            .unwrap();
+        assert!(
+            ro_tree.is_lazy(f.attr.ino.0),
+            "read-only mount must defer file bodies"
+        );
+        drop(ro_tree);
+
+        let rw = PnaFS::new(path, None, Some(WriteStrategy::Lazy)).unwrap();
+        let rw_tree = rw.tree.read().unwrap();
+        let f = rw_tree
+            .lookup_child(ROOT_INODE, std::ffi::OsStr::new("f.txt"))
+            .unwrap();
+        assert!(
+            !rw_tree.is_lazy(f.attr.ino.0),
+            "write mount must load file bodies eagerly"
         );
     }
 }

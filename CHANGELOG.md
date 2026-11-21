@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog], and this project follows [Semantic Ve
 - Added cargo-release changelog replacement rules for future release-prep PRs.
 - Implemented `statfs` so `df` reflects archive-tree capacity and usage.
 - Added sidecar file locking to reject conflicting concurrent mounts of the same archive.
+- Read-only mounts now load file bodies lazily: bodies stay in the archive image and are decoded on first read via per-entry chunk-run locators, so retained memory no longer grows with the total decoded size of the archive.
 
 ### Changed
 

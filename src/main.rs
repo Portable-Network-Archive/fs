@@ -8,6 +8,7 @@ mod archive_io;
 mod archive_lock;
 mod cli;
 mod command;
+mod entry_index;
 mod file_tree;
 mod filesystem;
 
