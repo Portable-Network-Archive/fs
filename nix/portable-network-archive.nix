@@ -8,15 +8,15 @@
 }:
 
 let
-  version = "0.41.0";
+  version = "0.41.1";
   sources = {
     x86_64-linux = {
       target = "x86_64-unknown-linux-gnu";
-      hash = "sha256-a/yG1TFVEdYh6Ku2zBcIZAAX9IAiS/EANHmc2ON3vzc=";
+      hash = "sha256-MA662sMS2fEtKn2Zx6hsfQsm0bLL5bYSQyIITz8hvK8=";
     };
     aarch64-linux = {
       target = "aarch64-unknown-linux-gnu";
-      hash = "sha256-bieeSEobx5F6DD5yt+8EAyJVMqoSXJ/fDhJXKY6SKsU=";
+      hash = "sha256-y9nGBerInCIG/Ox+pQQmpm4nFNp65VIcq6pTwy66b6o=";
     };
   };
   source = sources.${system} or (throw "portable-network-archive: unsupported system ${system}");
