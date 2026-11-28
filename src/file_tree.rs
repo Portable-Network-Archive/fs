@@ -1,4 +1,4 @@
-use fuser::{Errno, FileAttr, FileType, INodeNo, TimeOrNow};
+use fuser::{Errno, FileAttr, FileType, INodeNo, Owner, TimeOrNow};
 #[cfg(unix)]
 use nix::unistd::{Gid, Group, Uid, User};
 use pna::Metadata;
@@ -15,19 +15,16 @@ pub(crate) const ROOT_INODE: Inode = 1;
 /// POSIX permission-bit mask: the low 12 bits cover rwx + setuid/setgid/sticky.
 const PERM_MASK: u32 = 0o7777;
 
-/// Owner identity used when creating a new inode. FUSE handlers fill it from
-/// `Request::{uid, gid}`; archive load fills it from PNA permission metadata.
-#[derive(Copy, Clone, Debug)]
-pub(crate) struct Owner {
-    pub uid: u32,
-    pub gid: u32,
+/// Rename semantics independent of the platform's FUSE flag encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RenameMode {
+    Plain,
+    NoReplace,
+    Exchange,
 }
 
-impl Owner {
-    pub(crate) fn new(uid: u32, gid: u32) -> Self {
-        Self { uid, gid }
-    }
-}
+#[cfg(test)]
+pub(crate) const ROOT_OWNER: Owner = Owner { uid: 0, gid: 0 };
 
 /// Cipher configuration used when re-encrypting file data on save.
 ///
@@ -906,20 +903,8 @@ impl FileTree {
         old_name: &OsStr,
         new_parent: Inode,
         new_name: &OsStr,
-        flags: fuser::RenameFlags,
+        mode: RenameMode,
     ) -> Result<(), Errno> {
-        // RENAME_NOREPLACE and RENAME_EXCHANGE are mutually exclusive per
-        // the rename(2) man page. RENAME_WHITEOUT needs an overlay
-        // backend we don't provide; reject it explicitly.
-        let noreplace = flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
-        let exchange = flags.contains(fuser::RenameFlags::RENAME_EXCHANGE);
-        if flags.contains(fuser::RenameFlags::RENAME_WHITEOUT) {
-            return Err(Errno::ENOTSUP);
-        }
-        if noreplace && exchange {
-            return Err(Errno::EINVAL);
-        }
-
         let source_ino = {
             let p = self.inodes.get(&old_parent).ok_or(Errno::ENOENT)?;
             let dir = match &p.content {
@@ -935,9 +920,13 @@ impl FileTree {
             }
         }
         // No-op when source and destination resolve to the same path
-        // (POSIX rename(2)). EXCHANGE on the same path is also a no-op.
+        // (POSIX rename(2)), unless the caller forbids an existing destination.
         if old_parent == new_parent && old_name == new_name {
-            return Ok(());
+            return if mode == RenameMode::NoReplace {
+                Err(Errno::EEXIST)
+            } else {
+                Ok(())
+            };
         }
 
         let dest_existing = {
@@ -949,7 +938,7 @@ impl FileTree {
             }
         };
 
-        if exchange {
+        if mode == RenameMode::Exchange {
             // Both endpoints must already exist for EXCHANGE.
             let dest_ino = dest_existing.ok_or(Errno::ENOENT)?;
             if dest_ino == source_ino {
@@ -978,11 +967,11 @@ impl FileTree {
         }
 
         if let Some(dest_ino) = dest_existing {
+            if mode == RenameMode::NoReplace {
+                return Err(Errno::EEXIST);
+            }
             if dest_ino == source_ino {
                 return Ok(());
-            }
-            if noreplace {
-                return Err(Errno::EEXIST);
             }
             let dest_node = self.inodes.get(&dest_ino).ok_or(Errno::ENOENT)?;
             let dest_is_dir = matches!(dest_node.content, FsContent::Directory(_));
@@ -1396,7 +1385,10 @@ pub(crate) fn make_dir_node(ino: Inode, name: OsString) -> FsNode {
         name,
         FileType::Directory,
         0o775,
-        Owner::new(current_uid(), current_gid()),
+        Owner {
+            uid: current_uid(),
+            gid: current_gid(),
+        },
         FsContent::Directory(DirContent::new()),
         0,
         512,
@@ -1546,7 +1538,7 @@ mod tests {
     fn make_tree_with_file(content: &[u8]) -> (FileTree, Inode) {
         let mut tree = make_tree();
         let node = tree
-            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let ino = node.attr.ino.0;
         if !content.is_empty() {
@@ -1594,7 +1586,7 @@ mod tests {
     fn create_file_happy_path() {
         let mut tree = make_tree();
         let node = tree
-            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         assert_eq!(node.name, "a.txt");
         assert_eq!(node.attr.kind, FileType::RegularFile);
@@ -1609,10 +1601,10 @@ mod tests {
     #[test]
     fn create_file_existing_name_returns_eexist() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let err = tree
-            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap_err();
         assert_errno(err, fuser::Errno::EEXIST);
     }
@@ -1621,7 +1613,7 @@ mod tests {
     fn create_file_bad_parent_returns_enoent() {
         let mut tree = make_tree();
         let err = tree
-            .create_file(9999, OsStr::new("x.txt"), 0o644, Owner::new(0, 0))
+            .create_file(9999, OsStr::new("x.txt"), 0o644, ROOT_OWNER)
             .unwrap_err();
         assert_errno(err, fuser::Errno::ENOENT);
     }
@@ -1630,7 +1622,7 @@ mod tests {
     fn create_file_parent_is_file_returns_enotdir() {
         let (mut tree, file_ino) = make_tree_with_file(b"");
         let err = tree
-            .create_file(file_ino, OsStr::new("x.txt"), 0o644, Owner::new(0, 0))
+            .create_file(file_ino, OsStr::new("x.txt"), 0o644, ROOT_OWNER)
             .unwrap_err();
         assert_errno(err, fuser::Errno::ENOTDIR);
     }
@@ -1639,16 +1631,11 @@ mod tests {
     fn create_file_in_subdir() {
         let mut tree = make_tree();
         let subdir = tree
-            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let subdir_ino = subdir.attr.ino.0;
         let node = tree
-            .create_file(
-                subdir_ino,
-                OsStr::new("nested.txt"),
-                0o644,
-                Owner::new(0, 0),
-            )
+            .create_file(subdir_ino, OsStr::new("nested.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         assert_eq!(node.name, OsStr::new("nested.txt"));
     }
@@ -1722,7 +1709,7 @@ mod tests {
         // Get a Clean node: create -> write -> mark_clean
         let mut tree = make_tree();
         let node = tree
-            .create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let ino = node.attr.ino.0;
         tree.write_file(ino, 0, b"abc").unwrap();
@@ -1749,7 +1736,7 @@ mod tests {
         // Get Clean state: create -> write -> mark_clean
         let mut tree = make_tree();
         let node = tree
-            .create_file(ROOT_INODE, OsStr::new("h.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("h.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let ino = node.attr.ino.0;
         tree.write_file(ino, 0, b"abc").unwrap();
@@ -2003,7 +1990,7 @@ mod tests {
     fn make_dir_happy_path() {
         let mut tree = make_tree();
         let node = tree
-            .make_dir(ROOT_INODE, OsStr::new("mydir"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("mydir"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         assert_eq!(node.attr.nlink, 2);
         assert_eq!(node.attr.kind, FileType::Directory);
@@ -2014,7 +2001,7 @@ mod tests {
     fn make_dir_increments_parent_nlink() {
         let mut tree = make_tree();
         let parent_nlink_before = tree.get(ROOT_INODE).unwrap().attr.nlink;
-        tree.make_dir(ROOT_INODE, OsStr::new("mydir"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(ROOT_INODE, OsStr::new("mydir"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let parent_nlink_after = tree.get(ROOT_INODE).unwrap().attr.nlink;
         assert_eq!(parent_nlink_after, parent_nlink_before + 1);
@@ -2023,10 +2010,10 @@ mod tests {
     #[test]
     fn make_dir_existing_name_returns_eexist() {
         let mut tree = make_tree();
-        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         assert_errno(
-            tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, Owner::new(0, 0))
+            tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, ROOT_OWNER)
                 .unwrap_err(),
             fuser::Errno::EEXIST,
         );
@@ -2036,13 +2023,7 @@ mod tests {
     fn make_dir_applies_umask() {
         let mut tree = make_tree();
         let node = tree
-            .make_dir(
-                ROOT_INODE,
-                OsStr::new("masked"),
-                0o777,
-                0o022,
-                Owner::new(0, 0),
-            )
+            .make_dir(ROOT_INODE, OsStr::new("masked"), 0o777, 0o022, ROOT_OWNER)
             .unwrap();
         assert_eq!(node.attr.perm, 0o755);
     }
@@ -2051,7 +2032,7 @@ mod tests {
     fn make_dir_bad_parent_returns_enoent() {
         let mut tree = make_tree();
         let err = tree
-            .make_dir(9999, OsStr::new("x"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(9999, OsStr::new("x"), 0o755, 0, ROOT_OWNER)
             .unwrap_err();
         assert!(errno_eq(err, fuser::Errno::ENOENT));
     }
@@ -2060,7 +2041,7 @@ mod tests {
     fn make_dir_parent_is_file_returns_enotdir() {
         let (mut tree, file_ino) = make_tree_with_file(b"");
         let err = tree
-            .make_dir(file_ino, OsStr::new("x"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(file_ino, OsStr::new("x"), 0o755, 0, ROOT_OWNER)
             .unwrap_err();
         assert!(errno_eq(err, fuser::Errno::ENOTDIR));
     }
@@ -2090,7 +2071,7 @@ mod tests {
     #[test]
     fn unlink_directory_returns_eperm_or_eisdir() {
         let mut tree = make_tree();
-        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let err = tree.unlink(ROOT_INODE, OsStr::new("d")).unwrap_err();
         assert!(
@@ -2104,7 +2085,7 @@ mod tests {
         let (mut tree, old_ino) = make_tree_with_file(b"hi");
         tree.unlink(ROOT_INODE, OsStr::new("test.txt")).unwrap();
         let new_node = tree
-            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         assert_ne!(new_node.attr.ino.0, old_ino);
         let children: Vec<_> = tree.children(ROOT_INODE).unwrap().collect();
@@ -2116,7 +2097,7 @@ mod tests {
         let (mut tree, old_ino) = make_tree_with_file(b"old data");
         tree.unlink(ROOT_INODE, OsStr::new("test.txt")).unwrap();
         let new_node = tree
-            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("test.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let new_ino = new_node.attr.ino.0;
         tree.write_file(new_ino, 0, b"new data").unwrap();
@@ -2164,7 +2145,7 @@ mod tests {
         let mut tree =
             FileTree::new_for_test(PathBuf::from("/tmp/t.pna"), Some("secret".to_string()));
         let node = tree
-            .create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let ino = node.attr.ino.0;
         tree.mark_clean();
@@ -2193,7 +2174,7 @@ mod tests {
         // Get Dirty state: create -> write -> mark_clean -> write again
         let mut tree = make_tree();
         let node = tree
-            .create_file(ROOT_INODE, OsStr::new("g.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("g.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let ino = node.attr.ino.0;
         tree.write_file(ino, 0, b"abc").unwrap();
@@ -2222,7 +2203,7 @@ mod tests {
             FileTree::new_for_test(PathBuf::from("/tmp/t.pna"), Some("secret".to_string()));
         // Create file -> write -> mark_clean: New+pwd -> Clean{cipher=Some(AES-CTR)}
         let node = tree
-            .create_file(ROOT_INODE, OsStr::new("enc.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("enc.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let ino = node.attr.ino.0;
         tree.write_file(ino, 0, b"hello").unwrap();
@@ -2289,7 +2270,7 @@ mod tests {
     #[test]
     fn rmdir_empty_dir_succeeds() {
         let mut tree = make_tree();
-        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         tree.rmdir(ROOT_INODE, OsStr::new("d")).unwrap();
         assert!(tree.lookup_child(ROOT_INODE, OsStr::new("d")).is_none());
@@ -2299,10 +2280,10 @@ mod tests {
     fn rmdir_non_empty_returns_enotempty() {
         let mut tree = make_tree();
         let dir = tree
-            .make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let dir_ino = dir.attr.ino.0;
-        tree.create_file(dir_ino, OsStr::new("f"), 0o644, Owner::new(0, 0))
+        tree.create_file(dir_ino, OsStr::new("f"), 0o644, ROOT_OWNER)
             .unwrap();
         assert_errno(
             tree.rmdir(ROOT_INODE, OsStr::new("d")).unwrap_err(),
@@ -2327,7 +2308,7 @@ mod tests {
             OsStr::new("test.txt"),
             ROOT_INODE,
             OsStr::new("renamed.txt"),
-            fuser::RenameFlags::empty(),
+            RenameMode::Plain,
         )
         .unwrap();
         assert!(
@@ -2343,14 +2324,14 @@ mod tests {
     #[test]
     fn rename_replace_existing_file() {
         let (mut tree, _) = make_tree_with_file(b"src");
-        tree.create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         tree.rename(
             ROOT_INODE,
             OsStr::new("test.txt"),
             ROOT_INODE,
             OsStr::new("dst.txt"),
-            fuser::RenameFlags::empty(),
+            RenameMode::Plain,
         )
         .unwrap();
         let node = tree
@@ -2367,21 +2348,21 @@ mod tests {
     fn rename_cross_parent_directory() {
         let mut tree = make_tree();
         let a = tree
-            .make_dir(ROOT_INODE, OsStr::new("a"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("a"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let a_ino = a.attr.ino.0;
         let b = tree
-            .make_dir(ROOT_INODE, OsStr::new("b"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("b"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let b_ino = b.attr.ino.0;
-        tree.create_file(a_ino, OsStr::new("f"), 0o644, Owner::new(0, 0))
+        tree.create_file(a_ino, OsStr::new("f"), 0o644, ROOT_OWNER)
             .unwrap();
         tree.rename(
             a_ino,
             OsStr::new("f"),
             b_ino,
             OsStr::new("f"),
-            fuser::RenameFlags::empty(),
+            RenameMode::Plain,
         )
         .unwrap();
         assert!(tree.lookup_child(a_ino, OsStr::new("f")).is_none());
@@ -2392,11 +2373,11 @@ mod tests {
     fn rename_dir_into_descendant_returns_einval() {
         let mut tree = make_tree();
         let outer = tree
-            .make_dir(ROOT_INODE, OsStr::new("a"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("a"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let outer_ino = outer.attr.ino.0;
         let inner = tree
-            .make_dir(outer_ino, OsStr::new("b"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(outer_ino, OsStr::new("b"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let inner_ino = inner.attr.ino.0;
         // Try to move 'a' under 'a/b' -> EINVAL.
@@ -2406,7 +2387,7 @@ mod tests {
                 OsStr::new("a"),
                 inner_ino,
                 OsStr::new("a"),
-                fuser::RenameFlags::empty(),
+                RenameMode::Plain,
             )
             .unwrap_err(),
             fuser::Errno::EINVAL,
@@ -2428,12 +2409,12 @@ mod tests {
         let mut tree = make_tree();
         // Setup: /a (subdir), /b (empty subdir to be the rename target).
         let a_ino = tree
-            .make_dir(ROOT_INODE, OsStr::new("a"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("a"), 0o755, 0, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
             .0;
-        tree.make_dir(ROOT_INODE, OsStr::new("b"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(ROOT_INODE, OsStr::new("b"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let _ = a_ino;
         let parent_nlink_before = tree.get(ROOT_INODE).unwrap().attr.nlink;
@@ -2443,7 +2424,7 @@ mod tests {
             OsStr::new("a"),
             ROOT_INODE,
             OsStr::new("b"),
-            fuser::RenameFlags::empty(),
+            RenameMode::Plain,
         )
         .unwrap();
         let parent_nlink_after = tree.get(ROOT_INODE).unwrap().attr.nlink;
@@ -2461,20 +2442,20 @@ mod tests {
         //   dst parent: unchanged (loses /dst/b as a subdir, gains /dst/a)
         let mut tree = make_tree();
         let src = tree
-            .make_dir(ROOT_INODE, OsStr::new("src"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("src"), 0o755, 0, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
             .0;
         let dst = tree
-            .make_dir(ROOT_INODE, OsStr::new("dst"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("dst"), 0o755, 0, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
             .0;
-        tree.make_dir(src, OsStr::new("a"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(src, OsStr::new("a"), 0o755, 0, ROOT_OWNER)
             .unwrap();
-        tree.make_dir(dst, OsStr::new("b"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(dst, OsStr::new("b"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let src_before = tree.get(src).unwrap().attr.nlink;
         let dst_before = tree.get(dst).unwrap().attr.nlink;
@@ -2483,7 +2464,7 @@ mod tests {
             OsStr::new("a"),
             dst,
             OsStr::new("b"),
-            fuser::RenameFlags::empty(),
+            RenameMode::Plain,
         )
         .unwrap();
         assert_eq!(tree.get(src).unwrap().attr.nlink, src_before - 1);
@@ -2492,22 +2473,20 @@ mod tests {
 
     #[test]
     fn rename_with_noreplace_returns_eexist_when_dst_exists() {
-        // RENAME_NOREPLACE (linux 3.15+): refuse to clobber. Verifies
-        // the FUSE flags arg is honoured and not silently dropped.
+        // Refuse to clobber an existing destination.
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap();
-        tree.create_file(ROOT_INODE, OsStr::new("b.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("b.txt"), 0o644, ROOT_OWNER)
             .unwrap();
-        let mut flags = fuser::RenameFlags::empty();
-        flags.insert(fuser::RenameFlags::RENAME_NOREPLACE);
+        let mode = RenameMode::NoReplace;
         assert_errno(
             tree.rename(
                 ROOT_INODE,
                 OsStr::new("a.txt"),
                 ROOT_INODE,
                 OsStr::new("b.txt"),
-                flags,
+                mode,
             )
             .unwrap_err(),
             fuser::Errno::EEXIST,
@@ -2522,27 +2501,26 @@ mod tests {
         // RENAME_EXCHANGE (linux 3.15+): the two entries swap ino/contents.
         let mut tree = make_tree();
         let a = tree
-            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
             .0;
         tree.write_file(a, 0, b"AAA").unwrap();
         let b = tree
-            .create_file(ROOT_INODE, OsStr::new("b.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("b.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
             .0;
         tree.write_file(b, 0, b"BBB").unwrap();
-        let mut flags = fuser::RenameFlags::empty();
-        flags.insert(fuser::RenameFlags::RENAME_EXCHANGE);
+        let mode = RenameMode::Exchange;
         tree.rename(
             ROOT_INODE,
             OsStr::new("a.txt"),
             ROOT_INODE,
             OsStr::new("b.txt"),
-            flags,
+            mode,
         )
         .unwrap();
         // a.txt still exists but now points to inode `b` (the BBB content),
@@ -2566,30 +2544,30 @@ mod tests {
     }
 
     #[test]
-    fn rename_whiteout_is_rejected() {
-        // RENAME_WHITEOUT needs an overlay backend pnafs does not
-        // provide, so the flag is refused before touching the tree.
-        // (The code returns ENOTSUP — the man page lets a filesystem
-        // signal "unsupported" for whiteout; assert the actual contract.)
+    fn rename_noreplace_rejects_same_path_and_hardlink() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+        let ino = tree
+            .create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
+            .unwrap()
+            .attr
+            .ino
+            .0;
+        tree.create_hardlink(ROOT_INODE, OsStr::new("b.txt"), ino)
             .unwrap();
-        let mut flags = fuser::RenameFlags::empty();
-        flags.insert(fuser::RenameFlags::RENAME_WHITEOUT);
-        assert_errno(
-            tree.rename(
-                ROOT_INODE,
-                OsStr::new("a.txt"),
-                ROOT_INODE,
-                OsStr::new("b.txt"),
-                flags,
-            )
-            .unwrap_err(),
-            fuser::Errno::ENOTSUP,
-        );
-        // Source untouched, no phantom destination created.
-        assert!(tree.lookup_child(ROOT_INODE, OsStr::new("a.txt")).is_some());
-        assert!(tree.lookup_child(ROOT_INODE, OsStr::new("b.txt")).is_none());
+        for dest in ["a.txt", "b.txt"] {
+            assert_errno(
+                tree.rename(
+                    ROOT_INODE,
+                    OsStr::new("a.txt"),
+                    ROOT_INODE,
+                    OsStr::new(dest),
+                    RenameMode::NoReplace,
+                )
+                .unwrap_err(),
+                Errno::EEXIST,
+            );
+        }
+        assert_eq!(tree.get(ino).unwrap().attr.nlink, 2);
     }
 
     #[test]
@@ -2598,7 +2576,7 @@ mod tests {
         // entry, rename returns success and changes nothing.
         let mut tree = make_tree();
         let ino = tree
-            .create_file(ROOT_INODE, OsStr::new("same.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("same.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
@@ -2609,7 +2587,7 @@ mod tests {
             OsStr::new("same.txt"),
             ROOT_INODE,
             OsStr::new("same.txt"),
-            fuser::RenameFlags::empty(),
+            RenameMode::Plain,
         )
         .unwrap();
         let still = tree
@@ -2625,22 +2603,16 @@ mod tests {
         // destination is missing the swap fails with ENOENT and the
         // existing source entry is left intact.
         let mut tree = make_tree();
-        tree.create_file(
-            ROOT_INODE,
-            OsStr::new("present.txt"),
-            0o644,
-            Owner::new(0, 0),
-        )
-        .unwrap();
-        let mut flags = fuser::RenameFlags::empty();
-        flags.insert(fuser::RenameFlags::RENAME_EXCHANGE);
+        tree.create_file(ROOT_INODE, OsStr::new("present.txt"), 0o644, ROOT_OWNER)
+            .unwrap();
+        let mode = RenameMode::Exchange;
         assert_errno(
             tree.rename(
                 ROOT_INODE,
                 OsStr::new("present.txt"),
                 ROOT_INODE,
                 OsStr::new("absent.txt"),
-                flags,
+                mode,
             )
             .unwrap_err(),
             fuser::Errno::ENOENT,
@@ -2850,7 +2822,7 @@ mod tests {
                 ROOT_INODE,
                 OsStr::new("s"),
                 Path::new("/target"),
-                Owner::new(0, 0),
+                ROOT_OWNER,
             )
             .unwrap();
         assert_eq!(node.attr.kind, FileType::Symlink);
@@ -2891,7 +2863,7 @@ mod tests {
     #[test]
     fn create_hardlink_existing_dest_returns_eexist() {
         let (mut tree, ino) = make_tree_with_file(b"x");
-        tree.create_file(ROOT_INODE, OsStr::new("dest.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("dest.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         assert_errno(
             tree.create_hardlink(ROOT_INODE, OsStr::new("dest.txt"), ino)
@@ -2904,7 +2876,7 @@ mod tests {
     fn create_hardlink_to_directory_returns_eperm() {
         let mut tree = make_tree();
         let dir = tree
-            .make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let dir_ino = dir.attr.ino.0;
         assert_errno(
@@ -2926,7 +2898,10 @@ mod tests {
                 SpecialKind::Fifo,
                 0o644,
                 0,
-                Owner::new(1000, 100),
+                Owner {
+                    uid: 1000,
+                    gid: 100,
+                },
             )
             .unwrap();
         assert_eq!(node.attr.kind, FileType::NamedPipe);
@@ -2953,7 +2928,7 @@ mod tests {
                 SpecialKind::BlockDevice,
                 0o600,
                 0x0301,
-                Owner::new(0, 0),
+                ROOT_OWNER,
             )
             .unwrap();
         assert_eq!(node.attr.kind, FileType::BlockDevice);
@@ -2963,7 +2938,7 @@ mod tests {
     #[test]
     fn create_special_eexist_when_target_taken() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("dup"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("dup"), 0o644, ROOT_OWNER)
             .unwrap();
         assert_errno(
             tree.create_special(
@@ -2972,7 +2947,7 @@ mod tests {
                 SpecialKind::Fifo,
                 0o644,
                 0,
-                Owner::new(0, 0),
+                ROOT_OWNER,
             )
             .unwrap_err(),
             fuser::Errno::EEXIST,
@@ -2989,7 +2964,7 @@ mod tests {
                 SpecialKind::Fifo,
                 0o644,
                 0,
-                Owner::new(0, 0),
+                ROOT_OWNER,
             )
             .unwrap();
         let ino = node.attr.ino.0;
@@ -3009,7 +2984,7 @@ mod tests {
                 SpecialKind::Fifo,
                 0o644,
                 0,
-                Owner::new(0, 0),
+                ROOT_OWNER,
             )
             .unwrap();
         let ino = node.attr.ino.0;
@@ -3090,7 +3065,7 @@ mod tests {
     fn rename_overwrite_with_open_fd_orphans_target() {
         let (mut tree, _src_ino) = make_tree_with_file(b"src");
         let dst = tree
-            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let dst_ino = dst.attr.ino.0;
         tree.bump_open(dst_ino).unwrap();
@@ -3099,7 +3074,7 @@ mod tests {
             OsStr::new("test.txt"),
             ROOT_INODE,
             OsStr::new("dst.txt"),
-            fuser::RenameFlags::empty(),
+            RenameMode::Plain,
         )
         .unwrap();
         // The previous "dst.txt" inode lost its dir entry but a fd is open,
@@ -3241,7 +3216,7 @@ mod tests {
         for round in 0..64 {
             let mut base = make_tree();
             let ino = base
-                .create_file(ROOT_INODE, OsStr::new("doomed"), 0o644, Owner::new(0, 0))
+                .create_file(ROOT_INODE, OsStr::new("doomed"), 0o644, ROOT_OWNER)
                 .unwrap()
                 .attr
                 .ino
@@ -3345,7 +3320,7 @@ mod tests {
         for round in 0..64 {
             let mut base = make_tree();
             let ino = base
-                .create_file(ROOT_INODE, OsStr::new("racy"), 0o644, Owner::new(0, 0))
+                .create_file(ROOT_INODE, OsStr::new("racy"), 0o644, ROOT_OWNER)
                 .unwrap()
                 .attr
                 .ino
@@ -3576,7 +3551,7 @@ mod tests {
     fn copy_file_range_appends_to_empty_dst() {
         let (mut tree, src) = make_tree_with_file(b"hello world");
         let dst = tree
-            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
@@ -3590,7 +3565,7 @@ mod tests {
     fn copy_file_range_grows_dst_with_zero_fill() {
         let (mut tree, src) = make_tree_with_file(b"abcdefghij");
         let dst = tree
-            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
@@ -3606,7 +3581,7 @@ mod tests {
     fn copy_file_range_truncates_at_src_eof() {
         let (mut tree, src) = make_tree_with_file(b"short");
         let dst = tree
-            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
@@ -3620,7 +3595,7 @@ mod tests {
     fn copy_file_range_src_offset_at_or_past_eof_returns_zero() {
         let (mut tree, src) = make_tree_with_file(b"abc");
         let dst = tree
-            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
@@ -3641,7 +3616,7 @@ mod tests {
     fn copy_file_range_directory_src_returns_eisdir() {
         let mut tree = make_tree();
         let dst = tree
-            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, Owner::new(0, 0))
+            .create_file(ROOT_INODE, OsStr::new("dst.txt"), 0o644, ROOT_OWNER)
             .unwrap()
             .attr
             .ino
@@ -3796,7 +3771,7 @@ mod tests {
     #[test]
     fn collect_dfs_single_file() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let result = tree.collect_dfs();
         assert_eq!(result.len(), 1);
@@ -3807,10 +3782,10 @@ mod tests {
     fn collect_dfs_nested_dirs() {
         let mut tree = make_tree();
         let dir = tree
-            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let dir_ino = dir.attr.ino.0;
-        tree.create_file(dir_ino, OsStr::new("file.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(dir_ino, OsStr::new("file.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let result = tree.collect_dfs();
         assert_eq!(result.len(), 2);
@@ -3821,9 +3796,9 @@ mod tests {
     #[test]
     fn collect_dfs_sorted_order() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("z.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("z.txt"), 0o644, ROOT_OWNER)
             .unwrap();
-        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let result = tree.collect_dfs();
         assert_eq!(result[0].2, "a.txt");
@@ -3846,14 +3821,8 @@ mod tests {
     #[test]
     fn make_dir_all_reuses_existing() {
         let mut tree = make_tree();
-        tree.make_dir(
-            ROOT_INODE,
-            OsStr::new("existing"),
-            0o755,
-            0,
-            Owner::new(0, 0),
-        )
-        .unwrap();
+        tree.make_dir(ROOT_INODE, OsStr::new("existing"), 0o755, 0, ROOT_OWNER)
+            .unwrap();
         tree.make_dir_all(Path::new("existing/new"), ROOT_INODE)
             .unwrap();
         // "existing" was reused (not duplicated), "new" was created
@@ -3870,11 +3839,11 @@ mod tests {
     #[test]
     fn children_returns_sorted_order() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("z.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("z.txt"), 0o644, ROOT_OWNER)
             .unwrap();
-        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("a.txt"), 0o644, ROOT_OWNER)
             .unwrap();
-        tree.create_file(ROOT_INODE, OsStr::new("m.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("m.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let names: Vec<_> = tree
             .children(ROOT_INODE)
@@ -3889,7 +3858,7 @@ mod tests {
     #[test]
     fn parent_pointer_set_on_create_file() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let child = tree.lookup_child(ROOT_INODE, OsStr::new("f.txt")).unwrap();
         assert_eq!(child.parent, Some(ROOT_INODE));
@@ -3899,10 +3868,10 @@ mod tests {
     fn parent_pointer_for_nested_file() {
         let mut tree = make_tree();
         let dir = tree
-            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         let dir_ino = dir.attr.ino.0;
-        tree.create_file(dir_ino, OsStr::new("f.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(dir_ino, OsStr::new("f.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         let child = tree.lookup_child(dir_ino, OsStr::new("f.txt")).unwrap();
         assert_eq!(child.parent, Some(dir_ino));
@@ -3912,7 +3881,7 @@ mod tests {
     fn parent_pointer_for_make_dir() {
         let mut tree = make_tree();
         let dir = tree
-            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, Owner::new(0, 0))
+            .make_dir(ROOT_INODE, OsStr::new("sub"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         assert_eq!(dir.parent, Some(ROOT_INODE));
     }
@@ -3922,7 +3891,7 @@ mod tests {
     #[test]
     fn is_dirty_after_make_dir() {
         let mut tree = make_tree();
-        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, Owner::new(0, 0))
+        tree.make_dir(ROOT_INODE, OsStr::new("d"), 0o755, 0, ROOT_OWNER)
             .unwrap();
         assert!(tree.is_dirty());
     }
@@ -3930,7 +3899,7 @@ mod tests {
     #[test]
     fn is_dirty_after_unlink() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         tree.mark_clean();
         tree.unlink(ROOT_INODE, OsStr::new("f.txt")).unwrap();
@@ -3940,7 +3909,7 @@ mod tests {
     #[test]
     fn is_dirty_after_set_times_with_value() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         tree.mark_clean();
         let t = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1000);
@@ -3958,7 +3927,7 @@ mod tests {
     #[test]
     fn not_dirty_after_set_times_none_none() {
         let mut tree = make_tree();
-        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, Owner::new(0, 0))
+        tree.create_file(ROOT_INODE, OsStr::new("f.txt"), 0o644, ROOT_OWNER)
             .unwrap();
         tree.mark_clean();
         let ino = tree

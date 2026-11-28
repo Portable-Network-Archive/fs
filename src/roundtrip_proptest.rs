@@ -93,7 +93,10 @@
 //!   conventional system has entries for; see comment there.
 
 use crate::archive_io;
-use crate::file_tree::{FileTree, FsContent, Inode, Owner, ROOT_INODE, SpecialKind};
+use crate::file_tree::{
+    FileTree, FsContent, Inode, ROOT_INODE, ROOT_OWNER, RenameMode, SpecialKind,
+};
+use fuser::Owner;
 use proptest::prelude::*;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
@@ -306,21 +309,6 @@ enum FsOp {
         dst_offset: u64,
         len: u64,
     },
-}
-
-/// Which flavour of `rename(2)` an `FsOp::Rename` issues. Splitting
-/// this out (rather than generating raw `fuser::RenameFlags`) keeps
-/// the shrinker working on a small closed set and documents intent.
-#[derive(Debug, Clone, Copy)]
-enum RenameMode {
-    /// Plain rename: clobbers the destination if it exists.
-    Plain,
-    /// `RENAME_NOREPLACE`: `EEXIST` (skipped) if the destination
-    /// exists.
-    NoReplace,
-    /// `RENAME_EXCHANGE`: atomically swap two existing entries;
-    /// `ENOENT` (skipped) if the destination does not exist.
-    Exchange,
 }
 
 /// The three `fallocate(2)` flavours `FileTree::fallocate` supports.
@@ -547,7 +535,7 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                         None => continue,
                     }
                 };
-                let _ = tree.make_dir(parent_ino, OsStr::new(name), 0o755, 0, Owner::new(0, 0));
+                let _ = tree.make_dir(parent_ino, OsStr::new(name), 0o755, 0, ROOT_OWNER);
             }
             FsOp::Rmdir { target } => {
                 // Skip the root: rmdir on `/` is meaningless and the
@@ -629,11 +617,6 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                         None => continue,
                     }
                 };
-                let flags = match mode {
-                    RenameMode::Plain => fuser::RenameFlags::empty(),
-                    RenameMode::NoReplace => fuser::RenameFlags::RENAME_NOREPLACE,
-                    RenameMode::Exchange => fuser::RenameFlags::RENAME_EXCHANGE,
-                };
                 // Every rejected case (ENOENT, EEXIST under
                 // NOREPLACE, ENOENT under EXCHANGE, EINVAL for a dir
                 // into its own descendant, ENOTEMPTY clobbering a
@@ -644,7 +627,7 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                     &old_leaf,
                     new_parent,
                     OsStr::new(dest_name),
-                    flags,
+                    *mode,
                 );
             }
             FsOp::Link {
@@ -732,7 +715,7 @@ fn apply_ops(tree: &mut FileTree, ops: &[FsOp]) -> Expectations {
                     parent_ino,
                     OsStr::new(name),
                     Path::new(target),
-                    Owner::new(0, 0),
+                    ROOT_OWNER,
                 );
             }
             FsOp::SetAttr {
@@ -1109,7 +1092,10 @@ fn build_child(tree: &mut FileTree, parent: Inode, name: &str, spec: &NodeSpec) 
         NodeSpec::File { meta, .. }
         | NodeSpec::Symlink { meta, .. }
         | NodeSpec::Special { meta, .. }
-        | NodeSpec::Dir { meta, .. } => Owner::new(meta.uid, meta.gid),
+        | NodeSpec::Dir { meta, .. } => Owner {
+            uid: meta.uid,
+            gid: meta.gid,
+        },
     };
     match spec {
         NodeSpec::File { meta, content } => {

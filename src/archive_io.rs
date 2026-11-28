@@ -682,7 +682,7 @@ fn owner_facets(node: &FsNode) -> (u64, String, u64, String, u16) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::file_tree::{Owner, ROOT_INODE};
+    use crate::file_tree::{ROOT_INODE, ROOT_OWNER};
     use pna::{Archive, DirEntryBuilder, FileEntryBuilder, Metadata, WriteOptions};
     use std::io::Write as IoWrite;
     use std::path::PathBuf;
@@ -1109,7 +1109,7 @@ mod tests {
             ROOT_INODE,
             std::ffi::OsStr::new("new.txt"),
             0o644,
-            Owner::new(0, 0),
+            ROOT_OWNER,
         )
         .unwrap();
         let child_ino = tree
@@ -1142,7 +1142,7 @@ mod tests {
             ROOT_INODE,
             std::ffi::OsStr::new("enc.txt"),
             0o644,
-            Owner::new(0, 0),
+            ROOT_OWNER,
         )
         .unwrap();
         let child_ino = tree
@@ -1398,7 +1398,7 @@ mod tests {
             std::ffi::OsStr::new("mydir"),
             0o755,
             0,
-            Owner::new(0, 0),
+            ROOT_OWNER,
         )
         .unwrap();
         let dir_ino = tree
@@ -1498,7 +1498,7 @@ mod tests {
                 ROOT_INODE,
                 std::ffi::OsStr::new("orig.txt"),
                 0o644,
-                Owner::new(0, 0),
+                ROOT_OWNER,
             )
             .unwrap();
         let original_ino = original.attr.ino.0;
@@ -1565,7 +1565,7 @@ mod tests {
                     ROOT_INODE,
                     std::ffi::OsStr::new(name),
                     std::path::Path::new(target),
-                    Owner::new(0, 0),
+                    ROOT_OWNER,
                 )
                 .unwrap();
             match &node.content {

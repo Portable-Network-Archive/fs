@@ -1,8 +1,8 @@
 use crate::archive_io;
-use crate::file_tree::{FileTree, FsContent, NodeKind, Owner, ROOT_INODE};
+use crate::file_tree::{FileTree, FsContent, NodeKind, ROOT_INODE, RenameMode};
 use fuser::{
     BsdFileFlags, Errno, FileHandle, Filesystem, FopenFlags, Generation, INodeNo, LockOwner,
-    OpenAccMode, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    OpenAccMode, OpenFlags, Owner, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
     ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow,
     WriteFlags,
 };
@@ -122,11 +122,40 @@ impl PnaFS {
     }
 }
 
+/// Translate native rename flags before touching the tree. Unsupported flags
+/// (including Linux whiteout) and combinations must not become plain renames.
+fn rename_mode(flags: RenameFlags) -> Result<RenameMode, Errno> {
+    if flags.is_empty() {
+        return Ok(RenameMode::Plain);
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if flags == RenameFlags::RENAME_NOREPLACE {
+            return Ok(RenameMode::NoReplace);
+        }
+        if flags == RenameFlags::RENAME_EXCHANGE {
+            return Ok(RenameMode::Exchange);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if flags == RenameFlags::RENAME_EXCL {
+            return Ok(RenameMode::NoReplace);
+        }
+        if flags == RenameFlags::RENAME_SWAP {
+            return Ok(RenameMode::Exchange);
+        }
+    }
+    Err(Errno::EINVAL)
+}
+
 /// Block size reported by `statfs`. Matches `FileAttr::blksize` so
 /// per-file `st_blocks` and the filesystem-wide block accounting use the
 /// same unit.
 const STATFS_BSIZE: u32 = 512;
 
+// FUSE_HANDLE_KILLPRIV_V2 and FUSE_ALLOW_IDMAP are not negotiated; the
+// kernel retains privilege-bit handling and provides caller IDs.
 impl Filesystem for PnaFS {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         info!("[Implemented] lookup(parent: {parent:#x?}, name {name:?})");
@@ -177,7 +206,14 @@ impl Filesystem for PnaFS {
         }
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+    fn open(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        flags: OpenFlags,
+        _kill_suid_gid: bool,
+        reply: ReplyOpen,
+    ) {
         info!("[Implemented] open(ino: {ino:#x?}, flags: {flags:#x?})");
         if self.write_strategy.is_none() && flags.acc_mode() != OpenAccMode::O_RDONLY {
             reply.error(Errno::EROFS);
@@ -426,6 +462,7 @@ impl Filesystem for PnaFS {
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<BsdFileFlags>,
+        _kill_suid_gid: bool,
         reply: ReplyAttr,
     ) {
         info!("[Implemented] setattr(ino: {ino:#x?}, mode: {mode:?}, size: {size:?})");
@@ -450,7 +487,12 @@ impl Filesystem for PnaFS {
                     return;
                 }
             };
-            let caller_uid = req.uid();
+            // Caller IDs are absent on idmapped mounts. Do not authorize a
+            // metadata change without a caller identity.
+            let Some(caller_uid) = req.uid() else {
+                reply.error(Errno::EPERM);
+                return;
+            };
             let owner_uid = node.attr.uid;
             // chown of uid: caller must be root.
             if let Some(new_uid) = uid
@@ -497,12 +539,14 @@ impl Filesystem for PnaFS {
 
     fn create(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         flags: i32,
+        _kill_suid_gid: bool,
+        owner: Owner,
         reply: ReplyCreate,
     ) {
         info!("[Implemented] create(parent: {parent:#x?}, name: {name:?}, mode: {mode})");
@@ -532,12 +576,7 @@ impl Filesystem for PnaFS {
             }
             ino
         } else {
-            match tree.create_file(
-                parent.0,
-                name,
-                mode & !umask,
-                Owner::new(req.uid(), req.gid()),
-            ) {
+            match tree.create_file(parent.0, name, mode & !umask, owner) {
                 Ok(node) => node.attr.ino.0,
                 Err(e) => {
                     reply.error(e);
@@ -573,12 +612,13 @@ impl Filesystem for PnaFS {
 
     fn mknod(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
         rdev: u32,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         info!(
@@ -600,7 +640,6 @@ impl Filesystem for PnaFS {
             }
         };
         let perm = (mode & !umask) as u16;
-        let owner = Owner::new(req.uid(), req.gid());
         let mut tree = match self.write_tree() {
             Ok(tree) => tree,
             Err(e) => return reply.error(e),
@@ -622,11 +661,12 @@ impl Filesystem for PnaFS {
 
     fn mkdir(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         mode: u32,
         umask: u32,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         info!("[Implemented] mkdir(parent: {parent:#x?}, name: {name:?}, mode: {mode})");
@@ -642,13 +682,7 @@ impl Filesystem for PnaFS {
             Ok(tree) => tree,
             Err(e) => return reply.error(e),
         };
-        match tree.make_dir(
-            parent.0,
-            name,
-            mode,
-            umask,
-            Owner::new(req.uid(), req.gid()),
-        ) {
+        match tree.make_dir(parent.0, name, mode, umask, owner) {
             Ok(node) => {
                 let attr = node.attr;
                 reply.entry(&Duration::from_secs(1), &attr, Generation(0));
@@ -731,10 +765,11 @@ impl Filesystem for PnaFS {
 
     fn symlink(
         &self,
-        req: &Request,
+        _req: &Request,
         parent: INodeNo,
         name: &OsStr,
         link: &std::path::Path,
+        owner: Owner,
         reply: ReplyEntry,
     ) {
         info!("[Implemented] symlink(parent: {parent:#x?}, name: {name:?}, link: {link:?})");
@@ -750,7 +785,7 @@ impl Filesystem for PnaFS {
             Ok(tree) => tree,
             Err(e) => return reply.error(e),
         };
-        match tree.create_symlink(parent.0, name, link, Owner::new(req.uid(), req.gid())) {
+        match tree.create_symlink(parent.0, name, link, owner) {
             Ok(node) => {
                 let attr = node.attr;
                 reply.entry(&Duration::from_secs(1), &attr, Generation(0));
@@ -767,6 +802,7 @@ impl Filesystem for PnaFS {
         newparent: INodeNo,
         newname: &OsStr,
         flags: RenameFlags,
+        _owner: Option<Owner>,
         reply: ReplyEmpty,
     ) {
         info!(
@@ -784,11 +820,15 @@ impl Filesystem for PnaFS {
             reply.error(e);
             return;
         }
+        let mode = match rename_mode(flags) {
+            Ok(mode) => mode,
+            Err(e) => return reply.error(e),
+        };
         let mut tree = match self.write_tree() {
             Ok(tree) => tree,
             Err(e) => return reply.error(e),
         };
-        match tree.rename(parent.0, name, newparent.0, newname, flags) {
+        match tree.rename(parent.0, name, newparent.0, newname, mode) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(e),
         }
@@ -1054,6 +1094,51 @@ mod tests {
     }
 
     #[test]
+    fn rename_mode_rejects_unknown_flags() {
+        assert_eq!(
+            rename_mode(RenameFlags::empty()).unwrap(),
+            RenameMode::Plain
+        );
+        let unknown = RenameFlags::from_bits_retain(1 << 31);
+        assert_eq!(
+            rename_mode(unknown).unwrap_err().code(),
+            Errno::EINVAL.code()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_rename_flags_are_translated() {
+        let no_replace = RenameFlags::RENAME_NOREPLACE;
+        let exchange = RenameFlags::RENAME_EXCHANGE;
+        assert_eq!(rename_mode(no_replace).unwrap(), RenameMode::NoReplace);
+        assert_eq!(rename_mode(exchange).unwrap(), RenameMode::Exchange);
+        for flags in [
+            no_replace | exchange,
+            RenameFlags::RENAME_WHITEOUT,
+            no_replace | RenameFlags::RENAME_WHITEOUT,
+            exchange | RenameFlags::from_bits_retain(1 << 31),
+        ] {
+            assert_eq!(rename_mode(flags).unwrap_err().code(), Errno::EINVAL.code());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rename_flags_are_translated() {
+        let no_replace = RenameFlags::RENAME_EXCL;
+        let exchange = RenameFlags::RENAME_SWAP;
+        assert_eq!(rename_mode(no_replace).unwrap(), RenameMode::NoReplace);
+        assert_eq!(rename_mode(exchange).unwrap(), RenameMode::Exchange);
+        for flags in [
+            no_replace | exchange,
+            exchange | RenameFlags::from_bits_retain(1 << 31),
+        ] {
+            assert_eq!(rename_mode(flags).unwrap_err().code(), Errno::EINVAL.code());
+        }
+    }
+
+    #[test]
     fn usage_grows_when_more_data_is_present() {
         let dir = TempDir::new().unwrap();
         let small = create_plain_archive(&dir, "small.pna", &[("f", b"x")]);
@@ -1114,7 +1199,7 @@ mod tests {
                 ROOT_INODE,
                 std::ffi::OsStr::new("created"),
                 0o644,
-                Owner::new(0, 0),
+                crate::file_tree::ROOT_OWNER,
             )
             .unwrap();
         }
@@ -1143,7 +1228,7 @@ mod tests {
                 ROOT_INODE,
                 std::ffi::OsStr::new("doomed"),
                 0o644,
-                Owner::new(0, 0),
+                crate::file_tree::ROOT_OWNER,
             )
             .unwrap();
         }
